@@ -247,6 +247,20 @@ fn dot_q6k(w: &[u8], x: &[f32]) -> f32 {
     acc
 }
 
+#[inline(always)]
+fn dot_iq_generic(ty: GgmlType, w: &[u8], x: &[f32]) -> f32 {
+    let (be, bb) = ty.block().unwrap();
+    let mut tmp = [0f32; 256];
+    let mut acc = 0f32;
+    for (b, xb) in w.chunks_exact(bb).zip(x.chunks_exact(be)) {
+        ocak_gguf::quant::dequantize_row(ty, b, &mut tmp[..be], be);
+        let mut s = 0f32;
+        for i in 0..be { s += tmp[i] * xb[i]; }
+        acc += s;
+    }
+    acc
+}
+
 macro_rules! dispatch_row {
     ($ty:expr, $w:expr, $x:expr) => {
         match $ty {
@@ -260,6 +274,7 @@ macro_rules! dispatch_row {
             GgmlType::Q4K => dot_q4k($w, $x),
             GgmlType::Q5K => dot_q5k($w, $x),
             GgmlType::Q6K => dot_q6k($w, $x),
+            GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS => dot_iq_generic($ty, $w, $x),
             t => panic!("cpu gemv: unsupported type {}", t.name()),
         }
     };
@@ -276,7 +291,7 @@ fn row_dot_scalar(ty: GgmlType, w: &[u8], x: &[f32]) -> f32 {
 }
 
 pub fn supported(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS)
 }
 
 /// Dot product of one quantised row (`k` elements) with `x`.
@@ -325,6 +340,7 @@ mod tests {
             GgmlType::Q2K => &[80, 82],
             GgmlType::Q3K => &[108],
             GgmlType::Q6K => &[208],
+            GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS => &[0],
             _ => &[],
         }
     }
@@ -358,7 +374,7 @@ mod tests {
     #[test]
     fn gemv_matches_dequant_reference_for_all_types() {
         let mut rng = Lcg(42);
-        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K] {
+        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4NL, GgmlType::IQ4XS] {
             let (k, m) = (512usize, 37usize);
             let w = random_rows(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();

@@ -31,6 +31,13 @@ fn main() {
         "gated_rms_norm",
         "split_qg",
         "mul_sigmoid",
+        "mul_head_sigmoid",
+        "rope_ext",
+        "qmv_iq2_xs",
+        "qmv_iq3_xxs",
+        "qmv_iq3_s",
+        "qmv_iq4_nl",
+        "qmv_iq4_xs",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

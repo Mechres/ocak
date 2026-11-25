@@ -1,7 +1,7 @@
 use crate::exec::EngineError;
 use ocak_gguf::GgufFile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayerKind {
     FullAttn {
         n_head_kv: usize,
@@ -9,6 +9,10 @@ pub enum LayerKind {
         qk_norm: bool,
         /// Index among attention layers (for compact KV buffer allocation).
         kv_layer_idx: usize,
+        sliding_window: usize,
+        rope_base: f32,
+        use_rope_factors: bool,
+        head_gate: bool,
     },
     ShortConv {
         l_cache: usize,
@@ -44,6 +48,7 @@ pub struct ModelConfig {
     pub ffn_norm_suffix: String,
     pub layer_kinds: Vec<LayerKind>,
     pub is_hybrid: bool,
+    pub has_post_norms: bool,
 }
 
 impl ModelConfig {
@@ -57,7 +62,7 @@ impl ModelConfig {
 
     pub fn from_gguf(g: &GgufFile) -> Result<Self, EngineError> {
         let arch = g.architecture().ok_or_else(|| EngineError::Unsupported("no architecture".into()))?.to_string();
-        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "qwen35") {
+        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35") {
             return Err(EngineError::Unsupported(format!(
                 "architecture '{arch}' (native engine supports llama, qwen2, lfm2, qwen35)"
             )));
@@ -80,7 +85,13 @@ impl ModelConfig {
         let mut n_head_kv_max = 0usize;
         let mut is_hybrid = false;
 
-        if arch == "lfm2" {
+        let rope_base_main = g.arch_f64("rope.freq_base").unwrap_or(10000.0) as f32;
+        let rope_base_swa = g.arch_f64("rope.freq_base_swa").map(|v| v as f32).unwrap_or(rope_base_main);
+        let swa_win = g.arch_u64("attention.sliding_window").unwrap_or(0) as usize;
+        let swa_pat = g.ints(&format!("{arch}.attention.sliding_window_pattern"));
+        let has_rope_factors = g.tensor("rope_freqs.weight").is_some();
+        let has_post_norms = arch == "lfm3" && g.tensor("blk.0.post_attention_norm.weight").is_some();
+        if arch == "lfm2" || arch == "lfm3" {
             let l_cache = g.arch_u64("shortconv.l_cache").unwrap_or(3) as usize;
             for i in 0..n_layer {
                 let hkv = kv_arr.and_then(|a| a.get(i)).map(|&v| v as usize).unwrap_or(0);
@@ -89,11 +100,16 @@ impl ModelConfig {
                     layer_kinds.push(LayerKind::ShortConv { l_cache });
                 } else {
                     n_head_kv_max = n_head_kv_max.max(hkv);
+                    let is_swa = swa_pat.and_then(|a| a.get(i)).map(|&v| v != 0).unwrap_or(false);
                     layer_kinds.push(LayerKind::FullAttn {
                         n_head_kv: hkv,
                         gated_q: false,
                         qk_norm: g.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some(),
                         kv_layer_idx: n_kv_layers,
+                        sliding_window: if is_swa { swa_win } else { 0 },
+                        rope_base: if is_swa { rope_base_swa } else { rope_base_main },
+                        use_rope_factors: !is_swa && has_rope_factors,
+                        head_gate: g.tensor(&format!("blk.{i}.attn_gate.weight")).is_some(),
                     });
                     n_kv_layers += 1;
                 }
@@ -113,6 +129,10 @@ impl ModelConfig {
                         gated_q: true,
                         qk_norm: true,
                         kv_layer_idx: n_kv_layers,
+                        sliding_window: 0,
+                        rope_base: rope_base_main,
+                        use_rope_factors: false,
+                        head_gate: false,
                     });
                     n_kv_layers += 1;
                 } else {
@@ -128,6 +148,10 @@ impl ModelConfig {
                     gated_q: false,
                     qk_norm: g.tensor(&format!("blk.{i}.attn_q_norm.weight")).is_some(),
                     kv_layer_idx: i,
+                    sliding_window: 0,
+                    rope_base: rope_base_main,
+                    use_rope_factors: false,
+                    head_gate: false,
                 });
             }
             n_kv_layers = n_layer;
@@ -166,6 +190,7 @@ impl ModelConfig {
             ffn_norm_suffix,
             layer_kinds,
             is_hybrid,
+            has_post_norms,
             arch,
         };
 

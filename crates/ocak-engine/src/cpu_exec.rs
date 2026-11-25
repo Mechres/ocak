@@ -19,6 +19,10 @@ enum CpuMixer {
         gated_q: bool,
         n_head_kv: usize,
         kv_layer_idx: usize,
+        sliding_window: usize,
+        rope_base: f32,
+        use_rope_factors: bool,
+        head_gate_w: Option<TensorInfo>,
     },
     ShortConv {
         in_proj: TensorInfo,
@@ -49,6 +53,8 @@ enum CpuMixer {
 struct Layer {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
+    post_attn_norm: Option<Vec<f32>>,
+    post_ffw_norm: Option<Vec<f32>>,
     mixer: CpuMixer,
     gate: TensorInfo,
     up: TensorInfo,
@@ -61,6 +67,7 @@ pub struct CpuExec {
     layers: Vec<Layer>,
     embd: TensorInfo,
     out_norm: Vec<f32>,
+    rope_factors: Option<Vec<f32>>,
     output: TensorInfo,
     kv: Vec<f32>,
     layer_stride: usize,
@@ -83,7 +90,7 @@ impl CpuExec {
         for (i, &kind) in cfg.layer_kinds.iter().enumerate() {
             let p = |s: &str| format!("blk.{i}.{s}");
             let mixer = match kind {
-                LayerKind::FullAttn { n_head_kv, gated_q, qk_norm, kv_layer_idx } => {
+                LayerKind::FullAttn { n_head_kv, gated_q, qk_norm, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate } => {
                     let bias = |s: &str| if cfg.qkv_bias { f32t(&g, &p(s)).map(Some) } else { Ok(None) };
                     CpuMixer::FullAttn {
                         wq: t(&g, &p("attn_q.weight"))?,
@@ -98,6 +105,10 @@ impl CpuExec {
                         gated_q,
                         n_head_kv,
                         kv_layer_idx,
+                        sliding_window,
+                        rope_base,
+                        use_rope_factors,
+                        head_gate_w: if head_gate { Some(t(&g, &p("attn_gate.weight"))?) } else { None },
                     }
                 }
                 LayerKind::ShortConv { l_cache } => CpuMixer::ShortConv {
@@ -131,6 +142,8 @@ impl CpuExec {
             layers.push(Layer {
                 attn_norm: f32t(&g, &p("attn_norm.weight"))?,
                 ffn_norm: f32t(&g, &p(&cfg.ffn_norm_suffix))?,
+                post_attn_norm: if cfg.has_post_norms { Some(f32t(&g, &p("post_attention_norm.weight"))?) } else { None },
+                post_ffw_norm: if cfg.has_post_norms { Some(f32t(&g, &p("post_ffw_norm.weight"))?) } else { None },
                 mixer,
                 gate: t(&g, &p("ffn_gate.weight"))?,
                 up: t(&g, &p("ffn_up.weight"))?,
@@ -142,6 +155,7 @@ impl CpuExec {
         let layer_stride = n_pages * 2 * ops::PAGE * cfg.kv_dim();
         Ok(Self {
             out_norm: f32t(&g, &cfg.output_norm_name)?,
+            rope_factors: g.tensor("rope_freqs.weight").map(|ti| g.tensor_to_f32(ti)),
             kv: vec![0f32; layer_stride * cfg.n_kv_layers],
             layer_stride,
             logits: vec![0.0; cfg.n_vocab],
@@ -197,7 +211,7 @@ impl Executor for CpuExec {
         for li in 0..c.n_layer {
             ops::rms_norm(&x, &self.layers[li].attn_norm, &mut xn, c.eps);
             match &mut self.layers[li].mixer {
-                CpuMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx } => {
+                CpuMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
                     let (hd, n_h, n_kv) = (c.head_dim, c.n_head, *n_head_kv);
                     let kv_dim = n_kv * hd;
                     let mut q = vec![0f32; n_h * hd];
@@ -221,14 +235,20 @@ impl Executor for CpuExec {
                     if let Some(b) = bv { ops::add(&mut v, b); }
                     if let Some(qn) = q_norm { ops::rms_norm_heads(&mut q, qn, n_h, hd, c.eps); }
                     if let Some(kn) = k_norm { ops::rms_norm_heads(&mut k, kn, n_kv, hd, c.eps); }
-                    ops::rope(&mut q, n_h, hd, c.n_rot, pos, c.rope_base, c.rope_mode);
-                    ops::rope(&mut k, n_kv, hd, c.n_rot, pos, c.rope_base, c.rope_mode);
+                    let rf = if *use_rope_factors { self.rope_factors.as_deref() } else { None };
+                    ops::rope_ext(&mut q, rf, n_h, hd, c.n_rot, pos, *rope_base, c.rope_mode);
+                    ops::rope_ext(&mut k, rf, n_kv, hd, c.n_rot, pos, *rope_base, c.rope_mode);
                     let off = *kv_layer_idx * self.layer_stride;
                     ops::kv_write(&k, &v, &mut self.kv, off, page_table, pos, kv_dim);
                     let mut attn = vec![0f32; n_h * hd];
-                    ops::attention(&q, &self.kv, off, page_table, &mut attn, n_h, n_kv, hd, pos);
+                    ops::attention_swa(&q, &self.kv, off, page_table, &mut attn, n_h, n_kv, hd, pos, *sliding_window);
                     if *gated_q {
                         ops::mul_sigmoid_inplace(&mut attn, &q_gate);
+                    }
+                    if let Some(hg) = head_gate_w {
+                        let mut hgv = vec![0f32; n_h];
+                        gemv(hg.ty, self.g.tensor_data(hg), &xn, &mut hgv, hg.n_cols(), hg.n_rows());
+                        ops::mul_head_sigmoid_inplace(&mut attn, &hgv, n_h, hd);
                     }
                     gemv(wo.ty, self.g.tensor_data(wo), &attn, &mut o, wo.n_cols(), wo.n_rows());
                 }
@@ -262,12 +282,14 @@ impl Executor for CpuExec {
                     gemv(wout.ty, self.g.tensor_data(wout), &dn_norm, &mut o, wout.n_cols(), wout.n_rows());
                 }
             }
+            if let Some(pan) = &self.layers[li].post_attn_norm { let tmp = o.clone(); ops::rms_norm(&tmp, pan, &mut o, c.eps); }
             ops::add(&mut x, &o);
             ops::rms_norm(&x, &self.layers[li].ffn_norm, &mut xn, c.eps);
             self.mv(&self.layers[li].gate, &xn, &mut gate_ff);
             self.mv(&self.layers[li].up, &xn, &mut up_ff);
             ops::swiglu(&gate_ff, &up_ff, &mut act_ff);
             self.mv(&self.layers[li].down, &act_ff, &mut o);
+            if let Some(pfn) = &self.layers[li].post_ffw_norm { let tmp = o.clone(); ops::rms_norm(&tmp, pfn, &mut o, c.eps); }
             ops::add(&mut x, &o);
         }
         if out.logits || out.hidden {

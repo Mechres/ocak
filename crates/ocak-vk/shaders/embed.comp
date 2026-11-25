@@ -3,6 +3,7 @@
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 2) readonly buffer T { uint tbl[]; };
 layout(push_constant) uniform PC {
     uint ty;
     uint token;
@@ -105,6 +106,26 @@ void main() {
         int scv = int(w[sc_off + sc_i]);
         if (scv >= 128) scv -= 256;
         val = d * float(scv) * float(int(q) - 32);
+    } else if (pc.ty == 21u) { // IQ3_S
+        uint blk = i / 256u;
+        uint sub = i % 256u;
+        uint b = rbase + blk * 110u;
+        float d = f16_at(b);
+        uint ib32 = sub / 32u;
+        uint rem32 = sub % 32u;
+        uint l = rem32 / 8u;
+        uint j = rem32 % 8u;
+        uint sc = uint(w[b + 106u + ib32 / 2u]);
+        float db = d * float(1u + 2u * (((ib32 & 1u) == 0u) ? (sc & 0xFu) : (sc >> 4)));
+        uint qh = uint(w[b + 66u + ib32]);
+        uint qs_off = b + 2u + ib32 * 8u;
+        uint sg = uint(w[b + 74u + ib32 * 4u + l]);
+        uint idx = (j < 4u)
+            ? (uint(w[qs_off + 2u * l]) | ((qh << (8u - 2u * l)) & 256u))
+            : (uint(w[qs_off + 2u * l + 1u]) | ((qh << (7u - 2u * l)) & 256u));
+        uint g = tbl[1280u + idx];
+        uint gv = (g >> (8u * (j & 3u))) & 0xFFu;
+        val = db * float(gv) * (((sg & (1u << j)) != 0u) ? -1.0 : 1.0);
     }
     o[pc.out_off + i] = val;
 }

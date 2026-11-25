@@ -35,6 +35,11 @@ pub enum WType {
     Q4K,
     Q5K,
     Q6K,
+    IQ2XS,
+    IQ3XXS,
+    IQ3S,
+    IQ4NL,
+    IQ4XS,
 }
 
 impl WType {
@@ -49,6 +54,11 @@ impl WType {
             GgmlType::Q4K => WType::Q4K,
             GgmlType::Q5K => WType::Q5K,
             GgmlType::Q6K => WType::Q6K,
+            GgmlType::IQ2XS => WType::IQ2XS,
+            GgmlType::IQ3XXS => WType::IQ3XXS,
+            GgmlType::IQ3S => WType::IQ3S,
+            GgmlType::IQ4NL => WType::IQ4NL,
+            GgmlType::IQ4XS => WType::IQ4XS,
             o => return Err(VkError::UnsupportedType(o.name())),
         })
     }
@@ -64,6 +74,11 @@ impl WType {
             WType::Q4K => GgmlType::Q4K,
             WType::Q5K => GgmlType::Q5K,
             WType::Q6K => GgmlType::Q6K,
+            WType::IQ2XS => GgmlType::IQ2XS,
+            WType::IQ3XXS => GgmlType::IQ3XXS,
+            WType::IQ3S => GgmlType::IQ3S,
+            WType::IQ4NL => GgmlType::IQ4NL,
+            WType::IQ4XS => GgmlType::IQ4XS,
         }
     }
 
@@ -103,6 +118,13 @@ struct Pipelines {
     gated_rms_norm: PipelineBundle,
     split_qg: PipelineBundle,
     mul_sigmoid: PipelineBundle,
+    mul_head_sigmoid: PipelineBundle,
+    rope_ext: PipelineBundle,
+    qmv_iq2_xs: PipelineBundle,
+    qmv_iq3_xxs: PipelineBundle,
+    qmv_iq3_s: PipelineBundle,
+    qmv_iq4_nl: PipelineBundle,
+    qmv_iq4_xs: PipelineBundle,
 }
 
 impl Pipelines {
@@ -111,7 +133,7 @@ impl Pipelines {
             &self.rms_norm, &self.add, &self.copy, &self.swiglu, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_q8_0, &self.qmv_q4_0,
-            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k, &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid,
+            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k, &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext, &self.qmv_iq2_xs, &self.qmv_iq3_xxs, &self.qmv_iq3_s, &self.qmv_iq4_nl, &self.qmv_iq4_xs,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -144,6 +166,8 @@ pub struct VkContext {
     subgroup_size: u32,
     vram_bytes: u64,
     pipelines: Pipelines,
+    iq_buf: vk::Buffer,
+    iq_mem: vk::DeviceMemory,
     exec: Mutex<ExecState>,
 }
 
@@ -268,8 +292,8 @@ impl VkContext {
                 swiglu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/swiglu.spv")), 3, 16)?,
                 rope: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
                 kv_write: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/kv_write.spv")), 4, 24)?,
-                attention: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 32)?,
-                embed: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 2, 20)?,
+                attention: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 36)?,
+                embed: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 3, 20)?,
                 qmv_f32: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f32.spv")), 3, 24)?,
                 qmv_f16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f16.spv")), 3, 24)?,
                 qmv_q8_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0.spv")), 3, 24)?,
@@ -286,6 +310,13 @@ impl VkContext {
                 gated_rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), 4, 12)?,
                 split_qg: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), 3, 8)?,
                 mul_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), 2, 4)?,
+                mul_head_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_head_sigmoid.spv")), 2, 8)?,
+                rope_ext: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_ext.spv")), 3, 40)?,
+                qmv_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xs.spv")), 4, 24)?,
+                qmv_iq3_xxs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs.spv")), 4, 24)?,
+                qmv_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s.spv")), 4, 24)?,
+                qmv_iq4_nl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_nl.spv")), 4, 24)?,
+                qmv_iq4_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_xs.spv")), 4, 24)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -319,6 +350,24 @@ impl VkContext {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
             let staging_ptr = device.map_memory(staging_mem, 0, STAGING_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
+            let iq_data = ocak_gguf::iq_tables::packed_gpu_table();
+            let iq_bytes = bytemuck::cast_slice::<u32, u8>(&iq_data);
+            let (iq_buf, iq_mem) = alloc_raw_buffer(
+                &device,
+                &mem_props,
+                iq_bytes.len() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            std::ptr::copy_nonoverlapping(iq_bytes.as_ptr(), staging_ptr, iq_bytes.len());
+            device.begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let reg = [vk::BufferCopy::default().src_offset(0).dst_offset(0).size(iq_bytes.len() as u64)];
+            device.cmd_copy_buffer(cmd_buf, staging_buf, iq_buf, &reg);
+            device.end_command_buffer(cmd_buf)?;
+            let bufs = [cmd_buf];
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&bufs)], fence)?;
+            device.wait_for_fences(&[fence], true, u64::MAX)?;
+            device.reset_fences(&[fence])?;
 
             Ok(Arc::new(Self {
                 _entry: entry,
@@ -331,6 +380,8 @@ impl VkContext {
                 subgroup_size,
                 vram_bytes,
                 pipelines,
+                iq_buf,
+                iq_mem,
                 exec: Mutex::new(ExecState {
                     cmd_pool,
                     cmd_buf,
@@ -484,6 +535,8 @@ impl Drop for VkContext {
                 self.device.destroy_descriptor_pool(exec.desc_pool, None);
                 self.device.destroy_command_pool(exec.cmd_pool, None);
             }
+            self.device.destroy_buffer(self.iq_buf, None);
+            self.device.free_memory(self.iq_mem, None);
             self.pipelines.destroy(&self.device);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -652,20 +705,29 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
-        let pipe = match ty {
-            WType::F32 => &self.ctx.pipelines.qmv_f32,
-            WType::F16 => &self.ctx.pipelines.qmv_f16,
-            WType::Q8_0 => &self.ctx.pipelines.qmv_q8_0,
-            WType::Q4_0 => &self.ctx.pipelines.qmv_q4_0,
-            WType::Q4K => &self.ctx.pipelines.qmv_q4_k,
-            WType::Q5K => &self.ctx.pipelines.qmv_q5_k,
-            WType::Q6K => &self.ctx.pipelines.qmv_q6_k,
-            WType::Q2K => &self.ctx.pipelines.qmv_q2_k,
-            WType::Q3K => &self.ctx.pipelines.qmv_q3_k,
-        };
         let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k)];
         let gx = (m + 3) / 4;
-        self.dispatch_raw(pipe, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+        let (pipe, needs_iq) = match ty {
+            WType::F32 => (&self.ctx.pipelines.qmv_f32, false),
+            WType::F16 => (&self.ctx.pipelines.qmv_f16, false),
+            WType::Q8_0 => (&self.ctx.pipelines.qmv_q8_0, false),
+            WType::Q4_0 => (&self.ctx.pipelines.qmv_q4_0, false),
+            WType::Q4K => (&self.ctx.pipelines.qmv_q4_k, false),
+            WType::Q5K => (&self.ctx.pipelines.qmv_q5_k, false),
+            WType::Q6K => (&self.ctx.pipelines.qmv_q6_k, false),
+            WType::Q2K => (&self.ctx.pipelines.qmv_q2_k, false),
+            WType::Q3K => (&self.ctx.pipelines.qmv_q3_k, false),
+            WType::IQ2XS => (&self.ctx.pipelines.qmv_iq2_xs, true),
+            WType::IQ3XXS => (&self.ctx.pipelines.qmv_iq3_xxs, true),
+            WType::IQ3S => (&self.ctx.pipelines.qmv_iq3_s, true),
+            WType::IQ4NL => (&self.ctx.pipelines.qmv_iq4_nl, true),
+            WType::IQ4XS => (&self.ctx.pipelines.qmv_iq4_xs, true),
+        };
+        if needs_iq {
+            self.dispatch_raw(pipe, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+        } else {
+            self.dispatch_raw(pipe, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+        }
     }
 
     pub fn rms_norm(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
@@ -699,13 +761,16 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn attention(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32) {
-        let pc = [q_off as u32, layer_kv_off as u32, pt_off as u32, out_off as u32, n_heads, n_kv_heads, head_dim, pos];
+        self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
+    }
+    pub fn attention_swa(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32) {
+        let pc = [q_off as u32, layer_kv_off as u32, pt_off as u32, out_off as u32, n_heads, n_kv_heads, head_dim, pos, sliding_window];
         self.dispatch_raw(&self.ctx.pipelines.attention, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
     }
 
     pub fn embed(&mut self, ty: WType, table: &Buffer, token: u32, out: &Buffer, out_off: u64, k: u32) {
         let pc = [ty.ggml().id(), token, out_off as u32, k, ty.row_bytes(k)];
-        self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf], bytemuck::cast_slice(&pc), (k + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), (k + 255) / 256, 1, 1);
     }
 
     pub fn rms_norm_heads(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
@@ -742,6 +807,16 @@ impl<'a> Recorder<'a> {
     pub fn mul_sigmoid(&mut self, x: &Buffer, g: &Buffer, n: u32) {
         let pc = [n];
         self.dispatch_raw(&self.ctx.pipelines.mul_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn mul_head_sigmoid(&mut self, x: &Buffer, g: &Buffer, n_heads: u32, head_dim: u32) {
+        let pc = [n_heads, head_dim];
+        self.dispatch_raw(&self.ctx.pipelines.mul_head_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n_heads * head_dim + 255) / 256, 1, 1);
+    }
+
+    pub fn rope_ext(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, factors: &Buffer, use_factors: bool, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {
+        let pc = [q_off as u32, k_off as u32, n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits(), use_factors as u32];
+        self.dispatch_raw(&self.ctx.pipelines.rope_ext, &[q.buf, k.buf, factors.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, 1, 1);
     }
 
     pub fn finish_and_wait(self) -> Result<(), VkError> {
@@ -793,6 +868,7 @@ mod tests {
             WType::Q3K => for blk in v.chunks_exact_mut(bb) {
                 blk[108..110].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
             },
+            WType::IQ2XS | WType::IQ3XXS | WType::IQ3S | WType::IQ4NL | WType::IQ4XS => for blk in v.chunks_exact_mut(bb) { blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
             WType::Q6K => for blk in v.chunks_exact_mut(bb) { blk[208..210].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
         }
         v
@@ -802,7 +878,7 @@ mod tests {
     fn vk_qmv_all_types_match_cpu() {
         let c = ctx();
         let mut rng = Lcg(1337);
-        for ty in [WType::F32, WType::F16, WType::Q8_0, WType::Q4_0, WType::Q2K, WType::Q3K, WType::Q4K, WType::Q5K, WType::Q6K] {
+        for ty in [WType::F32, WType::F16, WType::Q8_0, WType::Q4_0, WType::Q2K, WType::Q3K, WType::Q4K, WType::Q5K, WType::Q6K, WType::IQ2XS, WType::IQ3XXS, WType::IQ3S, WType::IQ4NL, WType::IQ4XS] {
             let (k, m) = (512usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();

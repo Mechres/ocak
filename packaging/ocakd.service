@@ -1,0 +1,13 @@
+[Unit]
+Description=Ocak Ground-Up Vulkan LLM Server (RX 6700 XT)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/mechres/Projeler/ocak/target/release/ocakd --host 127.0.0.1 --port 8090 --compat-port 11434 --sleep-idle-seconds 120
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

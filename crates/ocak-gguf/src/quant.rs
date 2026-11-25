@@ -120,7 +120,7 @@ impl GgmlType {
     /// Types `dequantize_row` implements.
     pub fn dequant_supported(self) -> bool {
         use GgmlType::*;
-        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K)
+        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K | IQ2XS | IQ3XXS | IQ3S | IQ4NL | IQ4XS)
     }
 }
 
@@ -352,6 +352,126 @@ pub fn dequantize_row(t: GgmlType, src: &[u8], dst: &mut [f32], n: usize) {
                         dst[out + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
                     }
                     out += 128;
+                }
+            }
+        }
+        IQ2XS => {
+            use crate::iq_tables::{IQ2XS_GRID, KSIGNS_IQ2XS};
+            for (bi, b) in src.chunks_exact(74).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let qs = &b[2..66];
+                let scales = &b[66..74];
+                let mut out = bi * QK_K;
+                for ib32 in 0..8 {
+                    let db = [
+                        d * (0.5 + (scales[ib32] & 0xF) as f32) * 0.25,
+                        d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+                    ];
+                    for l in 0..4 {
+                        let q = u16::from_le_bytes([qs[2 * (4 * ib32 + l)], qs[2 * (4 * ib32 + l) + 1]]);
+                        let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+                        let signs = KSIGNS_IQ2XS[(q >> 9) as usize];
+                        let dl = db[l / 2];
+                        for j in 0..8 {
+                            dst[out] = dl * grid[j] as f32 * if (signs & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        IQ3XXS => {
+            use crate::iq_tables::{IQ3XXS_GRID, KSIGNS_IQ2XS};
+            for (bi, b) in src.chunks_exact(98).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let qs = &b[2..66];
+                let sas = &b[66..98];
+                let mut out = bi * QK_K;
+                for ib32 in 0..8 {
+                    let aux32 = u32::from_le_bytes(sas[ib32 * 4..ib32 * 4 + 4].try_into().unwrap());
+                    let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    for l in 0..4 {
+                        let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                        let g1 = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l] as usize].to_le_bytes();
+                        let g2 = IQ3XXS_GRID[qs[ib32 * 8 + 2 * l + 1] as usize].to_le_bytes();
+                        for j in 0..4 {
+                            dst[out + j] = db * g1[j] as f32 * if (signs & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            dst[out + j + 4] = db * g2[j] as f32 * if (signs & (1 << (j + 4))) != 0 { -1.0 } else { 1.0 };
+                        }
+                        out += 8;
+                    }
+                }
+            }
+        }
+        IQ3S => {
+            use crate::iq_tables::IQ3S_GRID;
+            for (bi, b) in src.chunks_exact(110).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let mut qs = &b[2..66];
+                let mut qh = &b[66..74];
+                let mut signs = &b[74..106];
+                let scales = &b[106..110];
+                let mut out = bi * QK_K;
+                for ib32 in (0..8).step_by(2) {
+                    let db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xF) as i32) as f32;
+                    let db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4) as i32) as f32;
+                    for l in 0..4 {
+                        let idx1 = (qs[2 * l] as usize) | (((qh[0] as usize) << (8 - 2 * l)) & 256);
+                        let idx2 = (qs[2 * l + 1] as usize) | (((qh[0] as usize) << (7 - 2 * l)) & 256);
+                        let g1 = IQ3S_GRID[idx1].to_le_bytes();
+                        let g2 = IQ3S_GRID[idx2].to_le_bytes();
+                        for j in 0..4 {
+                            dst[out + j] = db1 * g1[j] as f32 * if (signs[l] & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            dst[out + j + 4] = db1 * g2[j] as f32 * if (signs[l] & (1 << (j + 4))) != 0 { -1.0 } else { 1.0 };
+                        }
+                        out += 8;
+                    }
+                    qs = &qs[8..];
+                    signs = &signs[4..];
+                    for l in 0..4 {
+                        let idx1 = (qs[2 * l] as usize) | (((qh[1] as usize) << (8 - 2 * l)) & 256);
+                        let idx2 = (qs[2 * l + 1] as usize) | (((qh[1] as usize) << (7 - 2 * l)) & 256);
+                        let g1 = IQ3S_GRID[idx1].to_le_bytes();
+                        let g2 = IQ3S_GRID[idx2].to_le_bytes();
+                        for j in 0..4 {
+                            dst[out + j] = db2 * g1[j] as f32 * if (signs[l] & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            dst[out + j + 4] = db2 * g2[j] as f32 * if (signs[l] & (1 << (j + 4))) != 0 { -1.0 } else { 1.0 };
+                        }
+                        out += 8;
+                    }
+                    qh = &qh[2..];
+                    qs = &qs[8..];
+                    signs = &signs[4..];
+                }
+            }
+        }
+        IQ4NL => {
+            use crate::iq_tables::KVALUES_IQ4NL;
+            for (bi, b) in src.chunks_exact(18).take(n / 32).enumerate() {
+                let d = f16_at(b, 0);
+                for j in 0..16 {
+                    dst[bi * 32 + j] = d * KVALUES_IQ4NL[(b[2 + j] & 0xF) as usize] as f32;
+                    dst[bi * 32 + j + 16] = d * KVALUES_IQ4NL[(b[2 + j] >> 4) as usize] as f32;
+                }
+            }
+        }
+        IQ4XS => {
+            use crate::iq_tables::KVALUES_IQ4NL;
+            for (bi, b) in src.chunks_exact(136).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let scales_h = u16::from_le_bytes([b[2], b[3]]);
+                let scales_l = &b[4..8];
+                let qs = &b[8..136];
+                for ib in 0..8 {
+                    let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32)
+                        | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+                    let dl = d * (ls - 32) as f32;
+                    let q = &qs[ib * 16..ib * 16 + 16];
+                    let out = bi * QK_K + ib * 32;
+                    for j in 0..16 {
+                        dst[out + j] = dl * KVALUES_IQ4NL[(q[j] & 0xF) as usize] as f32;
+                        dst[out + j + 16] = dl * KVALUES_IQ4NL[(q[j] >> 4) as usize] as f32;
+                    }
                 }
             }
         }

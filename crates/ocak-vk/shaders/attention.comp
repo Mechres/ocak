@@ -13,6 +13,7 @@ layout(push_constant) uniform PC {
     uint n_kv_heads;
     uint head_dim;
     uint pos;
+    uint sliding_window;
 } pc;
 shared float sdot[32];
 void main() {
@@ -35,7 +36,8 @@ void main() {
     float m = -3.402823466e38;
     float l = 0.0;
 
-    for (uint t = 0; t <= pc.pos; t++) {
+    uint t_start = (pc.sliding_window > 0u && pc.pos >= pc.sliding_window) ? (pc.pos + 1u - pc.sliding_window) : 0u;
+    for (uint t = t_start; t <= pc.pos; t++) {
         uint page = pt[pc.pt_off + (t >> 4)];
         uint slot = t & 15u;
         uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * kv_dim + kvh * pc.head_dim;

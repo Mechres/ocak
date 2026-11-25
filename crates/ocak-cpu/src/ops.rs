@@ -25,10 +25,15 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
 
 /// Rotates the first `n_rot` dims of each head. mode 0: adjacent pairs, mode 1: split halves.
 pub fn rope(v: &mut [f32], n_heads: usize, head_dim: usize, n_rot: usize, pos: usize, freq_base: f32, mode: u32) {
+    rope_ext(v, None, n_heads, head_dim, n_rot, pos, freq_base, mode);
+}
+
+pub fn rope_ext(v: &mut [f32], factors: Option<&[f32]>, n_heads: usize, head_dim: usize, n_rot: usize, pos: usize, freq_base: f32, mode: u32) {
     for h in 0..n_heads {
         let hv = &mut v[h * head_dim..(h + 1) * head_dim];
         for i in 0..n_rot / 2 {
-            let theta = pos as f32 * freq_base.powf(-2.0 * i as f32 / n_rot as f32);
+            let inv_f = factors.map(|f| 1.0 / f[i]).unwrap_or(1.0);
+            let theta = pos as f32 * freq_base.powf(-2.0 * i as f32 / n_rot as f32) * inv_f;
             let (s, c) = theta.sin_cos();
             let (a, b) = if mode == 0 { (2 * i, 2 * i + 1) } else { (i, i + n_rot / 2) };
             let (x0, x1) = (hv[a], hv[b]);
@@ -55,15 +60,20 @@ pub fn kv_write(k: &[f32], v: &[f32], kv: &mut [f32], layer_off: usize, page_tab
 
 /// Single-token GQA attention over keys 0..=pos.
 pub fn attention(q: &[f32], kv: &[f32], layer_off: usize, page_table: &[u32], out: &mut [f32], n_heads: usize, n_kv_heads: usize, head_dim: usize, pos: usize) {
+    attention_swa(q, kv, layer_off, page_table, out, n_heads, n_kv_heads, head_dim, pos, 0);
+}
+
+pub fn attention_swa(q: &[f32], kv: &[f32], layer_off: usize, page_table: &[u32], out: &mut [f32], n_heads: usize, n_kv_heads: usize, head_dim: usize, pos: usize, sliding_window: usize) {
     let kv_dim = n_kv_heads * head_dim;
     let group = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let t_start = if sliding_window > 0 && pos >= sliding_window { pos + 1 - sliding_window } else { 0 };
     let mut scores = vec![0f32; pos + 1];
     for h in 0..n_heads {
         let kvh = h / group;
         let qh = &q[h * head_dim..(h + 1) * head_dim];
         let mut mx = f32::NEG_INFINITY;
-        for t in 0..=pos {
+        for t in t_start..=pos {
             let page = page_table[t / PAGE] as usize;
             let o = layer_off + kv_index(page, 0, t % PAGE, kv_dim) + kvh * head_dim;
             let kk = &kv[o..o + head_dim];
@@ -72,13 +82,13 @@ pub fn attention(q: &[f32], kv: &[f32], layer_off: usize, page_table: &[u32], ou
             mx = mx.max(s);
         }
         let mut sum = 0f32;
-        for s in scores.iter_mut() {
+        for s in scores[t_start..=pos].iter_mut() {
             *s = (*s - mx).exp();
             sum += *s;
         }
         let oh = &mut out[h * head_dim..(h + 1) * head_dim];
         oh.fill(0.0);
-        for t in 0..=pos {
+        for t in t_start..=pos {
             let page = page_table[t / PAGE] as usize;
             let o = layer_off + kv_index(page, 1, t % PAGE, kv_dim) + kvh * head_dim;
             let w = scores[t] / sum;
@@ -205,6 +215,13 @@ pub fn gated_rms_norm_heads(x: &[f32], w: &[f32], z: &[f32], out: &mut [f32], n_
             let silu = zv / (1.0 + (-zv).exp());
             out[base + d] = x[base + d] * sc * w[d] * silu;
         }
+    }
+}
+
+pub fn mul_head_sigmoid_inplace(x: &mut [f32], gate: &[f32], n_heads: usize, head_dim: usize) {
+    for h in 0..n_heads {
+        let s = 1.0 / (1.0 + (-gate[h]).exp());
+        for d in 0..head_dim { x[h * head_dim + d] *= s; }
     }
 }
 

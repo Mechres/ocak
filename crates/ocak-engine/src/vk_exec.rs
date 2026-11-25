@@ -25,6 +25,10 @@ enum VkMixer {
         gated_q: bool,
         n_head_kv: u32,
         kv_layer_idx: usize,
+        sliding_window: u32,
+        rope_base: f32,
+        use_rope_factors: bool,
+        head_gate_w: Option<WeightBuf>,
     },
     ShortConv {
         in_proj: WeightBuf,
@@ -56,6 +60,8 @@ enum VkMixer {
 struct VkLayer {
     attn_norm: Buffer,
     ffn_norm: Buffer,
+    post_attn_norm: Option<Buffer>,
+    post_ffw_norm: Option<Buffer>,
     mixer: VkMixer,
     gate: WeightBuf,
     up: WeightBuf,
@@ -68,6 +74,8 @@ pub struct VkExec {
     layers: Vec<VkLayer>,
     embd: WeightBuf,
     out_norm: Buffer,
+    rope_factors: Buffer,
+    head_gate_buf: Buffer,
     output: Option<WeightBuf>,
     kv: Buffer,
     layer_stride: u64,
@@ -134,7 +142,7 @@ impl VkExec {
         for (i, &kind) in cfg.layer_kinds.iter().enumerate() {
             let p = |s: &str| format!("blk.{i}.{s}");
             let mixer = match kind {
-                LayerKind::FullAttn { n_head_kv, gated_q, qk_norm, kv_layer_idx } => {
+                LayerKind::FullAttn { n_head_kv, gated_q, qk_norm, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate } => {
                     let b = |s: &str| -> Result<Option<Buffer>, EngineError> {
                         if cfg.qkv_bias { Ok(Some(upload_f32(&ctx, &g, &p(s))?)) } else { Ok(None) }
                     };
@@ -151,6 +159,10 @@ impl VkExec {
                         gated_q,
                         n_head_kv: n_head_kv as u32,
                         kv_layer_idx,
+                        sliding_window: sliding_window as u32,
+                        rope_base,
+                        use_rope_factors,
+                        head_gate_w: if head_gate { Some(upload_weight(&ctx, &g, req_tensor(&g, &p("attn_gate.weight"))?)?) } else { None },
                     }
                 }
                 LayerKind::ShortConv { l_cache } => {
@@ -197,6 +209,8 @@ impl VkExec {
             layers.push(VkLayer {
                 attn_norm: upload_f32(&ctx, &g, &p("attn_norm.weight"))?,
                 ffn_norm: upload_f32(&ctx, &g, &p(&cfg.ffn_norm_suffix))?,
+                post_attn_norm: if cfg.has_post_norms { Some(upload_f32(&ctx, &g, &p("post_attention_norm.weight"))?) } else { None },
+                post_ffw_norm: if cfg.has_post_norms { Some(upload_f32(&ctx, &g, &p("post_ffw_norm.weight"))?) } else { None },
                 mixer,
                 gate: upload_weight(&ctx, &g, req_tensor(&g, &p("ffn_gate.weight"))?)?,
                 up: upload_weight(&ctx, &g, req_tensor(&g, &p("ffn_up.weight"))?)?,
@@ -205,6 +219,12 @@ impl VkExec {
         }
         let embd = upload_weight(&ctx, &g, req_tensor(&g, "token_embd.weight")?)?;
         let out_norm = upload_f32(&ctx, &g, &cfg.output_norm_name)?;
+        let rope_factors = if g.tensor("rope_freqs.weight").is_some() {
+            upload_f32(&ctx, &g, "rope_freqs.weight")?
+        } else {
+            mk(cfg.head_dim / 2)?
+        };
+        let head_gate_buf = mk(cfg.n_head)?;
         let output = if cfg.tied_output { None } else { Some(upload_weight(&ctx, &g, req_tensor(&g, "output.weight")?)?) };
 
         let layer_stride = (n_pages * 2 * 16 * cfg.kv_dim()) as u64;
@@ -241,6 +261,8 @@ impl VkExec {
             layers,
             embd,
             out_norm,
+            rope_factors,
+            head_gate_buf,
             output,
             cfg,
             ctx,
@@ -280,7 +302,7 @@ impl Executor for VkExec {
         for l in &self.layers {
             rec.rms_norm(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
             match &l.mixer {
-                VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx } => {
+                VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
                     if *gated_q {
                         rec.qmv(wq.ty, &wq.buf, 0, &self.xn, 0, &self.qg, 0, wq.k, wq.m);
                         rec.split_qg(&self.qg, &self.q, &self.q_gate, c.n_head as u32, c.head_dim as u32);
@@ -294,12 +316,16 @@ impl Executor for VkExec {
                     if let Some(b) = bv { rec.add(&self.v, 0, b, 0, wv.m); }
                     if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, 0, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
                     if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, 0, kn, *n_head_kv, c.head_dim as u32, c.eps); }
-                    rec.rope(&self.q, 0, &self.k, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, pos as u32, c.rope_base, c.rope_mode);
+                    rec.rope_ext(&self.q, 0, &self.k, 0, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, pos as u32, *rope_base, c.rope_mode);
                     let kv_off = *kv_layer_idx as u64 * self.layer_stride;
                     rec.kv_write(&self.k, 0, &self.v, 0, &self.kv, kv_off, &self.pt_buf, 0, pos as u32, *n_head_kv * c.head_dim as u32);
-                    rec.attention(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos as u32);
+                    rec.attention_swa(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos as u32, *sliding_window);
                     if *gated_q {
                         rec.mul_sigmoid(&self.attn, &self.q_gate, (c.n_head * c.head_dim) as u32);
+                    }
+                    if let Some(hg) = head_gate_w {
+                        rec.qmv(hg.ty, &hg.buf, 0, &self.xn, 0, &self.head_gate_buf, 0, hg.k, hg.m);
+                        rec.mul_head_sigmoid(&self.attn, &self.head_gate_buf, c.n_head as u32, c.head_dim as u32);
                     }
                     rec.qmv(wo.ty, &wo.buf, 0, &self.attn, 0, &self.o, 0, wo.k, wo.m);
                 }
@@ -322,12 +348,14 @@ impl Executor for VkExec {
                     rec.qmv(wout.ty, &wout.buf, 0, &self.dn_norm, 0, &self.o, 0, wout.k, wout.m);
                 }
             }
+            if let Some(pan) = &l.post_attn_norm { rec.rms_norm(&self.o, 0, pan, 0, &self.o, 0, c.n_embd as u32, c.eps); }
             rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
             rec.rms_norm(&self.x, 0, &l.ffn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
             rec.qmv(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m);
             rec.qmv(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m);
             rec.swiglu(&self.gate, 0, &self.up, 0, &self.act, 0, c.n_ff as u32);
             rec.qmv(l.down.ty, &l.down.buf, 0, &self.act, 0, &self.o, 0, l.down.k, l.down.m);
+            if let Some(pfn) = &l.post_ffw_norm { rec.rms_norm(&self.o, 0, pfn, 0, &self.o, 0, c.n_embd as u32, c.eps); }
             rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
         }
 
