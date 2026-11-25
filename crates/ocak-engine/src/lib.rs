@@ -4,6 +4,7 @@ pub mod cpu_exec;
 pub mod engine;
 pub mod exec;
 pub mod sampler;
+pub mod xing_exec;
 #[cfg(feature = "vulkan")]
 pub mod vk_exec;
 

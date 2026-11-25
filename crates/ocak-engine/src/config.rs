@@ -62,7 +62,7 @@ impl ModelConfig {
 
     pub fn from_gguf(g: &GgufFile) -> Result<Self, EngineError> {
         let arch = g.architecture().ok_or_else(|| EngineError::Unsupported("no architecture".into()))?.to_string();
-        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35") {
+        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0") {
             return Err(EngineError::Unsupported(format!(
                 "architecture '{arch}' (native engine supports llama, qwen2, lfm2, qwen35)"
             )));
@@ -194,7 +194,7 @@ impl ModelConfig {
             arch,
         };
 
-        if g.arch_f64("rope.scaling.factor").map_or(false, |f| (f - 1.0).abs() > 1e-6) {
+        if cfg.arch != "xing4_0" && g.arch_f64("rope.scaling.factor").map_or(false, |f| (f - 1.0).abs() > 1e-6) {
             return Err(EngineError::Unsupported("rope scaling".into()));
         }
 
