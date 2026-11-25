@@ -120,7 +120,7 @@ impl GgmlType {
     /// Types `dequantize_row` implements.
     pub fn dequant_supported(self) -> bool {
         use GgmlType::*;
-        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q4K | Q5K | Q6K)
+        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K)
     }
 }
 
@@ -204,6 +204,75 @@ pub fn dequantize_row(t: GgmlType, src: &[u8], dst: &mut [f32], n: usize) {
                 let d = f16_at(b, 0);
                 for j in 0..32 {
                     dst[bi * 32 + j] = (b[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        Q2K => {
+            for (bi, b) in src.chunks_exact(84).take(n / QK_K).enumerate() {
+                let scales = &b[0..16];
+                let qs = &b[16..80];
+                let d = f16_at(b, 80);
+                let dmin = f16_at(b, 82);
+                let mut out = bi * QK_K;
+                let mut is = 0usize;
+                for half in 0..2 {
+                    let q = &qs[half * 32..half * 32 + 32];
+                    let mut shift = 0u8;
+                    for _ in 0..4 {
+                        let sc = scales[is]; is += 1;
+                        let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                        for l in 0..16 { dst[out] = dl * ((q[l] >> shift) & 3) as f32 - ml; out += 1; }
+                        let sc = scales[is]; is += 1;
+                        let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                        for l in 0..16 { dst[out] = dl * ((q[l + 16] >> shift) & 3) as f32 - ml; out += 1; }
+                        shift += 2;
+                    }
+                }
+            }
+        }
+        Q3K => {
+            const KM1: u32 = 0x03030303;
+            const KM2: u32 = 0x0f0f0f0f;
+            for (bi, b) in src.chunks_exact(110).take(n / QK_K).enumerate() {
+                let hm = &b[0..32];
+                let qs = &b[32..96];
+                let mut aux = [
+                    u32::from_le_bytes(b[96..100].try_into().unwrap()),
+                    u32::from_le_bytes(b[100..104].try_into().unwrap()),
+                    u32::from_le_bytes(b[104..108].try_into().unwrap()),
+                    0u32,
+                ];
+                let tmp = aux[2];
+                aux[2] = ((aux[0] >> 4) & KM2) | (((tmp >> 4) & KM1) << 4);
+                aux[3] = ((aux[1] >> 4) & KM2) | (((tmp >> 6) & KM1) << 4);
+                aux[0] = (aux[0] & KM2) | ((tmp & KM1) << 4);
+                aux[1] = (aux[1] & KM2) | (((tmp >> 2) & KM1) << 4);
+                let mut scales = [0i8; 16];
+                for k in 0..4 {
+                    let bytes = aux[k].to_le_bytes();
+                    for j in 0..4 { scales[k * 4 + j] = bytes[j] as i8; }
+                }
+                let d_all = f16_at(b, 108);
+                let mut out = bi * QK_K;
+                let mut is = 0usize;
+                let mut m = 1u8;
+                for half in 0..2 {
+                    let q = &qs[half * 32..half * 32 + 32];
+                    let mut shift = 0u8;
+                    for _ in 0..4 {
+                        let dl = d_all * (scales[is] as i32 - 32) as f32; is += 1;
+                        for l in 0..16 {
+                            let v = ((q[l] >> shift) & 3) as i32 - if hm[l] & m != 0 { 0 } else { 4 };
+                            dst[out] = dl * v as f32; out += 1;
+                        }
+                        let dl = d_all * (scales[is] as i32 - 32) as f32; is += 1;
+                        for l in 0..16 {
+                            let v = ((q[l + 16] >> shift) & 3) as i32 - if hm[l + 16] & m != 0 { 0 } else { 4 };
+                            dst[out] = dl * v as f32; out += 1;
+                        }
+                        shift += 2;
+                        m <<= 1;
+                    }
                 }
             }
         }

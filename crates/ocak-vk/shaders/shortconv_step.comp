@@ -1,0 +1,28 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer BCX { float bcx[]; };
+layout(set = 0, binding = 1) readonly buffer W { float cw[]; };
+layout(set = 0, binding = 2) buffer ST { float st[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n_embd; uint l_cache; } pc;
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= pc.n_embd) return;
+    uint d_conv = pc.l_cache - 1u;
+    float b = bcx[e];
+    float c = bcx[pc.n_embd + e];
+    float x = bcx[2u * pc.n_embd + e];
+    float bx = b * x;
+    uint sb = e * d_conv;
+    uint wb = e * pc.l_cache;
+    float acc = 0.0;
+    for (uint t = 0u; t < d_conv; t++) {
+        acc += st[sb + t] * cw[wb + t];
+    }
+    acc += bx * cw[wb + d_conv];
+    for (uint t = 0u; t + 1u < d_conv; t++) {
+        st[sb + t] = st[sb + t + 1u];
+    }
+    st[sb + d_conv - 1u] = bx;
+    o[e] = c * acc;
+}

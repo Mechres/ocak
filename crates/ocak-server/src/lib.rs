@@ -79,7 +79,7 @@ pub struct AppState {
 }
 
 fn engine_kind_for(e: &CatalogEntry) -> &'static str {
-    if e.arch == "llama" || e.arch == "qwen2" {
+    if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "qwen35") && !e.quant_summary.contains("IQ") {
         "native-vulkan"
     } else {
         "bridge-llama"

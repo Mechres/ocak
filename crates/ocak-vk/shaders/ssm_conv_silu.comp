@@ -1,0 +1,25 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float cw[]; };
+layout(set = 0, binding = 2) buffer ST { float st[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint channels; uint k_conv; } pc;
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.channels) return;
+    uint d_conv = pc.k_conv - 1u;
+    float xv = x[ch];
+    uint sb = ch * d_conv;
+    uint wb = ch * pc.k_conv;
+    float acc = 0.0;
+    for (uint t = 0u; t < d_conv; t++) {
+        acc += st[sb + t] * cw[wb + t];
+    }
+    acc += xv * cw[wb + d_conv];
+    for (uint t = 0u; t + 1u < d_conv; t++) {
+        st[sb + t] = st[sb + t + 1u];
+    }
+    st[sb + d_conv - 1u] = xv;
+    o[ch] = acc / (1.0 + exp(-acc));
+}

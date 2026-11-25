@@ -73,6 +73,90 @@ fn dot_q8_0(w: &[u8], x: &[f32]) -> f32 {
 }
 
 #[inline(always)]
+fn dot_q2k(w: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (b, xb) in w.chunks_exact(84).zip(x.chunks_exact(256)) {
+        let scales = &b[0..16];
+        let qs = &b[16..80];
+        let (d, dmin) = (h(b, 80), h(b, 82));
+        let mut is = 0usize;
+        let mut xi = 0usize;
+        for half in 0..2 {
+            let q = &qs[half * 32..half * 32 + 32];
+            let mut shift = 0u8;
+            for _ in 0..4 {
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                let (mut s1, mut sx1) = (0f32, 0f32);
+                for l in 0..16 { s1 += ((q[l] >> shift) & 3) as f32 * xb[xi + l]; sx1 += xb[xi + l]; }
+                acc += dl * s1 - ml * sx1; xi += 16;
+                let sc = scales[is]; is += 1;
+                let (dl, ml) = (d * (sc & 0xF) as f32, dmin * (sc >> 4) as f32);
+                let (mut s2, mut sx2) = (0f32, 0f32);
+                for l in 0..16 { s2 += ((q[l + 16] >> shift) & 3) as f32 * xb[xi + l]; sx2 += xb[xi + l]; }
+                acc += dl * s2 - ml * sx2; xi += 16;
+                shift += 2;
+            }
+        }
+    }
+    acc
+}
+
+#[inline(always)]
+fn dot_q3k(w: &[u8], x: &[f32]) -> f32 {
+    const KM1: u32 = 0x03030303;
+    const KM2: u32 = 0x0f0f0f0f;
+    let mut acc = 0f32;
+    for (b, xb) in w.chunks_exact(110).zip(x.chunks_exact(256)) {
+        let hm = &b[0..32];
+        let qs = &b[32..96];
+        let mut aux = [
+            u32::from_le_bytes(b[96..100].try_into().unwrap()),
+            u32::from_le_bytes(b[100..104].try_into().unwrap()),
+            u32::from_le_bytes(b[104..108].try_into().unwrap()),
+            0u32,
+        ];
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KM2) | (((tmp >> 4) & KM1) << 4);
+        aux[3] = ((aux[1] >> 4) & KM2) | (((tmp >> 6) & KM1) << 4);
+        aux[0] = (aux[0] & KM2) | ((tmp & KM1) << 4);
+        aux[1] = (aux[1] & KM2) | (((tmp >> 2) & KM1) << 4);
+        let mut scales = [0i8; 16];
+        for k in 0..4 {
+            let bytes = aux[k].to_le_bytes();
+            for j in 0..4 { scales[k * 4 + j] = bytes[j] as i8; }
+        }
+        let d_all = h(b, 108);
+        let mut is = 0usize;
+        let mut m = 1u8;
+        let mut xi = 0usize;
+        for half in 0..2 {
+            let q = &qs[half * 32..half * 32 + 32];
+            let mut shift = 0u8;
+            for _ in 0..4 {
+                let dl = d_all * (scales[is] as i32 - 32) as f32; is += 1;
+                let mut s1 = 0f32;
+                for l in 0..16 {
+                    let v = ((q[l] >> shift) & 3) as i32 - if hm[l] & m != 0 { 0 } else { 4 };
+                    s1 += v as f32 * xb[xi + l];
+                }
+                acc += dl * s1; xi += 16;
+                let dl = d_all * (scales[is] as i32 - 32) as f32; is += 1;
+                let mut s2 = 0f32;
+                for l in 0..16 {
+                    let v = ((q[l + 16] >> shift) & 3) as i32 - if hm[l + 16] & m != 0 { 0 } else { 4 };
+                    s2 += v as f32 * xb[xi + l];
+                }
+                acc += dl * s2; xi += 16;
+                shift += 2;
+                m <<= 1;
+            }
+        }
+    }
+    acc
+}
+
+#[inline(always)]
 fn dot_q4k(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0f32;
     for (b, xb) in w.chunks_exact(144).zip(x.chunks_exact(256)) {
@@ -171,6 +255,8 @@ macro_rules! dispatch_row {
             GgmlType::BF16 => dot_bf16($w, $x),
             GgmlType::Q4_0 => dot_q4_0($w, $x),
             GgmlType::Q8_0 => dot_q8_0($w, $x),
+            GgmlType::Q2K => dot_q2k($w, $x),
+            GgmlType::Q3K => dot_q3k($w, $x),
             GgmlType::Q4K => dot_q4k($w, $x),
             GgmlType::Q5K => dot_q5k($w, $x),
             GgmlType::Q6K => dot_q6k($w, $x),
@@ -190,7 +276,7 @@ fn row_dot_scalar(ty: GgmlType, w: &[u8], x: &[f32]) -> f32 {
 }
 
 pub fn supported(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
 }
 
 /// Dot product of one quantised row (`k` elements) with `x`.
@@ -236,6 +322,8 @@ mod tests {
         match ty {
             GgmlType::Q4_0 | GgmlType::Q8_0 => &[0],
             GgmlType::Q4K | GgmlType::Q5K => &[0, 2],
+            GgmlType::Q2K => &[80, 82],
+            GgmlType::Q3K => &[108],
             GgmlType::Q6K => &[208],
             _ => &[],
         }
@@ -270,7 +358,7 @@ mod tests {
     #[test]
     fn gemv_matches_dequant_reference_for_all_types() {
         let mut rng = Lcg(42);
-        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K] {
+        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K] {
             let (k, m) = (512usize, 37usize);
             let w = random_rows(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();

@@ -1,0 +1,65 @@
+#version 460
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 1) readonly buffer AB { float alpha[]; };
+layout(set = 0, binding = 2) readonly buffer BT { float beta[]; };
+layout(set = 0, binding = 3) readonly buffer DT { float dt_bias[]; };
+layout(set = 0, binding = 4) readonly buffer SA { float ssm_a[]; };
+layout(set = 0, binding = 5) buffer ST { float st[]; };
+layout(set = 0, binding = 6) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint head_dim;
+    float eps;
+} pc;
+shared float sq[128];
+shared float sk[128];
+shared float sred[128];
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint h = wg / pc.head_dim;
+    uint j = wg % pc.head_dim;
+    if (h >= pc.n_v_heads) return;
+    uint i = gl_LocalInvocationID.x;
+    uint kh = h % pc.n_k_heads;
+    uint k_total = pc.n_k_heads * pc.head_dim;
+
+    float qv = (i < pc.head_dim) ? qkv[kh * pc.head_dim + i] : 0.0;
+    float kv = (i < pc.head_dim) ? qkv[k_total + kh * pc.head_dim + i] : 0.0;
+    sq[i] = qv * qv;
+    sk[i] = kv * kv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (i < s) { sq[i] += sq[i + s]; sk[i] += sk[i + s]; }
+        barrier();
+    }
+    float q_norm = qv * inversesqrt(sq[0] + pc.eps) * inversesqrt(float(pc.head_dim));
+    float k_norm = kv * inversesqrt(sk[0] + pc.eps);
+
+    float ab = alpha[h] + dt_bias[h];
+    float sp = (ab > 20.0) ? ab : log(1.0 + exp(ab));
+    float g = exp(sp * ssm_a[h]);
+    float b = 1.0 / (1.0 + exp(-beta[h]));
+
+    uint s_idx = (h * pc.head_dim + j) * pc.head_dim + i;
+    float s_val = (i < pc.head_dim) ? (st[s_idx] * g) : 0.0;
+    sred[i] = s_val * k_norm;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (i < s) sred[i] += sred[i + s];
+        barrier();
+    }
+    float vj = qkv[2u * k_total + h * pc.head_dim + j];
+    float dj = (vj - sred[0]) * b;
+    s_val += k_norm * dj;
+    if (i < pc.head_dim) st[s_idx] = s_val;
+
+    sred[i] = s_val * q_norm;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (i < s) sred[i] += sred[i + s];
+        barrier();
+    }
+    if (i == 0u) o[h * pc.head_dim + j] = sred[0];
+}

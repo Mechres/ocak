@@ -91,7 +91,7 @@ impl NativeEngine {
         let tokenizer = Tokenizer::from_gguf(&g).map_err(|e| EngineError::Gguf(e.to_string()))?;
         let max_ctx = opts.max_ctx.min(cfg.n_ctx_train.max(2048));
         let n_pages = opts.kv_pages.max((max_ctx + PAGE_TOKENS - 1) / PAGE_TOKENS + 16);
-        let kv_bytes = (cfg.n_layer * n_pages * 2 * PAGE_TOKENS * cfg.kv_dim() * 4) as u64;
+        let kv_bytes = (cfg.n_kv_layers * n_pages * 2 * PAGE_TOKENS * cfg.kv_dim() * 4) as u64;
         let vram_bytes = g.file_len() + kv_bytes + 32 * 1024 * 1024;
         let exec: Box<dyn Executor> = match opts.backend {
             #[cfg(feature = "vulkan")]
@@ -122,6 +122,7 @@ impl NativeEngine {
         if tokens.is_empty() {
             return Err(EngineError::Context("empty token sequence".into()));
         }
+        self.exec.reset_recurrent()?;
         let need_pages = (tokens.len() + PAGE_TOKENS - 1) / PAGE_TOKENS;
         let mut pages = Vec::with_capacity(need_pages);
         for _ in 0..need_pages {
@@ -148,6 +149,7 @@ impl NativeEngine {
             if let Some(b) = self.tokenizer.bos() { tokens.push(b); } else { tokens.push(0); }
         }
         if tokens.len() > self.max_ctx { tokens.truncate(self.max_ctx); }
+        self.exec.reset_recurrent()?;
         let need_pages = (tokens.len() + PAGE_TOKENS - 1) / PAGE_TOKENS;
         let mut pages = Vec::with_capacity(need_pages);
         for _ in 0..need_pages {
@@ -188,10 +190,14 @@ impl NativeEngine {
         }
 
         // Prefix match via RadixPager: never match the very last token so we always get fresh logits for it
-        let match_slice = if tokens.len() > 1 { &tokens[..tokens.len() - 1] } else { &[] };
-        let pm = self.pager.match_prefix(match_slice);
-        let cache_n = pm.matched_tokens;
-        let mut pages = pm.pages;
+        let (cache_n, mut pages) = if self.cfg.is_hybrid {
+            self.exec.reset_recurrent()?;
+            (0usize, Vec::new())
+        } else {
+            let match_slice = if tokens.len() > 1 { &tokens[..tokens.len() - 1] } else { &[] };
+            let pm = self.pager.match_prefix(match_slice);
+            (pm.matched_tokens, pm.pages)
+        };
 
         let ensure_page = |pager: &mut RadixPager, pages: &mut Vec<u32>, pos: usize| -> Result<(), EngineError> {
             let need = pos / PAGE_TOKENS + 1;

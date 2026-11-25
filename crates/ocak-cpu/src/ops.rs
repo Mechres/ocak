@@ -89,6 +89,131 @@ pub fn attention(q: &[f32], kv: &[f32], layer_off: usize, page_table: &[u32], ou
     }
 }
 
+
+pub fn rms_norm_heads(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    for h in 0..n_heads {
+        let sl = &mut x[h * head_dim..(h + 1) * head_dim];
+        let ss: f32 = sl.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+        let sc = 1.0 / (ss + eps).sqrt();
+        for d in 0..head_dim { sl[d] = sl[d] * sc * w[d]; }
+    }
+}
+
+/// LFM2 ShortConv: bcx has [B (E), C (E), X (E)]; state has [E, d_conv] where d_conv = l_cache - 1;
+/// conv_w has [E, l_cache] (ne[0] = l_cache contiguous per channel).
+pub fn shortconv_step(bcx: &[f32], conv_w: &[f32], state: &mut [f32], out: &mut [f32], n_embd: usize, l_cache: usize) {
+    let d_conv = l_cache - 1;
+    let b = &bcx[0..n_embd];
+    let c = &bcx[n_embd..2 * n_embd];
+    let x = &bcx[2 * n_embd..3 * n_embd];
+    for e in 0..n_embd {
+        let bx_cur = b[e] * x[e];
+        let st = &mut state[e * d_conv..(e + 1) * d_conv];
+        let w = &conv_w[e * l_cache..(e + 1) * l_cache];
+        let mut acc = 0f32;
+        for t in 0..d_conv { acc += st[t] * w[t]; }
+        acc += bx_cur * w[d_conv];
+        // shift left, append bx_cur
+        for t in 0..d_conv - 1 { st[t] = st[t + 1]; }
+        st[d_conv - 1] = bx_cur;
+        out[e] = c[e] * acc;
+    }
+}
+
+/// Qwen3.5 SSM causal depthwise 1D conv + SiLU over `channels` channels, kernel size `k_conv` (4).
+pub fn ssm_conv_silu(x: &[f32], conv_w: &[f32], state: &mut [f32], out: &mut [f32], channels: usize, k_conv: usize) {
+    let d_conv = k_conv - 1;
+    for ch in 0..channels {
+        let st = &mut state[ch * d_conv..(ch + 1) * d_conv];
+        let w = &conv_w[ch * k_conv..(ch + 1) * k_conv];
+        let mut acc = 0f32;
+        for t in 0..d_conv { acc += st[t] * w[t]; }
+        acc += x[ch] * w[d_conv];
+        for t in 0..d_conv - 1 { st[t] = st[t + 1]; }
+        st[d_conv - 1] = x[ch];
+        out[ch] = acc / (1.0 + (-acc).exp());
+    }
+}
+
+/// Qwen3.5 Gated DeltaNet autoregressive step.
+/// `qkv` = [Q (n_k_heads*dk), K (n_k_heads*dk), V (n_v_heads*dv)], dk == dv == head_dim.
+/// `state` = [n_v_heads, dv, dk] (row j = v_dim, col i = k_dim).
+pub fn deltanet_step(
+    qkv: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    dt_bias: &[f32],
+    ssm_a: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    let k_total = n_k_heads * head_dim;
+    let q_all = &qkv[0..k_total];
+    let k_all = &qkv[k_total..2 * k_total];
+    let v_all = &qkv[2 * k_total..2 * k_total + n_v_heads * head_dim];
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut q_norm = vec![0f32; head_dim];
+    let mut k_norm = vec![0f32; head_dim];
+    for h in 0..n_v_heads {
+        let kh = h % n_k_heads;
+        let qh = &q_all[kh * head_dim..(kh + 1) * head_dim];
+        let kh_v = &k_all[kh * head_dim..(kh + 1) * head_dim];
+        let q_inv = 1.0 / (qh.iter().map(|v| v * v).sum::<f32>() + eps).sqrt() * q_scale;
+        let k_inv = 1.0 / (kh_v.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+        for i in 0..head_dim {
+            q_norm[i] = qh[i] * q_inv;
+            k_norm[i] = kh_v[i] * k_inv;
+        }
+        let ab = alpha[h] + dt_bias[h];
+        let sp = if ab > 20.0 { ab } else { (1.0 + ab.exp()).ln() };
+        let g = (sp * ssm_a[h]).exp();
+        let b = 1.0 / (1.0 + (-beta[h]).exp());
+
+        let sh = &mut state[h * head_dim * head_dim..(h + 1) * head_dim * head_dim];
+        let vh = &v_all[h * head_dim..(h + 1) * head_dim];
+        let oh = &mut out[h * head_dim..(h + 1) * head_dim];
+        for j in 0..head_dim {
+            let row = &mut sh[j * head_dim..(j + 1) * head_dim];
+            let mut sk = 0f32;
+            for i in 0..head_dim {
+                row[i] *= g;
+                sk += row[i] * k_norm[i];
+            }
+            let dj = (vh[j] - sk) * b;
+            let mut o_j = 0f32;
+            for i in 0..head_dim {
+                row[i] += k_norm[i] * dj;
+                o_j += row[i] * q_norm[i];
+            }
+            oh[j] = o_j;
+        }
+    }
+}
+
+pub fn gated_rms_norm_heads(x: &[f32], w: &[f32], z: &[f32], out: &mut [f32], n_heads: usize, head_dim: usize, eps: f32) {
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        let ss: f32 = x[base..base + head_dim].iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+        let sc = 1.0 / (ss + eps).sqrt();
+        for d in 0..head_dim {
+            let zv = z[base + d];
+            let silu = zv / (1.0 + (-zv).exp());
+            out[base + d] = x[base + d] * sc * w[d] * silu;
+        }
+    }
+}
+
+pub fn mul_sigmoid_inplace(x: &mut [f32], gate: &[f32]) {
+    for (a, &g) in x.iter_mut().zip(gate) {
+        *a *= 1.0 / (1.0 + (-g).exp());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

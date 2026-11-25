@@ -22,6 +22,15 @@ fn main() {
         "qmv_q4_k",
         "qmv_q5_k",
         "qmv_q6_k",
+        "qmv_q2_k",
+        "qmv_q3_k",
+        "rms_norm_heads",
+        "shortconv_step",
+        "ssm_conv_silu",
+        "deltanet_step",
+        "gated_rms_norm",
+        "split_qg",
+        "mul_sigmoid",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

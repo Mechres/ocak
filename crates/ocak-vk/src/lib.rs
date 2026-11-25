@@ -30,6 +30,8 @@ pub enum WType {
     F16,
     Q8_0,
     Q4_0,
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -42,6 +44,8 @@ impl WType {
             GgmlType::F16 => WType::F16,
             GgmlType::Q8_0 => WType::Q8_0,
             GgmlType::Q4_0 => WType::Q4_0,
+            GgmlType::Q2K => WType::Q2K,
+            GgmlType::Q3K => WType::Q3K,
             GgmlType::Q4K => WType::Q4K,
             GgmlType::Q5K => WType::Q5K,
             GgmlType::Q6K => WType::Q6K,
@@ -55,6 +59,8 @@ impl WType {
             WType::F16 => GgmlType::F16,
             WType::Q8_0 => GgmlType::Q8_0,
             WType::Q4_0 => GgmlType::Q4_0,
+            WType::Q2K => GgmlType::Q2K,
+            WType::Q3K => GgmlType::Q3K,
             WType::Q4K => GgmlType::Q4K,
             WType::Q5K => GgmlType::Q5K,
             WType::Q6K => GgmlType::Q6K,
@@ -88,6 +94,15 @@ struct Pipelines {
     qmv_q4_k: PipelineBundle,
     qmv_q5_k: PipelineBundle,
     qmv_q6_k: PipelineBundle,
+    qmv_q2_k: PipelineBundle,
+    qmv_q3_k: PipelineBundle,
+    rms_norm_heads: PipelineBundle,
+    shortconv_step: PipelineBundle,
+    ssm_conv_silu: PipelineBundle,
+    deltanet_step: PipelineBundle,
+    gated_rms_norm: PipelineBundle,
+    split_qg: PipelineBundle,
+    mul_sigmoid: PipelineBundle,
 }
 
 impl Pipelines {
@@ -96,7 +111,7 @@ impl Pipelines {
             &self.rms_norm, &self.add, &self.copy, &self.swiglu, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_q8_0, &self.qmv_q4_0,
-            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k,
+            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k, &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -262,6 +277,15 @@ impl VkContext {
                 qmv_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k.spv")), 3, 24)?,
                 qmv_q5_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q5_k.spv")), 3, 24)?,
                 qmv_q6_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q6_k.spv")), 3, 24)?,
+                qmv_q2_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q2_k.spv")), 3, 24)?,
+                qmv_q3_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q3_k.spv")), 3, 24)?,
+                rms_norm_heads: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_heads.spv")), 2, 16)?,
+                shortconv_step: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_step.spv")), 4, 8)?,
+                ssm_conv_silu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), 4, 8)?,
+                deltanet_step: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step.spv")), 7, 16)?,
+                gated_rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), 4, 12)?,
+                split_qg: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), 3, 8)?,
+                mul_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), 2, 4)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -278,7 +302,7 @@ impl VkContext {
             )?[0];
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(MAX_DESC_SETS * 4)];
+                .descriptor_count(MAX_DESC_SETS * 7)];
             let desc_pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(MAX_DESC_SETS)
@@ -416,6 +440,21 @@ impl VkContext {
         let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
         self.device.queue_submit(self.queue, &si, exec.fence)?;
         self.device.wait_for_fences(&[exec.fence], true, u64::MAX)?;
+        Ok(())
+    }
+
+    pub fn zero_buffer(&self, dst: &Buffer) -> Result<(), VkError> {
+        let exec = self.exec.lock().unwrap();
+        unsafe {
+            self.device.reset_command_buffer(exec.cmd_buf, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                exec.cmd_buf,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            self.device.cmd_fill_buffer(exec.cmd_buf, dst.buf, 0, vk::WHOLE_SIZE, 0);
+            self.device.end_command_buffer(exec.cmd_buf)?;
+            self.submit_wait(&exec)?;
+        }
         Ok(())
     }
 
@@ -621,6 +660,8 @@ impl<'a> Recorder<'a> {
             WType::Q4K => &self.ctx.pipelines.qmv_q4_k,
             WType::Q5K => &self.ctx.pipelines.qmv_q5_k,
             WType::Q6K => &self.ctx.pipelines.qmv_q6_k,
+            WType::Q2K => &self.ctx.pipelines.qmv_q2_k,
+            WType::Q3K => &self.ctx.pipelines.qmv_q3_k,
         };
         let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k)];
         let gx = (m + 3) / 4;
@@ -667,6 +708,42 @@ impl<'a> Recorder<'a> {
         self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf], bytemuck::cast_slice(&pc), (k + 255) / 256, 1, 1);
     }
 
+    pub fn rms_norm_heads(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
+        let pc = [x_off as u32, n_heads, head_dim, eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.rms_norm_heads, &[x.buf, w.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
+    }
+
+    pub fn shortconv_step(&mut self, bcx: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, n_embd: u32, l_cache: u32) {
+        let pc = [n_embd, l_cache];
+        self.dispatch_raw(&self.ctx.pipelines.shortconv_step, &[bcx.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (n_embd + 255) / 256, 1, 1);
+    }
+
+    pub fn ssm_conv_silu(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32) {
+        let pc = [channels, k_conv];
+        self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (channels + 255) / 256, 1, 1);
+    }
+
+    pub fn deltanet_step(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32) {
+        let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &[qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), n_v_heads * head_dim, 1, 1);
+    }
+
+    pub fn gated_rms_norm(&mut self, x: &Buffer, w: &Buffer, z: &Buffer, out: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
+        let pc = [n_heads, head_dim, eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.gated_rms_norm, &[x.buf, w.buf, z.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
+    }
+
+    pub fn split_qg(&mut self, qg: &Buffer, q: &Buffer, g: &Buffer, n_heads: u32, head_dim: u32) {
+        let pc = [n_heads, head_dim];
+        let total = n_heads * head_dim;
+        self.dispatch_raw(&self.ctx.pipelines.split_qg, &[qg.buf, q.buf, g.buf], bytemuck::cast_slice(&pc), (total + 255) / 256, 1, 1);
+    }
+
+    pub fn mul_sigmoid(&mut self, x: &Buffer, g: &Buffer, n: u32) {
+        let pc = [n];
+        self.dispatch_raw(&self.ctx.pipelines.mul_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
     pub fn finish_and_wait(self) -> Result<(), VkError> {
         unsafe {
             self.ctx.device.end_command_buffer(self.exec.cmd_buf)?;
@@ -709,6 +786,13 @@ mod tests {
                 blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                 blk[2..4].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
             },
+            WType::Q2K => for blk in v.chunks_exact_mut(bb) {
+                blk[80..82].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                blk[82..84].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+            },
+            WType::Q3K => for blk in v.chunks_exact_mut(bb) {
+                blk[108..110].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+            },
             WType::Q6K => for blk in v.chunks_exact_mut(bb) { blk[208..210].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
         }
         v
@@ -718,7 +802,7 @@ mod tests {
     fn vk_qmv_all_types_match_cpu() {
         let c = ctx();
         let mut rng = Lcg(1337);
-        for ty in [WType::F32, WType::F16, WType::Q8_0, WType::Q4_0, WType::Q4K, WType::Q5K, WType::Q6K] {
+        for ty in [WType::F32, WType::F16, WType::Q8_0, WType::Q4_0, WType::Q2K, WType::Q3K, WType::Q4K, WType::Q5K, WType::Q6K] {
             let (k, m) = (512usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();
@@ -814,6 +898,67 @@ mod tests {
         let mut e_cpu = vec![0f32; 512];
         dequantize_row(GgmlType::Q4K, &w[3 * rb..4 * rb], &mut e_cpu, 512);
         for i in 0..512 { assert!((e_cpu[i] - e_gpu[i]).abs() < 1e-4); }
+    }
+
+
+    #[test]
+    fn vk_m4_hybrid_shortconv_and_deltanet_match_cpu() {
+        let c = ctx();
+        let mut rng = Lcg(4242);
+        // 1. ShortConv (LFM2)
+        let (ne, lc) = (256usize, 3usize);
+        let bcx: Vec<f32> = (0..3 * ne).map(|_| rng.f()).collect();
+        let cw: Vec<f32> = (0..ne * lc).map(|_| rng.f()).collect();
+        let mut st_cpu = vec![0f32; ne * (lc - 1)];
+        let mut o_cpu = vec![0f32; ne];
+        let b_bcx = c.create_device_buffer((bcx.len() * 4) as u64).unwrap();
+        let b_cw = c.create_device_buffer((cw.len() * 4) as u64).unwrap();
+        let b_st = c.create_device_buffer((st_cpu.len() * 4) as u64).unwrap();
+        let b_o = c.create_device_buffer((o_cpu.len() * 4) as u64).unwrap();
+        c.upload(&b_bcx, 0, bytemuck::cast_slice(&bcx)).unwrap();
+        c.upload(&b_cw, 0, bytemuck::cast_slice(&cw)).unwrap();
+        c.zero_buffer(&b_st).unwrap();
+        for _ in 0..4 {
+            ocak_cpu::ops::shortconv_step(&bcx, &cw, &mut st_cpu, &mut o_cpu, ne, lc);
+            let mut rec = c.begin();
+            rec.shortconv_step(&b_bcx, &b_cw, &b_st, &b_o, ne as u32, lc as u32);
+            rec.finish_and_wait().unwrap();
+        }
+        let mut o_gpu = vec![0f32; ne];
+        c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..ne { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-4, "shortconv[{i}]"); }
+
+        // 2. Gated DeltaNet (Qwen3.5)
+        let (nkh, nvh, hd) = (4usize, 8usize, 128usize);
+        let qkv: Vec<f32> = (0..(2 * nkh + nvh) * hd).map(|_| rng.f()).collect();
+        let alpha: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let beta: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let dt_bias: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let ssm_a: Vec<f32> = (0..nvh).map(|_| -rng.f().abs()).collect();
+        let mut st_cpu = vec![0f32; nvh * hd * hd];
+        let mut o_cpu = vec![0f32; nvh * hd];
+        let b_qkv = c.create_device_buffer((qkv.len() * 4) as u64).unwrap();
+        let b_al = c.create_device_buffer((alpha.len() * 4) as u64).unwrap();
+        let b_bt = c.create_device_buffer((beta.len() * 4) as u64).unwrap();
+        let b_dt = c.create_device_buffer((dt_bias.len() * 4) as u64).unwrap();
+        let b_sa = c.create_device_buffer((ssm_a.len() * 4) as u64).unwrap();
+        let b_st = c.create_device_buffer((st_cpu.len() * 4) as u64).unwrap();
+        let b_o = c.create_device_buffer((o_cpu.len() * 4) as u64).unwrap();
+        c.upload(&b_qkv, 0, bytemuck::cast_slice(&qkv)).unwrap();
+        c.upload(&b_al, 0, bytemuck::cast_slice(&alpha)).unwrap();
+        c.upload(&b_bt, 0, bytemuck::cast_slice(&beta)).unwrap();
+        c.upload(&b_dt, 0, bytemuck::cast_slice(&dt_bias)).unwrap();
+        c.upload(&b_sa, 0, bytemuck::cast_slice(&ssm_a)).unwrap();
+        c.zero_buffer(&b_st).unwrap();
+        for _ in 0..3 {
+            ocak_cpu::ops::deltanet_step(&qkv, &alpha, &beta, &dt_bias, &ssm_a, &mut st_cpu, &mut o_cpu, nkh, nvh, hd, 1e-6);
+            let mut rec = c.begin();
+            rec.deltanet_step(&b_qkv, &b_al, &b_bt, &b_dt, &b_sa, &b_st, &b_o, nkh as u32, nvh as u32, hd as u32, 1e-6);
+            rec.finish_and_wait().unwrap();
+        }
+        let mut o_gpu = vec![0f32; nvh * hd];
+        c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..o_cpu.len() { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-3, "deltanet[{i}]: cpu={} gpu={}", o_cpu[i], o_gpu[i]); }
     }
 
     #[test]

@@ -1,0 +1,27 @@
+#version 460
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(push_constant) uniform PC { uint x_off; uint n_heads; uint head_dim; float eps; } pc;
+shared float ssum[128];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = pc.x_off + h * pc.head_dim;
+    float acc = 0.0;
+    for (uint d = tid; d < pc.head_dim; d += 128u) {
+        float v = x[base + d];
+        acc += v * v;
+    }
+    ssum[tid] = acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        barrier();
+    }
+    float sc = inversesqrt(ssum[0] / float(pc.head_dim) + pc.eps);
+    for (uint d = tid; d < pc.head_dim; d += 128u) {
+        x[base + d] = x[base + d] * sc * w[d];
+    }
+}

@@ -18,9 +18,13 @@ pub struct Out {
     pub hidden: bool,
 }
 
-/// One-token-at-a-time transformer forward pass with a paged KV cache owned by the executor.
+/// One-token-at-a-time transformer/hybrid forward pass with paged KV + recurrent states.
 pub trait Executor: Send {
     fn name(&self) -> String;
+    /// Resets any recurrent (ShortConv / DeltaNet) layer states before a fresh sequence.
+    fn reset_recurrent(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
     /// Processes `token` at position `pos`; `page_table[p]` maps logical page p to a physical page.
     fn forward(&mut self, token: u32, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError>;
     fn logits(&self) -> &[f32];

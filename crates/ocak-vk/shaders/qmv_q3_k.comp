@@ -1,0 +1,70 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+uint u32_at(uint o) {
+    return uint(w[o]) | (uint(w[o+1]) << 8) | (uint(w[o+2]) << 16) | (uint(w[o+3]) << 24);
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 256u;
+        const uint km1 = 0x03030303u;
+        const uint km2 = 0x0f0f0f0fu;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 110u;
+            float d_all = unpackHalf2x16(uint(w[b+108]) | (uint(w[b+109]) << 8)).x;
+            uint a0 = u32_at(b + 96u);
+            uint a1 = u32_at(b + 100u);
+            uint tmp = u32_at(b + 104u);
+            uint aux[4];
+            aux[2] = ((a0 >> 4) & km2) | (((tmp >> 4) & km1) << 4);
+            aux[3] = ((a1 >> 4) & km2) | (((tmp >> 6) & km1) << 4);
+            aux[0] = (a0 & km2) | ((tmp & km1) << 4);
+            aux[1] = (a1 & km2) | (((tmp >> 2) & km1) << 4);
+            uint xb = pc.x_off + blk * 256u;
+            uint is = 0u;
+            uint mask = 1u;
+            uint xi = 0u;
+            for (uint half_i = 0u; half_i < 2u; half_i++) {
+                uint qb = b + 32u + half_i * 32u;
+                uint shift = 0u;
+                for (uint j = 0u; j < 4u; j++) {
+                    int sc1 = int((aux[is >> 2] >> ((is & 3u) * 8u)) & 0xFFu); if (sc1 >= 128) sc1 -= 256;
+                    float dl = d_all * float(sc1 - 32); is++;
+                    float s1 = 0.0;
+                    for (uint l = 0u; l < 16u; l++) {
+                        int v = int((uint(w[qb + l]) >> shift) & 3u) - (((uint(w[b + l]) & mask) != 0u) ? 0 : 4);
+                        s1 += float(v) * x[xb + xi + l];
+                    }
+                    acc += dl * s1; xi += 16u;
+                    int sc2 = int((aux[is >> 2] >> ((is & 3u) * 8u)) & 0xFFu); if (sc2 >= 128) sc2 -= 256;
+                    dl = d_all * float(sc2 - 32); is++;
+                    float s2 = 0.0;
+                    for (uint l = 0u; l < 16u; l++) {
+                        int v = int((uint(w[qb + l + 16u]) >> shift) & 3u) - (((uint(w[b + l + 16u]) & mask) != 0u) ? 0 : 4);
+                        s2 += float(v) * x[xb + xi + l];
+                    }
+                    acc += dl * s2; xi += 16u;
+                    shift += 2u;
+                    mask <<= 1u;
+                }
+            }
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0u && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}
