@@ -1,0 +1,9 @@
+[package]
+name = "ocak-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ocak-gguf.workspace = true
+half.workspace = true
+rayon.workspace = true

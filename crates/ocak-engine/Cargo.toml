@@ -1,0 +1,19 @@
+[package]
+name = "ocak-engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["vulkan"]
+vulkan = ["dep:ocak-vk"]
+
+[dependencies]
+ocak-gguf.workspace = true
+ocak-tok = { path = "../ocak-tok" }
+ocak-kv = { path = "../ocak-kv" }
+ocak-cpu = { path = "../ocak-cpu" }
+ocak-vk = { path = "../ocak-vk", optional = true }
+half.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+serde.workspace = true

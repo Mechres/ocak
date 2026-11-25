@@ -1,0 +1,78 @@
+#version 460
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KV { float kv[]; };
+layout(set = 0, binding = 2) readonly buffer PT { uint pt[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint layer_kv_off;
+    uint pt_off;
+    uint out_off;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint pos;
+} pc;
+shared float sdot[32];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint group = pc.n_heads / pc.n_kv_heads;
+    uint kvh = h / group;
+    uint kv_dim = pc.n_kv_heads * pc.head_dim;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    float qreg[8];
+    float acc[8];
+    for (uint j = 0; j < 8; j++) {
+        uint d = tid + j * 32u;
+        qreg[j] = (d < pc.head_dim) ? q[pc.q_off + h * pc.head_dim + d] : 0.0;
+        acc[j] = 0.0;
+    }
+
+    float m = -3.402823466e38;
+    float l = 0.0;
+
+    for (uint t = 0; t <= pc.pos; t++) {
+        uint page = pt[pc.pt_off + (t >> 4)];
+        uint slot = t & 15u;
+        uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * kv_dim + kvh * pc.head_dim;
+        uint vo = pc.layer_kv_off + ((page * 2u + 1u) * 16u + slot) * kv_dim + kvh * pc.head_dim;
+
+        float part = 0.0;
+        for (uint j = 0; j < 8; j++) {
+            uint d = tid + j * 32u;
+            if (d < pc.head_dim) {
+                part += qreg[j] * kv[ko + d];
+            }
+        }
+        sdot[tid] = part;
+        barrier();
+        for (uint s = 16; s > 0; s >>= 1) {
+            if (tid < s) sdot[tid] += sdot[tid + s];
+            barrier();
+        }
+        float score = sdot[0] * scale;
+        float m_new = max(m, score);
+        float alpha = exp(m - m_new);
+        float p = exp(score - m_new);
+        l = l * alpha + p;
+        for (uint j = 0; j < 8; j++) {
+            uint d = tid + j * 32u;
+            if (d < pc.head_dim) {
+                acc[j] = acc[j] * alpha + p * kv[vo + d];
+            }
+        }
+        m = m_new;
+    }
+
+    float inv_l = 1.0 / l;
+    for (uint j = 0; j < 8; j++) {
+        uint d = tid + j * 32u;
+        if (d < pc.head_dim) {
+            o[pc.out_off + h * pc.head_dim + d] = acc[j] * inv_l;
+        }
+    }
+}

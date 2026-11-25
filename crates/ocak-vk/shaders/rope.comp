@@ -1,0 +1,42 @@
+#version 460
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Q { float q[]; };
+layout(set = 0, binding = 1) buffer K { float k[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint k_off;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint n_rot;
+    uint pos;
+    uint mode;
+    float freq_base;
+} pc;
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint half_rot = pc.n_rot / 2;
+    for (uint i = gl_LocalInvocationID.x; i < half_rot; i += 64) {
+        float theta = float(pc.pos) * pow(pc.freq_base, -2.0 * float(i) / float(pc.n_rot));
+        float c = cos(theta);
+        float s = sin(theta);
+        uint a = (pc.mode == 0) ? (2 * i) : i;
+        uint b = (pc.mode == 0) ? (2 * i + 1) : (i + half_rot);
+        if (wg < pc.n_heads) {
+            uint base = pc.q_off + wg * pc.head_dim;
+            float x0 = q[base + a];
+            float x1 = q[base + b];
+            q[base + a] = x0 * c - x1 * s;
+            q[base + b] = x0 * s + x1 * c;
+        } else {
+            uint h = wg - pc.n_heads;
+            if (h < pc.n_kv_heads) {
+                uint base = pc.k_off + h * pc.head_dim;
+                float x0 = k[base + a];
+                float x1 = k[base + b];
+                k[base + a] = x0 * c - x1 * s;
+                k[base + b] = x0 * s + x1 * c;
+            }
+        }
+    }
+}

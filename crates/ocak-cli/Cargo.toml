@@ -1,0 +1,29 @@
+[package]
+name = "ocak-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ocakd"
+path = "src/bin/ocakd.rs"
+
+[[bin]]
+name = "ocak"
+path = "src/bin/ocak.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+libc.workspace = true
+ocak-engine = { path = "../ocak-engine" }
+ocak-federation = { path = "../ocak-federation" }
+ocak-gguf.workspace = true
+ocak-sysfs.workspace = true
+ocak-server = { path = "../ocak-server" }
+ocak-tok = { path = "../ocak-tok" }
+ocak-vk = { path = "../ocak-vk" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

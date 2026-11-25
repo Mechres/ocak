@@ -1,0 +1,360 @@
+//! GGML tensor types and exact CPU reference dequantization.
+use half::{bf16, f16};
+
+pub const QK_K: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GgmlType {
+    F32,
+    F16,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q8_1,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
+    IQ2XXS,
+    IQ2XS,
+    IQ3XXS,
+    IQ1S,
+    IQ4NL,
+    IQ3S,
+    IQ2S,
+    IQ4XS,
+    I8,
+    I16,
+    I32,
+    I64,
+    F64,
+    IQ1M,
+    BF16,
+    Other(u32),
+}
+
+impl GgmlType {
+    pub fn from_u32(v: u32) -> Self {
+        use GgmlType::*;
+        match v {
+            0 => F32, 1 => F16, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1, 8 => Q8_0, 9 => Q8_1,
+            10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K, 15 => Q8K,
+            16 => IQ2XXS, 17 => IQ2XS, 18 => IQ3XXS, 19 => IQ1S, 20 => IQ4NL, 21 => IQ3S,
+            22 => IQ2S, 23 => IQ4XS, 24 => I8, 25 => I16, 26 => I32, 27 => I64, 28 => F64,
+            29 => IQ1M, 30 => BF16, o => Other(o),
+        }
+    }
+
+    pub fn id(self) -> u32 {
+        use GgmlType::*;
+        match self {
+            F32 => 0, F16 => 1, Q4_0 => 2, Q4_1 => 3, Q5_0 => 6, Q5_1 => 7, Q8_0 => 8, Q8_1 => 9,
+            Q2K => 10, Q3K => 11, Q4K => 12, Q5K => 13, Q6K => 14, Q8K => 15,
+            IQ2XXS => 16, IQ2XS => 17, IQ3XXS => 18, IQ1S => 19, IQ4NL => 20, IQ3S => 21,
+            IQ2S => 22, IQ4XS => 23, I8 => 24, I16 => 25, I32 => 26, I64 => 27, F64 => 28,
+            IQ1M => 29, BF16 => 30, Other(o) => o,
+        }
+    }
+
+    pub fn name(self) -> String {
+        use GgmlType::*;
+        match self {
+            Q4_0 => "Q4_0".into(), Q4_1 => "Q4_1".into(), Q5_0 => "Q5_0".into(), Q5_1 => "Q5_1".into(),
+            Q8_0 => "Q8_0".into(), Q8_1 => "Q8_1".into(), Q2K => "Q2_K".into(), Q3K => "Q3_K".into(),
+            Q4K => "Q4_K".into(), Q5K => "Q5_K".into(), Q6K => "Q6_K".into(), Q8K => "Q8_K".into(),
+            IQ2XXS => "IQ2_XXS".into(), IQ2XS => "IQ2_XS".into(), IQ3XXS => "IQ3_XXS".into(),
+            IQ1S => "IQ1_S".into(), IQ4NL => "IQ4_NL".into(), IQ3S => "IQ3_S".into(),
+            IQ2S => "IQ2_S".into(), IQ4XS => "IQ4_XS".into(), IQ1M => "IQ1_M".into(),
+            Other(o) => format!("type{o}"),
+            o => format!("{o:?}"),
+        }
+    }
+
+    /// (elements per block, bytes per block); None when unsupported here.
+    pub fn block(self) -> Option<(usize, usize)> {
+        use GgmlType::*;
+        Some(match self {
+            F32 => (1, 4),
+            F16 | BF16 => (1, 2),
+            F64 | I64 => (1, 8),
+            I8 => (1, 1),
+            I16 => (1, 2),
+            I32 => (1, 4),
+            Q4_0 => (32, 18),
+            Q4_1 => (32, 20),
+            Q5_0 => (32, 22),
+            Q5_1 => (32, 24),
+            Q8_0 => (32, 34),
+            Q8_1 => (32, 36),
+            Q2K => (QK_K, 84),
+            Q3K => (QK_K, 110),
+            Q4K => (QK_K, 144),
+            Q5K => (QK_K, 176),
+            Q6K => (QK_K, 210),
+            Q8K => (QK_K, 292),
+            IQ2XXS => (QK_K, 66),
+            IQ2XS => (QK_K, 74),
+            IQ2S => (QK_K, 82),
+            IQ3XXS => (QK_K, 98),
+            IQ3S => (QK_K, 110),
+            IQ1S => (QK_K, 50),
+            IQ1M => (QK_K, 56),
+            IQ4NL => (32, 18),
+            IQ4XS => (QK_K, 136),
+            Other(_) => return None,
+        })
+    }
+
+    pub fn row_bytes(self, n_elems: usize) -> Option<usize> {
+        let (be, bb) = self.block()?;
+        if n_elems % be != 0 {
+            return None;
+        }
+        Some(n_elems / be * bb)
+    }
+
+    /// Types `dequantize_row` implements.
+    pub fn dequant_supported(self) -> bool {
+        use GgmlType::*;
+        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q4K | Q5K | Q6K)
+    }
+}
+
+#[inline]
+fn f16_at(b: &[u8], o: usize) -> f32 {
+    f16::from_le_bytes([b[o], b[o + 1]]).to_f32()
+}
+
+#[inline]
+pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+    }
+}
+
+/// Dequantizes `n` elements (a whole number of blocks) from `src` into `dst[..n]`.
+pub fn dequantize_row(t: GgmlType, src: &[u8], dst: &mut [f32], n: usize) {
+    use GgmlType::*;
+    match t {
+        F32 => {
+            for i in 0..n {
+                dst[i] = f32::from_le_bytes(src[4 * i..4 * i + 4].try_into().unwrap());
+            }
+        }
+        F16 => {
+            for i in 0..n {
+                dst[i] = f16_at(src, 2 * i);
+            }
+        }
+        BF16 => {
+            for i in 0..n {
+                dst[i] = bf16::from_le_bytes([src[2 * i], src[2 * i + 1]]).to_f32();
+            }
+        }
+        Q4_0 => {
+            for (bi, b) in src.chunks_exact(18).take(n / 32).enumerate() {
+                let d = f16_at(b, 0);
+                for j in 0..16 {
+                    dst[bi * 32 + j] = ((b[2 + j] & 0xF) as i32 - 8) as f32 * d;
+                    dst[bi * 32 + j + 16] = ((b[2 + j] >> 4) as i32 - 8) as f32 * d;
+                }
+            }
+        }
+        Q4_1 => {
+            for (bi, b) in src.chunks_exact(20).take(n / 32).enumerate() {
+                let (d, m) = (f16_at(b, 0), f16_at(b, 2));
+                for j in 0..16 {
+                    dst[bi * 32 + j] = (b[4 + j] & 0xF) as f32 * d + m;
+                    dst[bi * 32 + j + 16] = (b[4 + j] >> 4) as f32 * d + m;
+                }
+            }
+        }
+        Q5_0 => {
+            for (bi, b) in src.chunks_exact(22).take(n / 32).enumerate() {
+                let d = f16_at(b, 0);
+                let qh = u32::from_le_bytes(b[2..6].try_into().unwrap());
+                for j in 0..16 {
+                    let xh0 = ((qh >> j) << 4) & 0x10;
+                    let xh1 = (qh >> (j + 12)) & 0x10;
+                    dst[bi * 32 + j] = (((b[6 + j] & 0xF) as u32 | xh0) as i32 - 16) as f32 * d;
+                    dst[bi * 32 + j + 16] = (((b[6 + j] >> 4) as u32 | xh1) as i32 - 16) as f32 * d;
+                }
+            }
+        }
+        Q5_1 => {
+            for (bi, b) in src.chunks_exact(24).take(n / 32).enumerate() {
+                let (d, m) = (f16_at(b, 0), f16_at(b, 2));
+                let qh = u32::from_le_bytes(b[4..8].try_into().unwrap());
+                for j in 0..16 {
+                    let xh0 = ((qh >> j) << 4) & 0x10;
+                    let xh1 = (qh >> (j + 12)) & 0x10;
+                    dst[bi * 32 + j] = ((b[8 + j] & 0xF) as u32 | xh0) as f32 * d + m;
+                    dst[bi * 32 + j + 16] = ((b[8 + j] >> 4) as u32 | xh1) as f32 * d + m;
+                }
+            }
+        }
+        Q8_0 => {
+            for (bi, b) in src.chunks_exact(34).take(n / 32).enumerate() {
+                let d = f16_at(b, 0);
+                for j in 0..32 {
+                    dst[bi * 32 + j] = (b[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        Q4K => {
+            for (bi, b) in src.chunks_exact(144).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let dmin = f16_at(b, 2);
+                let scales = &b[4..16];
+                let qs = &b[16..144];
+                let mut out = bi * QK_K;
+                let mut is = 0;
+                for g in 0..4 {
+                    let q = &qs[g * 32..g * 32 + 32];
+                    let (sc, m) = get_scale_min_k4(is, scales);
+                    let (d1, m1) = (d * sc as f32, dmin * m as f32);
+                    let (sc, m) = get_scale_min_k4(is + 1, scales);
+                    let (d2, m2) = (d * sc as f32, dmin * m as f32);
+                    for l in 0..32 {
+                        dst[out + l] = d1 * (q[l] & 0xF) as f32 - m1;
+                    }
+                    for l in 0..32 {
+                        dst[out + 32 + l] = d2 * (q[l] >> 4) as f32 - m2;
+                    }
+                    out += 64;
+                    is += 2;
+                }
+            }
+        }
+        Q5K => {
+            for (bi, b) in src.chunks_exact(176).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let dmin = f16_at(b, 2);
+                let scales = &b[4..16];
+                let qh = &b[16..48];
+                let qs = &b[48..176];
+                let mut out = bi * QK_K;
+                let mut is = 0;
+                let (mut u1, mut u2) = (1u8, 2u8);
+                for g in 0..4 {
+                    let ql = &qs[g * 32..g * 32 + 32];
+                    let (sc, m) = get_scale_min_k4(is, scales);
+                    let (d1, m1) = (d * sc as f32, dmin * m as f32);
+                    let (sc, m) = get_scale_min_k4(is + 1, scales);
+                    let (d2, m2) = (d * sc as f32, dmin * m as f32);
+                    for l in 0..32 {
+                        let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+                        dst[out + l] = d1 * ((ql[l] & 0xF) as i32 + hi) as f32 - m1;
+                    }
+                    for l in 0..32 {
+                        let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+                        dst[out + 32 + l] = d2 * ((ql[l] >> 4) as i32 + hi) as f32 - m2;
+                    }
+                    out += 64;
+                    is += 2;
+                    u1 <<= 2;
+                    u2 <<= 2;
+                }
+            }
+        }
+        Q6K => {
+            for (bi, b) in src.chunks_exact(210).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 208);
+                let mut out = bi * QK_K;
+                for half in 0..2 {
+                    let ql = &b[half * 64..half * 64 + 64];
+                    let qh = &b[128 + half * 32..128 + half * 32 + 32];
+                    let sc = &b[192 + half * 8..192 + half * 8 + 8];
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = (((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i32) - 32;
+                        let q2 = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32) - 32;
+                        let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32) - 32;
+                        let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32) - 32;
+                        dst[out + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                        dst[out + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                        dst[out + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                        dst[out + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+                    }
+                    out += 128;
+                }
+            }
+        }
+        _ => panic!("dequantize_row: unsupported type {}", t.name()),
+    }
+}
+
+/// Quantizes `x` (multiple of 32) into Q8_0 blocks (34 bytes each), matching ggml's reference.
+pub fn quantize_q8_0(x: &[f32], out: &mut Vec<u8>) {
+    for blk in x.chunks_exact(32) {
+        let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        for v in blk {
+            out.push((v * id).round() as i8 as u8);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_sizes_match_ggml() {
+        assert_eq!(GgmlType::Q4_0.block(), Some((32, 18)));
+        assert_eq!(GgmlType::Q8_0.block(), Some((32, 34)));
+        assert_eq!(GgmlType::Q4K.block(), Some((256, 144)));
+        assert_eq!(GgmlType::Q5K.block(), Some((256, 176)));
+        assert_eq!(GgmlType::Q6K.block(), Some((256, 210)));
+        assert_eq!(GgmlType::from_u32(12), GgmlType::Q4K);
+        assert_eq!(GgmlType::Q6K.id(), 14);
+    }
+
+    #[test]
+    fn q4_0_roundtrip_layout() {
+        let mut b = vec![0u8; 18];
+        b[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+        for j in 0..16 {
+            b[2 + j] = ((((j as u8) + 1) & 0xF) << 4) | (j as u8);
+        }
+        let mut y = vec![0f32; 32];
+        dequantize_row(GgmlType::Q4_0, &b, &mut y, 32);
+        for j in 0..16 {
+            assert_eq!(y[j], (j as i32 - 8) as f32 * 0.5);
+            assert_eq!(y[j + 16], (((j as i32 + 1) & 0xF) - 8) as f32 * 0.5);
+        }
+    }
+
+    #[test]
+    fn q8_0_quantize_dequantize_close() {
+        let x: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let mut q = Vec::new();
+        quantize_q8_0(&x, &mut q);
+        assert_eq!(q.len(), 68);
+        let mut y = vec![0f32; 64];
+        dequantize_row(GgmlType::Q8_0, &q, &mut y, 64);
+        for i in 0..64 {
+            assert!((x[i] - y[i]).abs() < 0.01, "{} {}", x[i], y[i]);
+        }
+    }
+
+    #[test]
+    fn q4k_scale_unpack_matches_reference() {
+        // scales packed per ggml: first 4 bytes low 6 bits sc[0..4], next 4 mins[0..4]
+        let mut s = [0u8; 12];
+        for i in 0..4 { s[i] = (i as u8 + 1) | (2 << 6); s[i + 4] = (i as u8 + 10) | (1 << 6); }
+        for i in 0..4 { s[i + 8] = (i as u8 + 3) | (((i as u8 + 5) & 0xF) << 4); }
+        assert_eq!(get_scale_min_k4(0, &s), (1, 10));
+        let (sc, m) = get_scale_min_k4(4, &s);
+        assert_eq!(sc, (s[8] & 0xF) | ((s[0] >> 6) << 4));
+        assert_eq!(m, (s[8] >> 4) | ((s[4] >> 6) << 4));
+    }
+}

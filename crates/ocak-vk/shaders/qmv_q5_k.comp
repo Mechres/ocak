@@ -1,0 +1,68 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+void get_scale_min_k4(uint j, uint sb, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = uint(w[sb + j]) & 63u;
+        mn = uint(w[sb + j + 4u]) & 63u;
+    } else {
+        sc = (uint(w[sb + j + 4u]) & 0xFu) | ((uint(w[sb + j - 4u]) >> 6) << 4);
+        mn = (uint(w[sb + j + 4u]) >> 4) | ((uint(w[sb + j]) >> 6) << 4);
+    }
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 256u;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 176u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1]) << 8)).x;
+            float dmin = unpackHalf2x16(uint(w[b+2]) | (uint(w[b+3]) << 8)).x;
+            uint sb = b + 4u;
+            uint qh_base = b + 16u;
+            uint qb_base = b + 48u;
+            uint xb = pc.x_off + blk * 256u;
+            uint u1 = 1u, u2 = 2u;
+            for (uint g = 0; g < 4u; g++) {
+                uint sc1, m1, sc2, m2;
+                get_scale_min_k4(2u * g, sb, sc1, m1);
+                get_scale_min_k4(2u * g + 1u, sb, sc2, m2);
+                float lo = 0.0, hi = 0.0, sx1 = 0.0, sx2 = 0.0;
+                uint qoff = qb_base + g * 32u;
+                uint xoff = xb + g * 64u;
+                for (uint l = 0; l < 32u; l++) {
+                    uint q = uint(w[qoff + l]);
+                    uint qh = uint(w[qh_base + l]);
+                    uint a = (q & 0xFu) + (((qh & u1) != 0u) ? 16u : 0u);
+                    uint c = (q >> 4) + (((qh & u2) != 0u) ? 16u : 0u);
+                    float x1 = x[xoff + l];
+                    float x2 = x[xoff + 32u + l];
+                    lo += float(a) * x1;
+                    hi += float(c) * x2;
+                    sx1 += x1;
+                    sx2 += x2;
+                }
+                acc += d * float(sc1) * lo - dmin * float(m1) * sx1;
+                acc += d * float(sc2) * hi - dmin * float(m2) * sx2;
+                u1 <<= 2u;
+                u2 <<= 2u;
+            }
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0 && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}

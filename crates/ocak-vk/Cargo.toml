@@ -1,0 +1,14 @@
+[package]
+name = "ocak-vk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ash.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+thiserror.workspace = true
+ocak-gguf.workspace = true
+
+[dev-dependencies]
+ocak-cpu = { path = "../ocak-cpu" }

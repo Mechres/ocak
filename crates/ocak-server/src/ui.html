@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Ocak Control Center</title>
+<style>
+  :root { --bg:#0b0f17; --card:#131a26; --border:#233046; --fg:#e5ecf6; --mut:#8ea0ba; --acc:#5eead4; --warn:#f59e0b; --err:#ef4444; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--bg); color:var(--fg); padding:18px; }
+  h1 { margin:0 0 14px; font-size:20px; display:flex; align-items:center; gap:10px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  .label { font-size:11px; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; }
+  .val { font-size:20px; font-weight:700; margin:4px 0 8px; }
+  .bar { height:8px; background:#1e293b; border-radius:4px; overflow:hidden; }
+  .fill { height:100%; background:linear-gradient(90deg,#14b8a6,#5eead4); transition:width .3s; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--mut); font-weight:600; }
+  .pill { display:inline-block; padding:2px 7px; border-radius:99px; font-size:11px; background:#1e293b; color:var(--mut); }
+  .pill.active_gpu { background:#064e3b; color:#6ee7b7; }
+  .pill.warm_sleep { background:#451a03; color:#fcd34d; }
+  button { background:#1e293b; color:var(--fg); border:1px solid var(--border); padding:4px 9px; border-radius:6px; cursor:pointer; font:inherit; font-size:11px; }
+  button:hover { border-color:var(--acc); color:var(--acc); }
+  textarea, input, select { background:#0f1622; color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:8px; font:inherit; width:100%; }
+  #chatOut { white-space:pre-wrap; min-height:90px; background:#090d14; padding:10px; border-radius:6px; border:1px solid var(--border); margin-top:8px; font-size:13px; }
+</style>
+</head>
+<body>
+  <h1>OCAK <span style="font-size:12px;color:var(--mut)">RX 6700 XT Ground-Up LLM Server</span></h1>
+  <div class="grid">
+    <div class="card"><div class="label">GPU VRAM</div><div class="val" id="vram">--</div><div class="bar"><div class="fill" id="vramBar" style="width:0%"></div></div></div>
+    <div class="card"><div class="label">GPU GTT</div><div class="val" id="gtt">--</div><div class="bar"><div class="fill" id="gttBar" style="width:0%"></div></div></div>
+    <div class="card"><div class="label">Power / Temp / Busy</div><div class="val" id="pwr">--</div><div class="label" id="hip">--</div></div>
+    <div class="card"><div class="label">Inference Counters</div><div class="val" id="stats">--</div><div class="label" id="kv">--</div></div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="label" style="margin-bottom:8px">Local Model Catalog</div>
+    <table><thead><tr><th>Model</th><th>Arch</th><th>Size</th><th>Engine</th><th>State</th><th>Actions</th></tr></thead><tbody id="models"></tbody></table>
+  </div>
+  <div class="card">
+    <div class="label" style="margin-bottom:8px">Quick Streaming Playground</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <select id="selModel" style="max-width:340px"></select>
+      <input id="prompt" value="Explain paged attention in two sentences."/>
+      <button onclick="sendChat()" style="min-width:90px">Send</button>
+    </div>
+    <div id="chatOut"></div>
+  </div>
+<script>
+const gi = b => (b / (1024**3)).toFixed(2) + ' GiB';
+let knownModels = [];
+function render(s) {
+  if (s.gpu) {
+    const vp = s.gpu.vram_total_bytes ? (100 * s.gpu.vram_used_bytes / s.gpu.vram_total_bytes) : 0;
+    const gp = s.gpu.gtt_total_bytes ? (100 * s.gpu.gtt_used_bytes / s.gpu.gtt_total_bytes) : 0;
+    document.getElementById('vram').textContent = gi(s.gpu.vram_used_bytes) + ' / ' + gi(s.gpu.vram_total_bytes);
+    document.getElementById('vramBar').style.width = vp.toFixed(1) + '%';
+    document.getElementById('gtt').textContent = gi(s.gpu.gtt_used_bytes) + ' / ' + gi(s.gpu.gtt_total_bytes);
+    document.getElementById('gttBar').style.width = gp.toFixed(1) + '%';
+    document.getElementById('pwr').textContent = s.gpu.power_watts.toFixed(1) + ' W · ' + s.gpu.temp_celsius.toFixed(0) + '°C · ' + s.gpu.gpu_busy_percent + '%';
+  }
+  document.getElementById('hip').textContent = s.hip ? s.hip.detail : '';
+  document.getElementById('stats').textContent = s.tokens_generated_total + ' tok · ' + s.requests_total + ' req';
+  document.getElementById('kv').textContent = 'Radix KV prefix hits: ' + s.kv_radix_hits_total;
+  const tb = document.getElementById('models');
+  tb.innerHTML = (s.models || []).map(m => `<tr>
+    <td>${m.id}</td><td>${m.arch}</td><td>${gi(m.size_bytes)}</td><td>${m.engine}</td>
+    <td><span class="pill ${m.residency}">${m.residency}</span></td>
+    <td><button onclick="act('${m.id}','load')">Load</button> <button onclick="act('${m.id}','sleep')">Sleep</button></td>
+  </tr>`).join('');
+  if (knownModels.length === 0 && s.models && s.models.length) {
+    knownModels = s.models;
+    document.getElementById('selModel').innerHTML = s.models.filter(m => !m.is_mmproj).map(m => `<option value="${m.id}">${m.id} (${m.engine})</option>`).join('');
+  }
+}
+async function act(id, op) {
+  await fetch('/v1/ocak/models/' + encodeURIComponent(id) + '/' + op, { method: 'POST' });
+}
+async function sendChat() {
+  const out = document.getElementById('chatOut');
+  out.textContent = '';
+  const model = document.getElementById('selModel').value;
+  const prompt = document.getElementById('prompt').value;
+  const res = await fetch('/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, stream: true, max_tokens: 128, temperature: 0.7, messages: [{ role: 'user', content: prompt }] })
+  });
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+  while (true) {
+    const { done, value } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    for (const line of buf.split('\n')) {
+      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+      try { const j = JSON.parse(line.slice(6)); out.textContent += (j.choices?.[0]?.delta?.content || ''); } catch {}
+    }
+    buf = buf.slice(buf.lastIndexOf('\n') + 1);
+  }
+}
+const es = new EventSource('/v1/ocak/events');
+es.onmessage = e => { try { render(JSON.parse(e.data)); } catch {} };
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+[package]
+name = "ocak-kv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+serde.workspace = true

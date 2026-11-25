@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 32u;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 34u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1]) << 8)).x;
+            uint xb = pc.x_off + blk * 32u;
+            float s = 0.0;
+            for (uint j = 0; j < 32u; j++) {
+                int q = int(w[b + 2u + j]);
+                if (q >= 128) q -= 256;
+                s += float(q) * x[xb + j];
+            }
+            acc += d * s;
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0 && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}

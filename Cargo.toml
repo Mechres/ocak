@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Mechres"]
+
+[workspace.dependencies]
+ash = "0.38"
+bytemuck = { version = "1.25", features = ["derive"] }
+half = "2.7"
+memmap2 = "0.9"
+rayon = "1.12"
+libloading = "0.8"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustc-hash = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+ocak-sysfs = { path = "crates/ocak-sysfs" }
+ocak-gguf = { path = "crates/ocak-gguf" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2

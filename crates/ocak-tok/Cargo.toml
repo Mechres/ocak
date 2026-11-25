@@ -1,0 +1,10 @@
+[package]
+name = "ocak-tok"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ocak-gguf.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+serde.workspace = true

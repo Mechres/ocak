@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 256u;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 210u;
+            float d = unpackHalf2x16(uint(w[b+208]) | (uint(w[b+209]) << 8)).x;
+            uint xb = pc.x_off + blk * 256u;
+            for (uint half_i = 0; half_i < 2u; half_i++) {
+                uint ql = b + half_i * 64u;
+                uint qh = b + 128u + half_i * 32u;
+                uint sc = b + 192u + half_i * 8u;
+                uint xh = xb + half_i * 128u;
+                float s = 0.0;
+                for (uint l = 0; l < 32u; l++) {
+                    uint is = l / 16u;
+                    uint qhb = uint(w[qh + l]);
+                    int q1 = int((uint(w[ql + l]) & 0xFu) | ((qhb & 3u) << 4)) - 32;
+                    int q2 = int((uint(w[ql + l + 32u]) & 0xFu) | (((qhb >> 2) & 3u) << 4)) - 32;
+                    int q3 = int((uint(w[ql + l]) >> 4) | (((qhb >> 4) & 3u) << 4)) - 32;
+                    int q4 = int((uint(w[ql + l + 32u]) >> 4) | (((qhb >> 6) & 3u) << 4)) - 32;
+                    int sc0 = int(w[sc + is]); if (sc0 >= 128) sc0 -= 256;
+                    int sc2 = int(w[sc + is + 2u]); if (sc2 >= 128) sc2 -= 256;
+                    int sc4 = int(w[sc + is + 4u]); if (sc4 >= 128) sc4 -= 256;
+                    int sc6 = int(w[sc + is + 6u]); if (sc6 >= 128) sc6 -= 256;
+                    s += float(sc0 * q1) * x[xh + l];
+                    s += float(sc2 * q2) * x[xh + l + 32u];
+                    s += float(sc4 * q3) * x[xh + l + 64u];
+                    s += float(sc6 * q4) * x[xh + l + 96u];
+                }
+                acc += d * s;
+            }
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0 && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}

@@ -1,0 +1,11 @@
+[package]
+name = "ocak-gguf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+half.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+serde.workspace = true
