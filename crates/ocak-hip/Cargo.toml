@@ -1,0 +1,9 @@
+[package]
+name = "ocak-hip"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libloading.workspace = true
+serde.workspace = true
+thiserror.workspace = true

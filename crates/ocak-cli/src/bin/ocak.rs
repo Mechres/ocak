@@ -49,6 +49,13 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         steps: usize,
     },
+    /// Verify native Qwen3.5/RVN NextN MTP draft head predictions against main trunk
+    MtpTest {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+    },
     /// Zero-dependency ANSI live dashboard polling ocakd
     Top {
         #[arg(long, default_value = "127.0.0.1:8090")]
@@ -180,6 +187,25 @@ async fn main() -> Result<()> {
                 "Greedy {}-step decode on {}: {:?}\n  prefill: {:.1} tok/s | decode: {:.1} tok/s",
                 steps, eng_vk.backend_name(), res.text, res.timings.prompt_per_second, res.timings.predicted_per_second
             );
+        }
+        Cmd::MtpTest { model, prompt } => {
+            let gf = std::sync::Arc::new(ocak_gguf::GgufFile::open(&model)?);
+            let mut eng = NativeEngine::load(&model, EngineOptions { backend: BackendKind::Vulkan, max_ctx: 256, kv_pages: 32 })?;
+            let mut mtp = ocak_engine::mtp::MtpDrafter::try_load(gf, eng.cfg.clone(), 256)?
+                .ok_or_else(|| anyhow::anyhow!("model has no Qwen3.5 NextN MTP head"))?;
+            let tokens = eng.tokenizer.encode(&prompt, true, false);
+            let (logits_main, h_main) = eng.eval_logits_and_hidden(&tokens)?;
+            let next1 = logits_main.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            let draft_logits = mtp.draft_logits(&h_main, next1, tokens.len() - 1)?;
+            let draft2 = draft_logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            let mut ext = tokens.clone();
+            ext.push(next1);
+            let logits_verify = eng.eval_logits(&ext)?;
+            let true2 = logits_verify.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            println!("Prompt: {prompt:?}");
+            println!("  Main trunk next token : {next1} ({:?})", eng.tokenizer.token_text(next1).unwrap_or("?"));
+            println!("  MTP draft +2 token    : {draft2} ({:?})", eng.tokenizer.token_text(draft2).unwrap_or("?"));
+            println!("  Main trunk +2 verify  : {true2} ({:?}) | match={}", eng.tokenizer.token_text(true2).unwrap_or("?"), draft2 == true2);
         }
         Cmd::Top { addr } => {
             let clean = addr.trim_start_matches("http://").to_string();

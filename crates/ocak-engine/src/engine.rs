@@ -120,6 +120,28 @@ impl NativeEngine {
     pub fn pager_stats(&self) -> PagerStats { self.pager.stats() }
     pub fn clear_kv(&mut self) { self.pager.clear(); }
 
+    /// Evaluates `tokens` and returns `(logits, final_hidden)` (used by MTP drafter verification).
+    pub fn eval_logits_and_hidden(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
+        self.exec.reset_recurrent()?;
+        let need_pages = (tokens.len() + PAGE_TOKENS - 1) / PAGE_TOKENS;
+        let mut pages = Vec::with_capacity(need_pages);
+        for _ in 0..need_pages {
+            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
+        }
+        let mut res = Ok(());
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let is_last = pos + 1 == tokens.len();
+            if let Err(e) = self.exec.forward(tok, pos, &pages, Out { logits: is_last, hidden: is_last }) {
+                res = Err(e);
+                break;
+            }
+        }
+        let out = (self.exec.logits().to_vec(), self.exec.hidden().to_vec());
+        self.pager.release(&pages);
+        res?;
+        Ok(out)
+    }
+
     /// Evaluates `tokens` from scratch and returns the final token's logits (used by parity tests).
     pub fn eval_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>, EngineError> {
         if tokens.is_empty() {

@@ -9,6 +9,7 @@ fn main() {
     let shaders = [
         "rms_norm",
         "add",
+        "add_scaled",
         "copy",
         "swiglu",
         "rope",

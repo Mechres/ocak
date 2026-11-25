@@ -96,6 +96,7 @@ struct PipelineBundle {
 struct Pipelines {
     rms_norm: PipelineBundle,
     add: PipelineBundle,
+    add_scaled: PipelineBundle,
     copy: PipelineBundle,
     swiglu: PipelineBundle,
     rope: PipelineBundle,
@@ -130,7 +131,7 @@ struct Pipelines {
 impl Pipelines {
     unsafe fn destroy(&self, dev: &Device) {
         for p in [
-            &self.rms_norm, &self.add, &self.copy, &self.swiglu, &self.rope,
+            &self.rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_q8_0, &self.qmv_q4_0,
             &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k, &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext, &self.qmv_iq2_xs, &self.qmv_iq3_xxs, &self.qmv_iq3_s, &self.qmv_iq4_nl, &self.qmv_iq4_xs,
@@ -288,6 +289,7 @@ impl VkContext {
             let pipelines = Pipelines {
                 rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 20)?,
                 add: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
+                add_scaled: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
                 copy: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv")), 2, 12)?,
                 swiglu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/swiglu.spv")), 3, 16)?,
                 rope: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
@@ -738,6 +740,29 @@ impl<'a> Recorder<'a> {
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {
         let pc = [a_off as u32, b_off as u32, n];
         self.dispatch_raw(&self.ctx.pipelines.add, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn add_scaled(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32, scale: f32) {
+        let pc = [a_off as u32, b_off as u32, n, scale.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn zero_buf(&mut self, dst: &Buffer) {
+        unsafe {
+            self.ctx.device.cmd_fill_buffer(self.exec.cmd_buf, dst.buf, 0, vk::WHOLE_SIZE, 0);
+            let bar = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(
+                self.exec.cmd_buf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+        }
     }
 
     pub fn copy(&mut self, src: &Buffer, s_off: u64, dst: &Buffer, d_off: u64, n: u32) {

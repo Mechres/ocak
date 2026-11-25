@@ -14,6 +14,7 @@ ocak-kv = { path = "../ocak-kv" }
 ocak-cpu = { path = "../ocak-cpu" }
 ocak-vk = { path = "../ocak-vk", optional = true }
 half.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
 serde.workspace = true

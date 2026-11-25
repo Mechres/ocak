@@ -681,6 +681,7 @@ dependencies = [
  "ocak-kv",
  "ocak-tok",
  "ocak-vk",
+ "rayon",
  "serde",
  "thiserror",
 ]
@@ -706,6 +707,15 @@ dependencies = [
  "memmap2",
  "serde",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "ocak-hip"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "serde",
  "thiserror",
 ]
 

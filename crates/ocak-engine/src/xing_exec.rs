@@ -8,6 +8,7 @@ use ocak_gguf::quant::dequantize_row;
 use ocak_gguf::{GgufFile, TensorInfo};
 #[cfg(feature = "vulkan")]
 use ocak_vk::{Buffer, VkContext, WType};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -187,6 +188,14 @@ pub struct XingExec {
     #[cfg(feature = "vulkan")]
     vk_y: Option<Buffer>,
     #[cfg(feature = "vulkan")]
+    vk_g: Option<Buffer>,
+    #[cfg(feature = "vulkan")]
+    vk_u: Option<Buffer>,
+    #[cfg(feature = "vulkan")]
+    vk_a: Option<Buffer>,
+    #[cfg(feature = "vulkan")]
+    vk_acc: Option<Buffer>,
+    #[cfg(feature = "vulkan")]
     vk_output: Option<VkMat>,
     /// Compact MLA latent KV cache: [n_layer][max_ctx][kv_rank + n_rot]
     kv_cache: Vec<f32>,
@@ -339,14 +348,18 @@ impl XingExec {
         let out_norm = f32v(&g, "output_norm.weight")?;
         let output = g.tensor("output.weight").cloned().unwrap_or_else(|| embd.clone());
         #[cfg(feature = "vulkan")]
-        let (vk_x, vk_y, vk_output) = match &vk {
+        let (vk_x, vk_y, vk_g, vk_u, vk_a, vk_acc, vk_output) = match &vk {
             Some(c) => {
                 let x = c.create_device_buffer((cfg.n_ff_dense.max(cfg.n_embd) * 4) as u64).ok();
                 let y = c.create_device_buffer((cfg.n_vocab.max(cfg.n_ff_dense) * 4) as u64).ok();
+                let fg = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
+                let fu = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
+                let fa = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
+                let acc = c.create_device_buffer((cfg.n_embd * 4) as u64).ok();
                 let vo = try_upload_mat(c, &g, &output);
-                (x, y, vo)
+                (x, y, fg, fu, fa, acc, vo)
             }
-            None => (None, None, None),
+            None => (None, None, None, None, None, None, None),
         };
 
         let hd = cfg.kv_rank + cfg.n_rot;
@@ -367,6 +380,14 @@ impl XingExec {
             vk_x,
             #[cfg(feature = "vulkan")]
             vk_y,
+            #[cfg(feature = "vulkan")]
+            vk_g,
+            #[cfg(feature = "vulkan")]
+            vk_u,
+            #[cfg(feature = "vulkan")]
+            vk_a,
+            #[cfg(feature = "vulkan")]
+            vk_acc,
             #[cfg(feature = "vulkan")]
             vk_output,
             cfg,
@@ -560,20 +581,27 @@ impl Executor for XingExec {
             let kv_layer_base = li * self.max_ctx * hd;
             self.kv_cache[kv_layer_base + pos * hd..kv_layer_base + (pos + 1) * hd].copy_from_slice(&kv_raw);
 
-            // Absorb wk_b per head: q_nope[h] (128) -> q_lat[h] (512)
-            for h in 0..nh {
+            // Parallel 32-head MLA (wk_b absorption + latent attention + wv_b projection)
+            let kv_slice = &self.kv_cache[kv_layer_base..kv_layer_base + (pos + 1) * hd];
+            let wk_b_ti = &self.layers[li].wk_b;
+            let wv_b_ti = &self.layers[li].wv_b;
+            let wk_b_raw = self.g.tensor_data(wk_b_ti);
+            let wv_b_raw = self.g.tensor_data(wv_b_ti);
+            let wk_b_stride = wk_b_ti.row_bytes() * wk_b_ti.ne[1] as usize;
+            let wv_b_stride = wv_b_ti.row_bytes() * wv_b_ti.ne[1] as usize;
+            let _ = (&mut q_lat, &mut attn_lat);
+            val_all.par_chunks_mut(vdim).enumerate().for_each(|(h, val_h)| {
                 let qn = &q_full[h * c.key_dim..h * c.key_dim + nope];
-                self.mv_cpu(&self.layers[li].wk_b, h, qn, &mut q_lat[h * latent..(h + 1) * latent]);
-            }
-
-            // MLA Attention over single-head latent KV cache [0..=pos]
-            let mut scores = vec![0f32; pos + 1];
-            for h in 0..nh {
-                let ql = &q_lat[h * latent..(h + 1) * latent];
                 let qp = &q_full[h * c.key_dim + nope..h * c.key_dim + c.key_dim];
+                let mut ql = vec![0f32; latent];
+                let wkb_h = &wk_b_raw[h * wk_b_stride..(h + 1) * wk_b_stride];
+                for r in 0..latent {
+                    ql[r] = ocak_cpu::row_dot(wk_b_ti.ty, &wkb_h[r * wk_b_ti.row_bytes()..(r + 1) * wk_b_ti.row_bytes()], qn);
+                }
+                let mut scores = vec![0f32; pos + 1];
                 let mut mx = f32::NEG_INFINITY;
                 for t in 0..=pos {
-                    let kc = &self.kv_cache[kv_layer_base + t * hd..kv_layer_base + (t + 1) * hd];
+                    let kc = &kv_slice[t * hd..(t + 1) * hd];
                     let mut dot = 0f32;
                     for i in 0..latent { dot += ql[i] * kc[i]; }
                     for i in 0..n_rot { dot += qp[i] * kc[latent + i]; }
@@ -583,16 +611,17 @@ impl Executor for XingExec {
                 }
                 let mut sum = 0f32;
                 for s in &mut scores { *s = (*s - mx).exp(); sum += *s; }
-                let ah = &mut attn_lat[h * latent..(h + 1) * latent];
-                ah.fill(0.0);
+                let mut ah = vec![0f32; latent];
                 for t in 0..=pos {
                     let w = scores[t] / sum;
-                    let vc = &self.kv_cache[kv_layer_base + t * hd..kv_layer_base + t * hd + latent];
+                    let vc = &kv_slice[t * hd..t * hd + latent];
                     for i in 0..latent { ah[i] += w * vc[i]; }
                 }
-                // Project latent value to vdim via wv_b[h]
-                self.mv_cpu(&self.layers[li].wv_b, h, ah, &mut val_all[h * vdim..(h + 1) * vdim]);
-            }
+                let wvb_h = &wv_b_raw[h * wv_b_stride..(h + 1) * wv_b_stride];
+                for r in 0..vdim {
+                    val_h[r] = ocak_cpu::row_dot(wv_b_ti.ty, &wvb_h[r * wv_b_ti.row_bytes()..(r + 1) * wv_b_ti.row_bytes()], &ah);
+                }
+            });
 
             #[cfg(feature = "vulkan")]
             self.mv_hybrid(&self.layers[li].wo, self.layers[li].vk_wo.as_ref(), 0, &val_all, &mut block_out);
@@ -668,45 +697,60 @@ impl Executor for XingExec {
                         for w in &mut wts { *w *= c.exp_weights_scale; }
                     }
 
-                    block_out.fill(0.0);
-                    let mut g_e = vec![0f32; c.n_ff_exp];
-                    let mut u_e = vec![0f32; c.n_ff_exp];
-                    let mut a_e = vec![0f32; c.n_ff_exp];
-                    let mut d_e = vec![0f32; ne];
-                    for (k_i, &(exp_id, _)) in sel.iter().enumerate() {
-                        #[cfg(feature = "vulkan")]
-                        {
-                            self.mv_hybrid(gate_exps, vk_gate_exps.as_ref(), exp_id, &normed, &mut g_e);
-                            self.mv_hybrid(up_exps, vk_up_exps.as_ref(), exp_id, &normed, &mut u_e);
-                            ops::swiglu(&g_e, &u_e, &mut a_e);
-                            self.mv_hybrid(down_exps, vk_down_exps.as_ref(), exp_id, &a_e, &mut d_e);
+                    #[cfg(feature = "vulkan")]
+                    let did_fused_gpu = if let (
+                        Some(ctx), Some(bx), Some(by), Some(bg), Some(bu), Some(ba), Some(bacc),
+                        Some(vg), Some(vu), Some(vd), Some(vgs), Some(vus), Some(vds),
+                    ) = (
+                        &self.vk, &self.vk_x, &self.vk_y, &self.vk_g, &self.vk_u, &self.vk_a, &self.vk_acc,
+                        vk_gate_exps.as_ref(), vk_up_exps.as_ref(), vk_down_exps.as_ref(),
+                        vk_gate_sh.as_ref(), vk_up_sh.as_ref(), vk_down_sh.as_ref(),
+                    ) {
+                        if ctx.upload(bx, 0, bytemuck::cast_slice(&normed)).is_ok() {
+                            let mut rec = ctx.begin();
+                            rec.zero_buf(bacc);
+                            for (k_i, &(exp_id, _)) in sel.iter().enumerate() {
+                                rec.qmv(vg.ty, &vg.buf, exp_id as u64 * vg.slice_bytes, bx, 0, bg, 0, vg.k, vg.m);
+                                rec.qmv(vu.ty, &vu.buf, exp_id as u64 * vu.slice_bytes, bx, 0, bu, 0, vu.k, vu.m);
+                                rec.swiglu(bg, 0, bu, 0, ba, 0, c.n_ff_exp as u32);
+                                rec.qmv(vd.ty, &vd.buf, exp_id as u64 * vd.slice_bytes, ba, 0, by, 0, vd.k, vd.m);
+                                rec.add_scaled(bacc, 0, by, 0, ne as u32, wts[k_i]);
+                            }
+                            rec.qmv(vgs.ty, &vgs.buf, 0, bx, 0, bg, 0, vgs.k, vgs.m);
+                            rec.qmv(vus.ty, &vus.buf, 0, bx, 0, bu, 0, vus.k, vus.m);
+                            rec.swiglu(bg, 0, bu, 0, ba, 0, c.n_ff_exp as u32);
+                            rec.qmv(vds.ty, &vds.buf, 0, ba, 0, by, 0, vds.k, vds.m);
+                            rec.add(bacc, 0, by, 0, ne as u32);
+                            rec.finish_and_wait().is_ok() && ctx.download(bacc, 0, bytemuck::cast_slice_mut(&mut block_out)).is_ok()
+                        } else {
+                            false
                         }
-                        #[cfg(not(feature = "vulkan"))]
-                        {
+                    } else {
+                        false
+                    };
+                    #[cfg(not(feature = "vulkan"))]
+                    let did_fused_gpu = false;
+
+                    if !did_fused_gpu {
+                        block_out.fill(0.0);
+                        let mut g_e = vec![0f32; c.n_ff_exp];
+                        let mut u_e = vec![0f32; c.n_ff_exp];
+                        let mut a_e = vec![0f32; c.n_ff_exp];
+                        let mut d_e = vec![0f32; ne];
+                        for (k_i, &(exp_id, _)) in sel.iter().enumerate() {
                             self.mv_cpu(gate_exps, exp_id, &normed, &mut g_e);
                             self.mv_cpu(up_exps, exp_id, &normed, &mut u_e);
                             ops::swiglu(&g_e, &u_e, &mut a_e);
                             self.mv_cpu(down_exps, exp_id, &a_e, &mut d_e);
+                            let w = wts[k_i];
+                            for e in 0..ne { block_out[e] += w * d_e[e]; }
                         }
-                        let w = wts[k_i];
-                        for e in 0..ne { block_out[e] += w * d_e[e]; }
-                    }
-                    // Shared expert
-                    #[cfg(feature = "vulkan")]
-                    {
-                        self.mv_hybrid(gate_shexp, vk_gate_sh.as_ref(), 0, &normed, &mut g_e);
-                        self.mv_hybrid(up_shexp, vk_up_sh.as_ref(), 0, &normed, &mut u_e);
-                        ops::swiglu(&g_e, &u_e, &mut a_e);
-                        self.mv_hybrid(down_shexp, vk_down_sh.as_ref(), 0, &a_e, &mut d_e);
-                    }
-                    #[cfg(not(feature = "vulkan"))]
-                    {
                         self.mv_cpu(gate_shexp, 0, &normed, &mut g_e);
                         self.mv_cpu(up_shexp, 0, &normed, &mut u_e);
                         ops::swiglu(&g_e, &u_e, &mut a_e);
                         self.mv_cpu(down_shexp, 0, &a_e, &mut d_e);
+                        ops::add(&mut block_out, &d_e);
                     }
-                    ops::add(&mut block_out, &d_e);
                 }
             }
             Self::hc_post(&mut streams, &block_out, &post, &comb, ne);
