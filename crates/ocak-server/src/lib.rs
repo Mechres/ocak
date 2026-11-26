@@ -235,10 +235,15 @@ impl AppState {
             .set_state(&entry.id, est, ModelResidencyState::Loading, Instant::now());
 
         let path = entry.path.clone();
+        let kv_pages = if entry.size_bytes > 8 * 1024 * 1024 * 1024 {
+            (self.cfg.max_ctx / 16 * 2).max(256)
+        } else {
+            (self.cfg.max_ctx / 16 * 8).max(1024)
+        };
         let opts = EngineOptions {
             backend: self.cfg.backend,
             max_ctx: self.cfg.max_ctx,
-            kv_pages: (self.cfg.max_ctx / 16 * 8).max(1024),
+            kv_pages,
         };
         let eng = tokio::task::spawn_blocking(move || NativeEngine::load(&path, opts))
             .await
@@ -378,6 +383,18 @@ fn is_loopback_origin(origin: &str) -> bool {
     is_loopback_host(host_port)
 }
 
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn security_middleware(
     State(st): State<Arc<AppState>>,
     req: AxRequest,
@@ -404,14 +421,19 @@ async fn security_middleware(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "));
             let x_api = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-            let query_key = req.uri().query().and_then(|q| {
-                q.split('&')
-                    .find_map(|pair| pair.strip_prefix("api_key="))
-            });
-            if bearer != Some(expected.as_str())
-                && x_api != Some(expected.as_str())
-                && query_key != Some(expected.as_str())
-            {
+            // Query param api_key is accepted ONLY on SSE /v1/ocak/events (EventSource cannot set headers)
+            let query_key = if path == "/v1/ocak/events" {
+                req.uri().query().and_then(|q| {
+                    q.split('&')
+                        .find_map(|pair| pair.strip_prefix("api_key="))
+                })
+            } else {
+                None
+            };
+            let ok = bearer.map_or(false, |k| ct_eq(k, expected))
+                || x_api.map_or(false, |k| ct_eq(k, expected))
+                || query_key.map_or(false, |k| ct_eq(k, expected));
+            if !ok {
                 return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
             }
         }

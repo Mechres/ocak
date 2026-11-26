@@ -1269,3 +1269,42 @@ impl Executor for XingExec {
     fn logits(&self) -> &[f32] { &self.logits }
     fn hidden(&self) -> &[f32] { &self.hidden }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    #[ignore]
+    fn xing_vk_vs_cpu_parity() {
+        let p = Path::new("/home/mechres/models/Xing4.0-29B-A4B-IQ3_XXS.gguf");
+        if !p.exists() { return; }
+        let g = Arc::new(GgufFile::open(p).unwrap());
+        let mut vk = XingExec::new(Arc::clone(&g), true, 64, 0).unwrap();
+        let mut cpu = XingExec::new(Arc::clone(&g), false, 64, 40).unwrap();
+        let toks = [1u32, 100, 200];
+        for (pos, &tok) in toks.iter().enumerate() {
+            let out = Out { logits: true, hidden: false };
+            vk.forward(tok, pos, &[], out).unwrap();
+            cpu.forward(tok, pos, &[], out).unwrap();
+            let lv = vk.logits();
+            let lc = cpu.logits();
+            let mut dot = 0.0f64;
+            let mut nv = 0.0f64;
+            let mut nc = 0.0f64;
+            let mut max_d = 0.0f32;
+            for (&a, &b) in lv.iter().zip(lc.iter()) {
+                dot += a as f64 * b as f64;
+                nv += a as f64 * a as f64;
+                nc += b as f64 * b as f64;
+                max_d = max_d.max((a - b).abs());
+            }
+            let cos = dot / (nv.sqrt() * nc.sqrt());
+            let top_v = lv.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            let top_c = lc.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+            println!("pos={pos} cos_sim={cos:.6} max_diff={max_d:.4} top_vk=({}, {:.3}) top_cpu=({}, {:.3})", top_v.0, top_v.1, top_c.0, top_c.1);
+            assert!(cos > 0.999, "Xing VK vs CPU mismatch at pos={pos}: cos_sim={cos}");
+        }
+    }
+}
