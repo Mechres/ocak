@@ -144,10 +144,15 @@ fn main() {
     println!("cargo:rerun-if-changed={src}");
     println!("cargo:rerun-if-changed=shaders/dequant8.glsl");
     println!("cargo:rerun-if-changed=shaders/qmv_multi.comp");
-    // kind 0 = tiled, 1 = grouped tiled, 2 = small-batch matvec
-    for (name, def, kind) in tiled.iter().flat_map(|&(n, d)| [(n, d, 0), (n, d, 1), (n, d, 2)]) {
-        let prefix = ["qmmt", "qmmg", "qmvm"][kind];
-        let src = if kind == 2 { "shaders/qmv_multi.comp" } else { src };
+    println!("cargo:rerun-if-changed=shaders/qmv_id_multi.comp");
+    // kind 0 = tiled, 1 = grouped tiled, 2 = small-batch matvec, 3 = MoE id matvec
+    for (name, def, kind) in tiled.iter().flat_map(|&(n, d)| [(n, d, 0), (n, d, 1), (n, d, 2), (n, d, 3)]) {
+        let prefix = ["qmmt", "qmmg", "qmvm", "qmvi"][kind];
+        let src = match kind {
+            2 => "shaders/qmv_multi.comp",
+            3 => "shaders/qmv_id_multi.comp",
+            _ => src,
+        };
         let dst = out_dir.join(format!("{prefix}_{name}.spv"));
         let define = format!("-D{def}");
         let gdef = if kind == 1 { "-DGROUPED" } else { "-DUNGROUPED" };
