@@ -74,6 +74,19 @@ enum Cmd {
         #[arg(long)]
         model: Option<PathBuf>,
     },
+    /// Benchmark prefill and decode throughput across local native GGUF models and emit a Markdown table
+    Bench {
+        #[arg(long, default_value = "/home/mechres/models")]
+        models_dir: PathBuf,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 128)]
+        prompt_tokens: usize,
+        #[arg(long, default_value_t = 64)]
+        decode_tokens: usize,
+        #[arg(long, default_value = "vk")]
+        backend: String,
+    },
     /// Zero-dependency ANSI live dashboard polling ocakd
     Top {
         #[arg(long, default_value = "127.0.0.1:8090")]
@@ -308,6 +321,91 @@ async fn main() -> Result<()> {
             }
             if failed > 0 {
                 anyhow::bail!("{failed} counting parity check(s) failed");
+            }
+        }
+        Cmd::Bench { models_dir, filter, prompt_tokens, decode_tokens, backend } => {
+            let bk = if backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
+            let mut entries: Vec<_> = scan(&[models_dir])
+                .into_iter()
+                .filter(|e| {
+                    !e.is_mmproj
+                        && matches!(
+                            e.arch.as_str(),
+                            "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop"
+                        )
+                        && filter
+                            .as_deref()
+                            .is_none_or(|f| e.id.to_lowercase().contains(&f.to_lowercase()))
+                })
+                .collect();
+            entries.sort_by_key(|e| e.size_bytes);
+            if entries.is_empty() {
+                anyhow::bail!("no matching native GGUF models found");
+            }
+            // Deterministic prompt (~prompt_tokens tokens)
+            let count_n = (prompt_tokens / 3).max(16);
+            let nums: Vec<String> = (1..=count_n).map(|i| i.to_string()).collect();
+            let prompt = format!("Counting: {},", nums.join(", "));
+
+            println!("| Model | Arch | Size | Load (ms) | Prefill (tok/s) | Decode (tok/s) | MTP |");
+            println!("|---|---|---:|---:|---:|---:|---|");
+            let _ = std::io::stdout().flush();
+
+            for e in entries {
+                let t0 = Instant::now();
+                let kv_pages = if e.size_bytes > 8 * 1024 * 1024 * 1024 { 128 } else { 256 };
+                let eng_res = NativeEngine::load(
+                    &e.path,
+                    EngineOptions { backend: bk, max_ctx: 2048, kv_pages },
+                );
+                let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let mut eng = match eng_res {
+                    Ok(eng) => eng,
+                    Err(err) => {
+                        println!(
+                            "| {} | {} | {:.2} GiB | ERR | - | - | {} |",
+                            e.id,
+                            e.arch,
+                            e.size_bytes as f64 / (1u64 << 30) as f64,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let gr = eng.generate(
+                    &GenRequest {
+                        prompt: prompt.clone(),
+                        parse_special: false,
+                        max_tokens: decode_tokens,
+                        sampler: SamplerParams::greedy(),
+                        stop: Vec::new(),
+                        json_mode: false,
+                        thinking: None,
+                    },
+                    |_, _| true,
+                )?;
+                let mtp_col = if gr.timings.mtp_drafted > 0 {
+                    format!(
+                        "{}/{} ({:.0}%)",
+                        gr.timings.mtp_accepted,
+                        gr.timings.mtp_drafted,
+                        100.0 * gr.timings.mtp_accepted as f64 / gr.timings.mtp_drafted as f64
+                    )
+                } else {
+                    "-".to_string()
+                };
+                println!(
+                    "| {} | {} | {:.2} GiB | {:.0} | {:.1} | {:.1} | {} |",
+                    e.id,
+                    e.arch,
+                    e.size_bytes as f64 / (1u64 << 30) as f64,
+                    load_ms,
+                    gr.timings.prompt_per_second,
+                    gr.timings.predicted_per_second,
+                    mtp_col
+                );
+                let _ = std::io::stdout().flush();
+                drop(eng);
             }
         }
         Cmd::Top { addr } => {
