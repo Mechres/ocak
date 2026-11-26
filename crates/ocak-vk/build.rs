@@ -113,4 +113,33 @@ fn main() {
         assert!(status.success(), "shader compilation failed on {src}");
         let _ = fs::metadata(&dst).expect("spv missing");
     }
+    // One tiled-prefill matmul source, specialised per weight format.
+    let tiled = [
+        ("q4_k", "Q4_K"), ("q5_k", "Q5_K"), ("q6_k", "Q6_K"), ("q2_k", "Q2_K"), ("q3_k", "Q3_K"),
+        ("q8_0", "Q8_0"), ("q4_0", "Q4_0"), ("f16", "F16"), ("f32", "F32"),
+        ("iq3_s", "IQ3_S"), ("iq3_xxs", "IQ3_XXS"), ("iq2_xs", "IQ2_XS"), ("iq2_s", "IQ2_S"),
+        ("iq2_xxs", "IQ2_XXS"), ("iq1_s", "IQ1_S"), ("iq1_m", "IQ1_M"), ("iq4_xs", "IQ4_XS"), ("iq4_nl", "IQ4_NL"),
+    ];
+    let src = "shaders/qmm_tiled.comp";
+    println!("cargo:rerun-if-changed={src}");
+    for (name, def) in tiled {
+        let dst = out_dir.join(format!("qmmt_{name}.spv"));
+        let define = format!("-D{def}");
+        let status = if has_glslc || has_usr_glslc {
+            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
+            Command::new(bin)
+                .args(["--target-env=vulkan1.3", "-O", &define, src, "-o"])
+                .arg(&dst)
+                .status()
+                .expect("failed to invoke glslc")
+        } else {
+            Command::new("glslangValidator")
+                .args(["-V", "--target-env", "vulkan1.3", &define, "-o"])
+                .arg(&dst)
+                .arg(src)
+                .status()
+                .expect("failed to invoke glslangValidator")
+        };
+        assert!(status.success(), "shader compilation failed on {src} ({def})");
+    }
 }

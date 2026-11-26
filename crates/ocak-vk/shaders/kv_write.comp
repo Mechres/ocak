@@ -16,10 +16,14 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     uint half_dim = pc.kv_dim >> 1;
     if (i >= half_dim) return;
-    uint page = pt[pc.pt_off + (pc.pos >> 4)];
-    uint slot = pc.pos & 15u;
+    uint tok = gl_WorkGroupID.y;  // batched: token index
+    uint pos = pc.pos + tok;
+    uint koff = pc.k_off + tok * pc.kv_dim;
+    uint voff = pc.v_off + tok * pc.kv_dim;
+    uint page = pt[pc.pt_off + (pos >> 4)];
+    uint slot = pos & 15u;
     uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * half_dim + i;
     uint vo = pc.layer_kv_off + ((page * 2u + 1u) * 16u + slot) * half_dim + i;
-    kv[ko] = packHalf2x16(vec2(k[pc.k_off + 2u * i], k[pc.k_off + 2u * i + 1u]));
-    kv[vo] = packHalf2x16(vec2(v[pc.v_off + 2u * i], v[pc.v_off + 2u * i + 1u]));
+    kv[ko] = packHalf2x16(vec2(k[koff + 2u * i], k[koff + 2u * i + 1u]));
+    kv[vo] = packHalf2x16(vec2(v[voff + 2u * i], v[voff + 2u * i + 1u]));
 }

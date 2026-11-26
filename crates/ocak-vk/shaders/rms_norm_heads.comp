@@ -8,7 +8,7 @@ void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
     uint tid = gl_LocalInvocationID.x;
-    uint base = pc.x_off + h * pc.head_dim;
+    uint base = pc.x_off + (gl_WorkGroupID.y * pc.n_heads + h) * pc.head_dim;  // y = token
     float acc = 0.0;
     for (uint d = tid; d < pc.head_dim; d += 128u) {
         float v = x[base + d];

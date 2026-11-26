@@ -31,6 +31,11 @@ shared vec2 sm_acc[NG][128];
 void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
+    // Batched prefill: workgroup y = token (query at q_off/out_off + y * n_heads * head_dim, pos + y).
+    uint tok = gl_WorkGroupID.y;
+    uint pos = pc.pos + tok;
+    uint q_off = pc.q_off + tok * pc.n_heads * pc.head_dim;
+    uint out_off = pc.out_off + tok * pc.n_heads * pc.head_dim;
     uint tid = gl_LocalInvocationID.x;
     uint g = tid >> 5;      // lane-group 0..NG-1
     uint lane = tid & 31u;  // lane within group
@@ -45,7 +50,7 @@ void main() {
     for (uint j = 0u; j < 4u; j++) {
         uint d2 = lane + j * 32u;
         if (d2 < half_hd) {
-            uint qb = pc.q_off + h * pc.head_dim + 2u * d2;
+            uint qb = q_off + h * pc.head_dim + 2u * d2;
             qreg[j] = vec2(q[qb], q[qb + 1u]);
         } else {
             qreg[j] = vec2(0.0);
@@ -56,8 +61,8 @@ void main() {
     float m = -3.402823466e38;
     float l = 0.0;
 
-    uint t_start = (pc.sliding_window > 0u && pc.pos >= pc.sliding_window) ? (pc.pos + 1u - pc.sliding_window) : 0u;
-    for (uint t = t_start + g; t <= pc.pos; t += NG) {
+    uint t_start = (pc.sliding_window > 0u && pos >= pc.sliding_window) ? (pos + 1u - pc.sliding_window) : 0u;
+    for (uint t = t_start + g; t <= pos; t += NG) {
         uint page = pt[pc.pt_off + (t >> 4)];
         uint slot = t & 15u;
         uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * half_kv_dim + kvh * half_hd;
@@ -109,7 +114,7 @@ void main() {
         vec2 res = vec2(0.0);
         for (uint k = 0u; k < NG; k++) res += sm_acc[k][d2] * wk[k];
         res *= inv_L;
-        uint ob = pc.out_off + h * pc.head_dim + 2u * d2;
+        uint ob = out_off + h * pc.head_dim + 2u * d2;
         o[ob] = res.x;
         o[ob + 1u] = res.y;
     }

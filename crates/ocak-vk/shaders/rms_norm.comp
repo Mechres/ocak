@@ -13,9 +13,12 @@ layout(push_constant) uniform PC {
 shared float ssum[256];
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    // Batched: workgroup y = token, rows of n floats.
+    uint xo = pc.x_off + gl_WorkGroupID.y * pc.n;
+    uint oo = pc.out_off + gl_WorkGroupID.y * pc.n;
     float acc = 0.0;
     for (uint i = tid; i < pc.n; i += 256) {
-        float v = x[pc.x_off + i];
+        float v = x[xo + i];
         acc += v * v;
     }
     ssum[tid] = acc;
@@ -26,6 +29,6 @@ void main() {
     }
     float scale = inversesqrt(ssum[0] / float(pc.n) + pc.eps);
     for (uint i = tid; i < pc.n; i += 256) {
-        o[pc.out_off + i] = x[pc.x_off + i] * scale * w[pc.w_off + i];
+        o[oo + i] = x[xo + i] * scale * w[pc.w_off + i];
     }
 }

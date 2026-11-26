@@ -186,7 +186,50 @@ struct Pipelines {
     qmm2_q4_k: PipelineBundle,
     qmm2_q5_k: PipelineBundle,
     qmm2_iq3_s: PipelineBundle,
+    /// Tiled prefill matmul, indexed by `qmmt_index`.
+    qmmt: Vec<PipelineBundle>,
     argmax: PipelineBundle,
+}
+
+/// Weight formats with a tiled prefill matmul (`qmm_tiled.comp`), in `Pipelines::qmmt` order.
+fn qmmt_index(ty: WType) -> Option<usize> {
+    Some(match ty {
+        WType::Q4K => 0,
+        WType::Q5K => 1,
+        WType::Q6K => 2,
+        WType::Q2K => 3,
+        WType::Q3K => 4,
+        WType::Q8_0 => 5,
+        WType::Q4_0 => 6,
+        WType::F16 => 7,
+        WType::F32 => 8,
+        WType::IQ3S => 9,
+        WType::IQ3XXS => 10,
+        WType::IQ2XS => 11,
+        WType::IQ2S => 12,
+        WType::IQ2XXS => 13,
+        WType::IQ1S => 14,
+        WType::IQ1M => 15,
+        WType::IQ4XS => 16,
+        WType::IQ4NL => 17,
+        _ => return None,
+    })
+}
+
+/// Whether batched (prefill) matmuls of this weight format use a tiled kernel. Formats without
+/// one fall back to a per-token matvec loop, so callers should keep prefill chunks small.
+pub fn has_tiled_qmm(ty: WType) -> bool {
+    qmmt_index(ty).is_some()
+}
+
+/// Tile shape of qmm_tiled.comp (16*TM rows x 16*TN tokens); keep in sync with the shader defaults.
+const QMMT_BM: u32 = 64;
+const QMMT_BN: u32 = 128;
+
+/// Smallest batch that uses the tiled prefill matmul (env `OCAK_QMMT_MIN`, default 32).
+fn qmmt_min_batch() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OCAK_QMMT_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(32))
 }
 
 impl Pipelines {
@@ -208,7 +251,10 @@ impl Pipelines {
             &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_xxs, &self.qmm_iq3_s,
             &self.qmm2_iq2_xs, &self.qmm2_q4_k, &self.qmm2_q5_k, &self.qmm2_iq3_s,
             &self.argmax,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.qmmt.iter())
+        {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
             dev.destroy_descriptor_set_layout(p.ds_layout, None);
@@ -352,7 +398,7 @@ impl VkContext {
                 let mut avail12 = vk::PhysicalDeviceVulkan12Features::default();
                 let mut avail2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut avail12);
                 instance.get_physical_device_features2(pd, &mut avail2);
-                if avail12.storage_buffer8_bit_access == 0 || avail12.shader_int8 == 0 {
+                if avail12.storage_buffer8_bit_access == 0 || avail12.shader_int8 == 0 || avail12.shader_float16 == 0 {
                     continue;
                 }
                 let qfs = instance.get_physical_device_queue_family_properties(pd);
@@ -399,7 +445,8 @@ impl VkContext {
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
             let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
                 .storage_buffer8_bit_access(true)
-                .shader_int8(true);
+                .shader_int8(true)
+                .shader_float16(true);
             let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feat12);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qci)
@@ -489,6 +536,26 @@ impl VkContext {
                 qmm2_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
                 qmm2_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), 3, 28)?,
                 qmm2_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), 4, 28)?,
+                qmmt: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q5_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q6_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q2_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q3_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q8_0.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_0.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f16.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f32.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_xxs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xxs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_m.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_xs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_nl.spv")), 4, 28)?,
+                ],
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), 2, 8)?,
             };
 
@@ -1055,6 +1122,13 @@ impl<'a> Recorder<'a> {
                 }
             }
         }
+        if batch >= qmmt_min_batch() && k.is_multiple_of(32) {
+            if let Some(i) = qmmt_index(ty) {
+                let p = &self.ctx.pipelines.qmmt[i];
+                self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
+                return;
+            }
+        }
         let gy = batch.div_ceil(8);
         let gx8 = m.div_ceil(8);
         match ty {
@@ -1078,8 +1152,12 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rms_norm(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
+        self.rms_norm_batch(x, x_off, w, w_off, out, out_off, n, eps, 1);
+    }
+    /// RMS-normalize `batch` consecutive rows of `n` floats in one dispatch.
+    pub fn rms_norm_batch(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32, batch: u32) {
         let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1421,12 +1499,22 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn kv_write(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, pos: u32, kv_dim: u32) {
+        self.kv_write_batch(k, k_off, v, v_off, kv, layer_kv_off, page_table, pt_off, pos, kv_dim, 1);
+    }
+    /// Write K/V rows for tokens pos..pos+batch (rows of kv_dim floats) into the paged cache.
+    pub fn kv_write_batch(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, pos: u32, kv_dim: u32, batch: u32) {
         let pc = [off_u32(k_off), off_u32(v_off), off_u32(layer_kv_off), off_u32(pt_off), pos, kv_dim];
-        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), (kv_dim / 2).div_ceil(256), 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), (kv_dim / 2).div_ceil(256), batch, 1);
     }
 
     pub fn attention(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32) {
         self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
+    }
+    /// Causal prefill attention for queries at pos..pos+batch in one single-pass dispatch.
+    /// q/out rows are n_heads*head_dim floats; K/V for all those positions must already be written.
+    pub fn attention_batch(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32, batch: u32) {
+        let pc = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), off_u32(out_off), n_heads, n_kv_heads, head_dim, pos, sliding_window];
+        self.dispatch_raw(&self.ctx.pipelines.attention, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, batch, 1);
     }
     pub fn attention_swa(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32) {
         let t_start = if sliding_window > 0 && pos >= sliding_window { pos + 1 - sliding_window } else { 0 };
@@ -1462,8 +1550,11 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rms_norm_heads(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
+        self.rms_norm_heads_batch(x, x_off, w, n_heads, head_dim, eps, 1);
+    }
+    pub fn rms_norm_heads_batch(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32, batch: u32) {
         let pc = [off_u32(x_off), n_heads, head_dim, eps.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.rms_norm_heads, &[x.buf, w.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.rms_norm_heads, &[x.buf, w.buf], bytemuck::cast_slice(&pc), n_heads, batch, 1);
     }
 
     pub fn shortconv_step(&mut self, bcx: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, n_embd: u32, l_cache: u32) {
@@ -1490,8 +1581,10 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_step_batch(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32, batch: u32) {
+        assert!(head_dim <= 128, "deltanet_step supports head_dim <= 128 (got {head_dim})");
         let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits(), batch];
-        self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &[qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), n_v_heads * head_dim, 1, 1);
+        // 8 state rows (32-lane clusters) per 256-thread workgroup.
+        self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &[qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(8), 1, 1);
     }
 
     pub fn gated_rms_norm(&mut self, x: &Buffer, w: &Buffer, z: &Buffer, out: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
@@ -1529,8 +1622,12 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rope_ext(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, factors: &Buffer, use_factors: bool, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {
+        self.rope_ext_batch(q, q_off, k, k_off, factors, use_factors, n_heads, n_kv_heads, head_dim, n_rot, pos, freq_base, mode, 1);
+    }
+    /// RoPE for tokens pos..pos+batch; q rows are n_heads*head_dim, k rows n_kv_heads*head_dim.
+    pub fn rope_ext_batch(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, factors: &Buffer, use_factors: bool, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32, batch: u32) {
         let pc = [off_u32(q_off), off_u32(k_off), n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits(), use_factors as u32];
-        self.dispatch_raw(&self.ctx.pipelines.rope_ext, &[q.buf, k.buf, factors.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.rope_ext, &[q.buf, k.buf, factors.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, batch, 1);
     }
 
     pub fn finish_and_wait(self) -> Result<(), VkError> {
@@ -1852,6 +1949,93 @@ mod tests {
         c.download(&b_ou, 0, bytemuck::cast_slice_mut(&mut out_gpu)).unwrap();
         for i in 0..nch { assert!((out_cpu[i] - out_gpu[i]).abs() < 1e-4, "conv[{i}]: cpu={} gpu={}", out_cpu[i], out_gpu[i]); }
         let _ = (ne, nff);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vk_qmm_tiled_bench() {
+        let c = VkContext::new().expect("vulkan init");
+        let (k, m, batch) = (2560usize, 9216usize, 256usize);
+        let x: Vec<f32> = (0..batch * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let by = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+        for wt in [WType::F32, WType::F16, WType::Q8_0, WType::Q4K, WType::Q6K, WType::IQ3S, WType::IQ2XS] {
+            let rb = wt.row_bytes(k as u32) as usize;
+            let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            let iters = 20;
+            let run = |n: usize| {
+                let mut rec = c.begin();
+                for _ in 0..n {
+                    rec.qmm(wt, &bw, 0, &bx, 0, &by, 0, k as u32, m as u32, batch as u32);
+                }
+                rec.finish_and_wait().unwrap();
+            };
+            run(2);
+            let t = std::time::Instant::now();
+            run(iters);
+            let dt = t.elapsed().as_secs_f64() / iters as f64;
+            let tflops = 2.0 * (k * m * batch) as f64 / dt / 1e12;
+            eprintln!("{wt:?}: {:.3} ms  {:.2} TFLOPS", dt * 1e3, tflops);
+        }
+    }
+
+    #[test]
+    fn vk_qmm_tiled_matches_qmv() {
+        let c = VkContext::new().expect("vulkan init");
+        // m and batch deliberately not multiples of the 64x64 tile.
+        let (k, m, batch) = (512usize, 70usize, 75usize);
+        let mut s = 0x1234_5678u64;
+        let mut next_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 32) as u8
+        };
+        let x: Vec<f32> = (0..batch * k).map(|i| ((i % 31) as f32 - 15.0) * 0.05).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+        let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+        for wt in [
+            WType::Q4K, WType::Q5K, WType::Q6K, WType::Q2K, WType::Q3K, WType::Q8_0, WType::Q4_0, WType::F16, WType::F32,
+            WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS,
+            WType::IQ4NL,
+        ] {
+            assert!(qmmt_index(wt).is_some());
+            let rb = wt.row_bytes(k as u32) as usize;
+            let raw: Vec<u8> = if wt == WType::F32 {
+                let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
+                bytemuck::cast_slice(&f).to_vec()
+            } else {
+                (0..m * rb).map(|_| next_u8() & 0x3F).collect()
+            };
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            let mut rec = c.begin();
+            rec.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, batch as u32);
+            for b in 0..batch {
+                rec.qmv(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
+            }
+            rec.finish_and_wait().unwrap();
+            let mut y_qmm = vec![0f32; batch * m];
+            let mut y_qmv = vec![0f32; batch * m];
+            c.download(&by_qmm, 0, bytemuck::cast_slice_mut(&mut y_qmm)).unwrap();
+            c.download(&by_qmv, 0, bytemuck::cast_slice_mut(&mut y_qmv)).unwrap();
+            // The tiled kernel stages weights and activations as fp16 in shared memory (like
+            // llama.cpp's mul_mm), so allow fp16-level error relative to the output scale. Indexing
+            // bugs produce errors on the order of the scale itself.
+            let scale = y_qmv.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            for i in 0..batch * m {
+                let tol = 3e-3 * scale;  // observed max ~5e-4
+                assert!(
+                    (y_qmm[i] - y_qmv[i]).abs() <= tol,
+                    "tiled qmm vs qmv mismatch for {wt:?} idx={i}: qmm={} qmv={}",
+                    y_qmm[i],
+                    y_qmv[i]
+                );
+            }
+        }
     }
 
     #[test]

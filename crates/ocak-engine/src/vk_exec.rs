@@ -4,7 +4,12 @@ use ocak_gguf::{GgufFile, TensorInfo};
 use ocak_vk::{Buffer, VkContext, WType};
 use std::sync::Arc;
 
-const PREFILL_BATCH: usize = 16;
+const PREFILL_BATCH: usize = 256;
+/// Layers recorded per queue submit during batched prefill. Splitting a chunk across several
+/// submits keeps each one far below amdgpu's ~2 s TDR timeout even on 64-layer 27B models.
+const LAYERS_PER_SUBMIT: usize = 8;
+/// Prefill chunk used when some layer weight format has no tiled matmul kernel.
+const SLOW_PREFILL_CHUNK: usize = 16;
 
 struct WeightBuf {
     buf: Arc<Buffer>,
@@ -73,6 +78,9 @@ struct VkLayer {
 pub struct VkExec {
     ctx: Arc<VkContext>,
     cfg: ModelConfig,
+    /// Largest prefill chunk: PREFILL_BATCH when every layer matrix has a tiled matmul,
+    /// otherwise SLOW_PREFILL_CHUNK (untiled formats run one matvec per token).
+    prefill_chunk: usize,
     layers: Vec<VkLayer>,
     embd: WeightBuf,
     out_norm: Buffer,
@@ -243,7 +251,12 @@ impl VkExec {
         // FP16 packed KV cache: 2 f16s per u32 (half the VRAM & attention bandwidth!)
         let layer_stride = (n_pages * 2 * 16 * (cfg.kv_dim() / 2)) as u64;
         let qd = cfg.n_head * cfg.head_dim;
+        let all_tiled = g.tensors.iter().filter(|t| t.name.starts_with("blk.") && t.n_dims >= 2).all(|t| {
+            WType::from_ggml(t.ty).map(ocak_vk::has_tiled_qmm).unwrap_or(false)
+        });
+        let prefill_chunk = if all_tiled { PREFILL_BATCH } else { SLOW_PREFILL_CHUNK };
         Ok(Self {
+            prefill_chunk,
             kv: mk(layer_stride as usize * cfg.n_kv_layers)?,
             layer_stride,
             pt_buf: mk((n_pages * 4).max(64))?,
@@ -329,7 +342,7 @@ impl Executor for VkExec {
         self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
 
         // Keep each single vkQueueSubmit well below Linux amdgpu's 2s TDR timeout on 27B+ models
-        let chunk_max = if self.cfg.n_layer >= 48 { 8 } else { PREFILL_BATCH };
+        let chunk_max = std::env::var("OCAK_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.prefill_chunk).clamp(1, PREFILL_BATCH);
         let mut offset = 0usize;
         while offset < tokens.len() {
             let chunk = &tokens[offset..(offset + chunk_max).min(tokens.len())];
@@ -360,7 +373,7 @@ impl Executor for VkExec {
         }
         self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
 
-        let chunk_max = if self.cfg.n_layer >= 48 { 8 } else { PREFILL_BATCH };
+        let chunk_max = std::env::var("OCAK_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.prefill_chunk).clamp(1, PREFILL_BATCH);
         let mut hiddens = Vec::with_capacity(tokens.len());
         let mut offset = 0usize;
         while offset < tokens.len() {
@@ -388,7 +401,7 @@ impl Executor for VkExec {
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
         rec.set_defer_barriers(true);
-        self.record_batch_layers(&mut rec, &tokens, pos0, true);
+        self.record_batch_layers(&mut rec, &tokens, pos0, true, 0..self.layers.len());
         // Final norm + lm_head for BOTH tokens using a single 2-token qmm!
         rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf2, 0, ne, c.eps);
         rec.rms_norm(&self.x, ne as u64, &self.out_norm, 0, &self.hidden_buf2, ne as u64, ne, c.eps);
@@ -811,16 +824,24 @@ impl VkExec {
     ) -> Result<(), EngineError> {
         let c = &self.cfg;
         let ne = c.n_embd as u32;
+        let n_layer = self.layers.len();
+        let mut l0 = 0usize;
+        while n_layer - l0 > LAYERS_PER_SUBMIT {
+            let mut rec = self.ctx.begin();
+            rec.set_defer_barriers(true);
+            rec.set_attn_split(false);
+            self.record_batch_layers(&mut rec, chunk, pos0, false, l0..l0 + LAYERS_PER_SUBMIT);
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            l0 += LAYERS_PER_SUBMIT;
+        }
         let mut rec = self.ctx.begin();
         rec.set_defer_barriers(true);
         rec.set_attn_split(false);
-        self.record_batch_layers(&mut rec, chunk, pos0, false);
+        self.record_batch_layers(&mut rec, chunk, pos0, false, l0..n_layer);
 
         let last_off = ((chunk.len() - 1) * c.n_embd) as u64;
         if collect_hiddens.is_some() {
-            for b in 0..chunk.len() {
-                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &self.out_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
-            }
+            rec.rms_norm_batch(&self.x, 0, &self.out_norm, 0, &self.xn, 0, ne, c.eps, chunk.len() as u32);
             rec.barrier();
             if out.logits {
                 let w = self.output.as_ref().unwrap_or(&self.embd);
@@ -861,22 +882,26 @@ impl VkExec {
         Ok(())
     }
 
-    fn record_batch_layers(&self, rec: &mut ocak_vk::Recorder<'_>, chunk: &[u32], pos0: usize, snap_after_t0: bool) {
+    /// Record layers `layers` of a batched forward pass (token embedding included when the
+    /// range starts at layer 0). Activations live in GPU buffers, so consecutive ranges may be
+    /// recorded into separate submits.
+    fn record_batch_layers(&self, rec: &mut ocak_vk::Recorder<'_>, chunk: &[u32], pos0: usize, snap_after_t0: bool, layers: std::ops::Range<usize>) {
         let c = &self.cfg;
         let batch = chunk.len() as u32;
         let ne = c.n_embd as u32;
         let qd = (c.n_head * c.head_dim) as u32;
-        let mut rec_snap_idx = 0usize;
+        // Recurrent-state snapshot slots are numbered over the non-attention layers.
+        let mut rec_snap_idx = self.layers[..layers.start].iter().filter(|l| !matches!(l.mixer, VkMixer::FullAttn { .. })).count();
 
-        for (b, &tok) in chunk.iter().enumerate() {
-            rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, (b * c.n_embd) as u64, ne);
-        }
-        rec.barrier();
-
-        for l in &self.layers {
-            for b in 0..chunk.len() {
-                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+        if layers.start == 0 {
+            for (b, &tok) in chunk.iter().enumerate() {
+                rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, (b * c.n_embd) as u64, ne);
             }
+            rec.barrier();
+        }
+
+        for l in &self.layers[layers] {
+            rec.rms_norm_batch(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, ne, c.eps, batch);
             rec.barrier();
             match &l.mixer {
                 VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
@@ -905,24 +930,16 @@ impl VkExec {
                         rec.barrier();
                     }
                     if q_norm.is_some() || k_norm.is_some() {
-                        for b in 0..chunk.len() {
-                            if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, (b * qd as usize) as u64, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
-                            if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, (b * kv_dim) as u64, kn, *n_head_kv, c.head_dim as u32, c.eps); }
-                        }
+                        if let Some(qn) = q_norm { rec.rms_norm_heads_batch(&self.q, 0, qn, c.n_head as u32, c.head_dim as u32, c.eps, batch); }
+                        if let Some(kn) = k_norm { rec.rms_norm_heads_batch(&self.k, 0, kn, *n_head_kv, c.head_dim as u32, c.eps, batch); }
                         rec.barrier();
                     }
-                    for b in 0..chunk.len() {
-                        rec.rope_ext(&self.q, (b * qd as usize) as u64, &self.k, (b * kv_dim) as u64, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, (pos0 + b) as u32, *rope_base, c.rope_mode);
-                    }
+                    rec.rope_ext_batch(&self.q, 0, &self.k, 0, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, pos0 as u32, *rope_base, c.rope_mode, batch);
                     rec.barrier();
                     let kv_off = *kv_layer_idx as u64 * self.layer_stride;
-                    for b in 0..chunk.len() {
-                        rec.kv_write(&self.k, (b * kv_dim) as u64, &self.v, (b * kv_dim) as u64, &self.kv, kv_off, &self.pt_buf, 0, (pos0 + b) as u32, kv_dim as u32);
-                    }
+                    rec.kv_write_batch(&self.k, 0, &self.v, 0, &self.kv, kv_off, &self.pt_buf, 0, pos0 as u32, kv_dim as u32, batch);
                     rec.barrier();
-                    for b in 0..chunk.len() {
-                        rec.attention_swa(&self.q, (b * qd as usize) as u64, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, (b * qd as usize) as u64, c.n_head as u32, *n_head_kv, c.head_dim as u32, (pos0 + b) as u32, *sliding_window);
-                    }
+                    rec.attention_batch(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos0 as u32, *sliding_window, batch);
                     rec.barrier();
                     if *gated_q {
                         rec.mul_sigmoid(&self.attn, &self.q_gate, batch * qd);
@@ -1014,16 +1031,12 @@ impl VkExec {
                 }
             }
             if let Some(pan) = &l.post_attn_norm {
-                for b in 0..chunk.len() {
-                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pan, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
-                }
+                rec.rms_norm_batch(&self.o, 0, pan, 0, &self.o, 0, ne, c.eps, batch);
                 rec.barrier();
             }
             rec.add(&self.x, 0, &self.o, 0, batch * ne);
             rec.barrier();
-            for b in 0..chunk.len() {
-                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.ffn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
-            }
+            rec.rms_norm_batch(&self.x, 0, &l.ffn_norm, 0, &self.xn, 0, ne, c.eps, batch);
             rec.barrier();
             rec.qmm(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m, batch);
             rec.qmm(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m, batch);
@@ -1033,9 +1046,7 @@ impl VkExec {
             rec.qmm(l.down.ty, &l.down.buf, 0, &self.act, 0, &self.o, 0, l.down.k, l.down.m, batch);
             rec.barrier();
             if let Some(pfn) = &l.post_ffw_norm {
-                for b in 0..chunk.len() {
-                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pfn, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
-                }
+                rec.rms_norm_batch(&self.o, 0, pfn, 0, &self.o, 0, ne, c.eps, batch);
                 rec.barrier();
             }
             rec.add(&self.x, 0, &self.o, 0, batch * ne);
