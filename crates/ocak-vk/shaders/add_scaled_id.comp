@@ -7,9 +7,14 @@ layout(push_constant) uniform PC { uint a_off; uint b_off; uint n; uint slot; ui
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
-    float acc = (pc.overwrite != 0u) ? 0.0 : a[pc.a_off + i];
+    // Batched: workgroup y = token t (a row t, b rows t*count.., weights slot + t*count..).
+    uint t = gl_WorkGroupID.y;
+    uint a_off = pc.a_off + t * pc.n;
+    uint b_off = pc.b_off + t * pc.count * pc.n;
+    uint slot = pc.slot + t * pc.count;
+    float acc = (pc.overwrite != 0u) ? 0.0 : a[a_off + i];
     for (uint k = 0u; k < pc.count; k++) {
-        acc += w[pc.slot + k] * b[pc.b_off + k * pc.n + i];
+        acc += w[slot + k] * b[b_off + k * pc.n + i];
     }
-    a[pc.a_off + i] = acc;
+    a[a_off + i] = acc;
 }

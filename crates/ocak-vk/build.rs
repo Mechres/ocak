@@ -82,6 +82,7 @@ fn main() {
         "qmm2_q5_k",
         "qmm2_iq3_s",
         "argmax",
+        "moe_group",
     ];
     let has_glslc = Command::new("glslc").arg("--version").output().is_ok();
     let has_usr_glslc = !has_glslc && Command::new("/usr/bin/glslc").arg("--version").output().is_ok();
@@ -122,19 +123,20 @@ fn main() {
     ];
     let src = "shaders/qmm_tiled.comp";
     println!("cargo:rerun-if-changed={src}");
-    for (name, def) in tiled {
-        let dst = out_dir.join(format!("qmmt_{name}.spv"));
+    for (name, def, grouped) in tiled.iter().flat_map(|&(n, d)| [(n, d, false), (n, d, true)]) {
+        let dst = out_dir.join(format!("{}_{name}.spv", if grouped { "qmmg" } else { "qmmt" }));
         let define = format!("-D{def}");
+        let gdef = if grouped { "-DGROUPED" } else { "-DUNGROUPED" };
         let status = if has_glslc || has_usr_glslc {
             let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
             Command::new(bin)
-                .args(["--target-env=vulkan1.3", "-O", &define, src, "-o"])
+                .args(["--target-env=vulkan1.3", "-O", &define, gdef, src, "-o"])
                 .arg(&dst)
                 .status()
                 .expect("failed to invoke glslc")
         } else {
             Command::new("glslangValidator")
-                .args(["-V", "--target-env", "vulkan1.3", &define, "-o"])
+                .args(["-V", "--target-env", "vulkan1.3", &define, gdef, "-o"])
                 .arg(&dst)
                 .arg(src)
                 .status()

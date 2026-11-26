@@ -11,7 +11,10 @@ use ocak_vk::{Buffer, VkContext, WType};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-const XING_PREFILL_BATCH: usize = 8;
+const XING_PREFILL_BATCH: usize = 512;
+/// Layers per queue submit in batched prefill (keeps each submit far below the amdgpu TDR).
+#[cfg(feature = "vulkan")]
+const XING_LAYERS_PER_SUBMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct XingConfig {
@@ -107,6 +110,8 @@ struct VkMat {
     k: u32,
     m: u32,
     slice_bytes: u64,
+    /// Lives in host-visible system memory (GTT) because VRAM ran out.
+    in_gtt: bool,
 }
 
 #[cfg(feature = "vulkan")]
@@ -118,7 +123,7 @@ fn try_upload_mat(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Option
     let k = ti.ne[0] as u32;
     let m = ti.ne[1] as u32;
     let slice_bytes = (ti.row_bytes() * m as usize) as u64;
-    Some(VkMat { buf, ty, k, m, slice_bytes })
+    Some(VkMat { buf, ty, k, m, slice_bytes, in_gtt: false })
 }
 
 #[cfg(feature = "vulkan")]
@@ -129,7 +134,7 @@ fn try_upload_mat_gtt(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Op
     let k = ti.ne[0] as u32;
     let m = ti.ne[1] as u32;
     let slice_bytes = (ti.row_bytes() * m as usize) as u64;
-    Some(VkMat { buf, ty, k, m, slice_bytes })
+    Some(VkMat { buf, ty, k, m, slice_bytes, in_gtt: true })
 }
 
 #[cfg(feature = "vulkan")]
@@ -182,6 +187,8 @@ struct XingGpuState {
     hidden_buf: Buffer,
     logits_buf: Buffer,
     moe_tmp: Buffer,
+    /// Per-expert entry lists for the grouped MoE matmul (moe_group.comp layout).
+    moe_list: Buffer,
 }
 
 struct HcWeights {
@@ -280,6 +287,11 @@ pub struct XingExec {
     vk_output: Option<VkMat>,
     #[cfg(feature = "vulkan")]
     gpu_pipe: Option<XingGpuState>,
+    /// VRAM staging buffers (gate, up, down) for one layer's routed experts. When the model does
+    /// not fit in VRAM some expert tensors live in GTT; batched prefill DMA-copies them here once
+    /// per layer instead of having every matmul tile read host memory over PCIe.
+    #[cfg(feature = "vulkan")]
+    moe_stage: Option<[Buffer; 3]>,
     /// Compact MLA latent KV cache: [n_layer][max_ctx][kv_rank + n_rot]
     kv_cache: Vec<f32>,
     max_ctx: usize,
@@ -306,6 +318,23 @@ impl XingExec {
         let gpu_moe_target = moe_indices.len().saturating_sub(n_cpu_moe);
         let mut gpu_moe_placed = 0usize;
         let mut cpu_moe_placed = 0usize;
+        let mut moe_in_gtt = 0usize;
+        // Reserve the expert staging buffers up front, while VRAM is still free, if the model is
+        // unlikely to fit entirely (weights + ~1.5 GiB for KV cache and activations).
+        #[cfg(feature = "vulkan")]
+        let moe_stage: Option<[Buffer; 3]> = match &vk {
+            Some(c) if g.file_len() + (3u64 << 29) > c.vram_bytes() && !moe_indices.is_empty() => {
+                let max_bytes = |name: &str| {
+                    moe_indices.iter().filter_map(|i| g.tensor(&format!("blk.{i}.{name}"))).map(|t| t.n_bytes).max().unwrap_or(0)
+                };
+                let mk = |name: &str| c.create_device_buffer(max_bytes(name).max(4)).ok();
+                match (mk("ffn_gate_exps.weight"), mk("ffn_up_exps.weight"), mk("ffn_down_exps.weight")) {
+                    (Some(a), Some(b), Some(d)) => Some([a, b, d]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
@@ -383,6 +412,7 @@ impl XingExec {
                             if v.0.is_some() && v.1.is_some() && v.2.is_some() {
                                 v
                             } else {
+                                moe_in_gtt += 1;
                                 (
                                     try_upload_mat_gtt(c, &g, &gate_exps),
                                     try_upload_mat_gtt(c, &g, &up_exps),
@@ -390,6 +420,7 @@ impl XingExec {
                                 )
                             }
                         } else {
+                            moe_in_gtt += 1;
                             (
                                 try_upload_mat_gtt(c, &g, &gate_exps),
                                 try_upload_mat_gtt(c, &g, &up_exps),
@@ -458,6 +489,12 @@ impl XingExec {
             });
         }
 
+        if moe_in_gtt > 0 || cpu_moe_placed > 0 {
+            eprintln!(
+                "ocak: xing MoE expert layers: {} in VRAM, {moe_in_gtt} in host memory (GTT), {cpu_moe_placed} on CPU",
+                gpu_moe_placed - moe_in_gtt.min(gpu_moe_placed)
+            );
+        }
         let embd = req(&g, "token_embd.weight")?;
         let out_norm = f32v(&g, "output_norm.weight")?;
         let output = g.tensor("output.weight").cloned().unwrap_or_else(|| embd.clone());
@@ -532,6 +569,7 @@ impl XingExec {
                         mk(cfg.n_layer * max_ctx * (hd / 2)),
                         mk(pb * cfg.n_expert), mk(pb * cfg.n_used), mk(pb * cfg.n_used), upload_f32_buf(c, &zero_b),
                         upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(pb * cfg.n_used * cfg.n_embd),
+                        mk(cfg.n_expert.max(1) * (pb + 1)),
                     ) {
                         (
                             Some(ones), Some(streams_a), Some(streams_b), Some(streams_norm),
@@ -541,10 +579,11 @@ impl XingExec {
                             Some(kv_cache),
                             Some(router_logits), Some(top_ids), Some(top_w), Some(dummy_bias),
                             Some(out_norm_b), Some(hidden_buf), Some(logits_buf), Some(moe_tmp),
+                            Some(moe_list),
                         ) => Some(XingGpuState {
                             layers: g_layers, ones, streams_a, streams_b, streams_norm, hc_mixes, hc_out,
                             inp, normed, block_out, q_a, q_an, kv_raw, q_full, q_lat, attn_lat, val_all,
-                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, moe_tmp,
+                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, moe_tmp, moe_list,
                         }),
                         _ => None,
                     }
@@ -593,6 +632,8 @@ impl XingExec {
             vk_output,
             #[cfg(feature = "vulkan")]
             gpu_pipe,
+            #[cfg(feature = "vulkan")]
+            moe_stage,
             cfg,
             g,
         })
@@ -1318,6 +1359,11 @@ impl Executor for XingExec {
 }
 
 #[cfg(feature = "vulkan")]
+fn qmmt_ok(ty: ocak_vk::WType) -> bool {
+    ocak_vk::has_tiled_qmm(ty)
+}
+
+#[cfg(feature = "vulkan")]
 impl XingExec {
     fn forward_batch_gpu_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
         let c = self.cfg.clone();
@@ -1367,15 +1413,17 @@ impl XingExec {
         rec.set_defer_barriers(true);
         let mut cur_a = true;
         for li in 0..c.n_layer {
+            if li > 0 && li % XING_LAYERS_PER_SUBMIT == 0 {
+                rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+                rec = c_vk.begin();
+                rec.set_defer_barriers(true);
+            }
             let l = &self.layers[li];
             let gl = &gp.layers[li];
             let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
 
             // 1. HC pre (attn)
-            for t in 0..bs {
-                let off = (t * 4 * ne) as u64;
-                rec.rms_norm(st_cur, off, &gp.ones, 0, &gp.streams_norm, off, (4 * ne) as u32, c.eps);
-            }
+            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
             rec.barrier();
             rec.qmm(gl.hc_attn_fn.ty, &gl.hc_attn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_attn_fn.k, gl.hc_attn_fn.m, batch);
             rec.barrier();
@@ -1385,10 +1433,7 @@ impl XingExec {
             rec.barrier();
 
             // 2. MLA Attention (batched projections + causal batched attention)
-            for t in 0..bs {
-                let off = (t * ne) as u64;
-                rec.rms_norm(&gp.inp, off, &gl.attn_norm, 0, &gp.normed, off, ne as u32, c.eps);
-            }
+            rec.rms_norm_batch(&gp.inp, 0, &gl.attn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
             rec.barrier();
             let va = l.vk_wq_a.as_ref().unwrap();
             let vkva = l.vk_wkv_a.as_ref().unwrap();
@@ -1399,10 +1444,8 @@ impl XingExec {
             rec.qmm(va.ty, &va.buf, 0, &gp.normed, 0, &gp.q_a, 0, va.k, va.m, batch);
             rec.qmm(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m, batch);
             rec.barrier();
-            for t in 0..bs {
-                rec.rms_norm(&gp.q_a, (t * c.q_rank) as u64, &gl.q_a_norm, 0, &gp.q_an, (t * c.q_rank) as u64, c.q_rank as u32, c.eps);
-                rec.rms_norm(&gp.kv_raw, (t * hd) as u64, &gl.kv_a_norm, 0, &gp.kv_raw, (t * hd) as u64, latent as u32, c.eps);
-            }
+            rec.rms_norm_batch(&gp.q_a, 0, &gl.q_a_norm, 0, &gp.q_an, 0, c.q_rank as u32, c.eps, batch);
+            rec.rms_norm_batch_strided(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_raw, 0, latent as u32, hd as u32, c.eps, batch);
             rec.barrier();
             rec.qmm(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m, batch);
             rec.barrier();
@@ -1413,14 +1456,17 @@ impl XingExec {
                 pos0 as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale, batch,
             );
             rec.barrier();
-            for t in 0..bs {
-                for h in 0..nh {
-                    rec.qmv(
-                        vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes,
-                        &gp.q_full, ((t * nh + h) * c.key_dim) as u64,
-                        &gp.q_lat, ((t * nh + h) * latent) as u64,
-                        vkb.k, vkb.m,
-                    );
+            // Per-head absorbed K projection: one grouped matmul (group = head, entry = t*nh + h).
+            if !rec.qmm_grouped(vkb.ty, &vkb.buf, 0, vkb.slice_bytes, &gp.q_full, 0, c.key_dim as u32, 1, &gp.q_lat, 0, vkb.k, vkb.m, nh as u32, None, batch) {
+                for t in 0..bs {
+                    for h in 0..nh {
+                        rec.qmv(
+                            vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes,
+                            &gp.q_full, ((t * nh + h) * c.key_dim) as u64,
+                            &gp.q_lat, ((t * nh + h) * latent) as u64,
+                            vkb.k, vkb.m,
+                        );
+                    }
                 }
             }
             rec.barrier();
@@ -1430,14 +1476,16 @@ impl XingExec {
                 pos0 as u32, kv_layer_off, kq_scale, batch,
             );
             rec.barrier();
-            for t in 0..bs {
-                for h in 0..nh {
-                    rec.qmv(
-                        vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes,
-                        &gp.attn_lat, ((t * nh + h) * latent) as u64,
-                        &gp.val_all, ((t * nh + h) * vdim) as u64,
-                        vvb.k, vvb.m,
-                    );
+            if !rec.qmm_grouped(vvb.ty, &vvb.buf, 0, vvb.slice_bytes, &gp.attn_lat, 0, latent as u32, 1, &gp.val_all, 0, vvb.k, vvb.m, nh as u32, None, batch) {
+                for t in 0..bs {
+                    for h in 0..nh {
+                        rec.qmv(
+                            vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes,
+                            &gp.attn_lat, ((t * nh + h) * latent) as u64,
+                            &gp.val_all, ((t * nh + h) * vdim) as u64,
+                            vvb.k, vvb.m,
+                        );
+                    }
                 }
             }
             rec.barrier();
@@ -1449,10 +1497,7 @@ impl XingExec {
 
             // 3. HC pre (FFN)
             let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
-            for t in 0..bs {
-                let off = (t * 4 * ne) as u64;
-                rec.rms_norm(st_cur, off, &gp.ones, 0, &gp.streams_norm, off, (4 * ne) as u32, c.eps);
-            }
+            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
             rec.barrier();
             rec.qmm(gl.hc_ffn_fn.ty, &gl.hc_ffn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_ffn_fn.k, gl.hc_ffn_fn.m, batch);
             rec.barrier();
@@ -1460,10 +1505,7 @@ impl XingExec {
             rec.barrier();
             rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
             rec.barrier();
-            for t in 0..bs {
-                let off = (t * ne) as u64;
-                rec.rms_norm(&gp.inp, off, &gl.ffn_norm, 0, &gp.normed, off, ne as u32, c.eps);
-            }
+            rec.rms_norm_batch(&gp.inp, 0, &gl.ffn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
             rec.barrier();
 
             // 4. Dense or MoE FFN
@@ -1497,27 +1539,53 @@ impl XingExec {
                     let (vg, vu, vd) = (vk_gate_exps.as_ref().unwrap(), vk_up_exps.as_ref().unwrap(), vk_down_exps.as_ref().unwrap());
                     // Shared down (batched qmm) + all B tokens' routed gate/up in parallel!
                     rec.qmm(vds.ty, &vds.buf, 0, ba, sh_off, &gp.block_out, 0, vds.k, vds.m, batch);
-                    for t in 0..bs {
-                        let slot_base = (t * c.n_used) as u32;
-                        let y_off = (t * c.n_used * c.n_ff_exp) as u64;
-                        rec.qmv_id_batch(vg.ty, &vg.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bg, y_off, vg.k, vg.m, vg.slice_bytes);
-                        rec.qmv_id_batch(vu.ty, &vu.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bu, y_off, vu.k, vu.m, vu.slice_bytes);
+                    // Routed experts: bucket the bs*n_used (token, slot) entries by expert, then one
+                    // grouped tiled matmul per projection (each expert's weights read once per tile).
+                    let grouped = qmmt_ok(vg.ty) && qmmt_ok(vu.ty) && qmmt_ok(vd.ty) && c.n_expert <= 256;
+                    let n_exp = c.n_expert as u32;
+                    // GTT-resident experts: one DMA copy per tensor into VRAM staging.
+                    let staged: Option<[&Buffer; 3]> = match &self.moe_stage {
+                        Some(st) if grouped && vg.in_gtt => {
+                            for (src, dst) in [(vg, &st[0]), (vu, &st[1]), (vd, &st[2])] {
+                                rec.copy_buf_bytes(&src.buf, dst, src.slice_bytes * c.n_expert as u64);
+                            }
+                            Some([&st[0], &st[1], &st[2]])
+                        }
+                        _ => None,
+                    };
+                    let (wg_buf, wu_buf, wd_buf) = match staged {
+                        Some([a, b, d]) => (a, b, d),
+                        None => (&vg.buf, &vu.buf, &vd.buf),
+                    };
+                    if grouped {
+                        rec.barrier();
+                        rec.moe_group(&gp.top_ids, &gp.moe_list, batch * n_used, n_exp, batch);
+                        rec.barrier();
+                        rec.qmm_grouped(vg.ty, wg_buf, 0, vg.slice_bytes, &gp.normed, 0, ne as u32, n_used, bg, 0, vg.k, vg.m, n_exp, Some(&gp.moe_list), batch);
+                        rec.qmm_grouped(vu.ty, wu_buf, 0, vu.slice_bytes, &gp.normed, 0, ne as u32, n_used, bu, 0, vu.k, vu.m, n_exp, Some(&gp.moe_list), batch);
+                    } else {
+                        for t in 0..bs {
+                            let slot_base = (t * c.n_used) as u32;
+                            let y_off = (t * c.n_used * c.n_ff_exp) as u64;
+                            rec.qmv_id_batch(vg.ty, &vg.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bg, y_off, vg.k, vg.m, vg.slice_bytes);
+                            rec.qmv_id_batch(vu.ty, &vu.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bu, y_off, vu.k, vu.m, vu.slice_bytes);
+                        }
                     }
                     rec.barrier();
                     rec.swiglu(bg, 0, bu, 0, ba, 0, batch * n_used * c.n_ff_exp as u32);
                     rec.barrier();
-                    for t in 0..bs {
-                        let slot_base = (t * c.n_used) as u32;
-                        let a_off = (t * c.n_used * c.n_ff_exp) as u64;
-                        let tmp_off = (t * c.n_used * ne) as u64;
-                        rec.qmv_id_batch(vd.ty, &vd.buf, &gp.top_ids, slot_base, n_used, ba, a_off, c.n_ff_exp as u32, &gp.moe_tmp, tmp_off, vd.k, vd.m, vd.slice_bytes);
+                    if grouped {
+                        rec.qmm_grouped(vd.ty, wd_buf, 0, vd.slice_bytes, ba, 0, c.n_ff_exp as u32, 1, &gp.moe_tmp, 0, vd.k, vd.m, n_exp, Some(&gp.moe_list), batch);
+                    } else {
+                        for t in 0..bs {
+                            let slot_base = (t * c.n_used) as u32;
+                            let a_off = (t * c.n_used * c.n_ff_exp) as u64;
+                            let tmp_off = (t * c.n_used * ne) as u64;
+                            rec.qmv_id_batch(vd.ty, &vd.buf, &gp.top_ids, slot_base, n_used, ba, a_off, c.n_ff_exp as u32, &gp.moe_tmp, tmp_off, vd.k, vd.m, vd.slice_bytes);
+                        }
                     }
                     rec.barrier();
-                    for t in 0..bs {
-                        let slot_base = (t * c.n_used) as u32;
-                        let tmp_off = (t * c.n_used * ne) as u64;
-                        rec.add_scaled_id_batch(&gp.block_out, (t * ne) as u64, &gp.moe_tmp, tmp_off, &gp.top_w, ne as u32, slot_base, n_used, false);
-                    }
+                    rec.add_scaled_id_tokens(&gp.block_out, 0, &gp.moe_tmp, 0, &gp.top_w, ne as u32, 0, n_used, false, batch);
                     rec.barrier();
                 }
             }

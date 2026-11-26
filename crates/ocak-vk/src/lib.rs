@@ -188,6 +188,9 @@ struct Pipelines {
     qmm2_iq3_s: PipelineBundle,
     /// Tiled prefill matmul, indexed by `qmmt_index`.
     qmmt: Vec<PipelineBundle>,
+    /// Grouped (MoE expert / per-head) variant of `qmmt`, same indexing.
+    qmmg: Vec<PipelineBundle>,
+    moe_group: PipelineBundle,
     argmax: PipelineBundle,
 }
 
@@ -225,6 +228,8 @@ pub fn has_tiled_qmm(ty: WType) -> bool {
 /// Tile shape of qmm_tiled.comp (16*TM rows x 16*TN tokens); keep in sync with the shader defaults.
 const QMMT_BM: u32 = 64;
 const QMMT_BN: u32 = 128;
+/// Column tile of the grouped variant (16 * TN with -DGROUPED).
+const QMMG_BN: u32 = 32;
 
 /// Smallest batch that uses the tiled prefill matmul (env `OCAK_QMMT_MIN`, default 32).
 fn qmmt_min_batch() -> u32 {
@@ -254,6 +259,8 @@ impl Pipelines {
         ]
         .into_iter()
         .chain(self.qmmt.iter())
+        .chain(self.qmmg.iter())
+        .chain(std::iter::once(&self.moe_group))
         {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -462,7 +469,7 @@ impl VkContext {
 
             let bp = |spv: &[u8], nb: u32, pc: u32| build_pipeline(&device, spv, nb, pc, use_push_desc);
             let pipelines = Pipelines {
-                rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 20)?,
+                rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 24)?,
                 add_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_rms_norm.spv")), 4, 24)?,
                 add: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
                 add_scaled: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
@@ -556,6 +563,27 @@ impl VkContext {
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_xs.spv")), 4, 28)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_nl.spv")), 4, 28)?,
                 ],
+                qmmg: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q4_k.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q5_k.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q6_k.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q2_k.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q3_k.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q8_0.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q4_0.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_f16.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_f32.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq3_s.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq3_xxs.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq2_xs.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq2_s.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq2_xxs.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq1_s.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq1_m.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq4_xs.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq4_nl.spv")), 5, 52)?,
+                ],
+                moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), 2, 12)?,
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), 2, 8)?,
             };
 
@@ -1156,7 +1184,11 @@ impl<'a> Recorder<'a> {
     }
     /// RMS-normalize `batch` consecutive rows of `n` floats in one dispatch.
     pub fn rms_norm_batch(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32, batch: u32) {
-        let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits()];
+        self.rms_norm_batch_strided(x, x_off, w, w_off, out, out_off, n, n, eps, batch);
+    }
+    /// Like `rms_norm_batch`, but rows are `stride` floats apart (normalizes the first n of each).
+    pub fn rms_norm_batch_strided(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, stride: u32, eps: f32, batch: u32) {
+        let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits(), stride];
         self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
@@ -1375,8 +1407,15 @@ impl<'a> Recorder<'a> {
         // Split-K over context chunks (each workgroup: 8 heads x one chunk), then merge per (token, head).
         let per_split = nh as u64 * batch as u64 * (latent as u64 + 2) * 4;
         let mut n_splits = max_nt.div_ceil(mla_chunk);
-        while n_splits > 1 && per_split * n_splits as u64 > ATTN_SCRATCH_BYTES / 2 {
+        while n_splits > 1 && per_split * n_splits as u64 > ATTN_SCRATCH_BYTES {
             n_splits = n_splits.div_ceil(2);
+        }
+        if n_splits <= 1 {
+            // Large batch: (heads/8 x batch) workgroups already fill the GPU, and a single split
+            // writes normalized output directly (the merge pass would read unwritten scratch).
+            let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits(), max_nt, 0];
+            self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf, scratch], bytemuck::cast_slice(&pc), gx, batch, 1);
+            return;
         }
         let chunk = max_nt.div_ceil(n_splits);
         let bytes = per_split * n_splits as u64;
@@ -1428,6 +1467,41 @@ impl<'a> Recorder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Bucket `n_entries` MoE routing entries (ids[i] = expert of entry i) by expert into `list`
+    /// (layout documented in moe_group.comp). `list` needs n_groups * (cap + 1) u32s.
+    pub fn moe_group(&mut self, ids: &Buffer, list: &Buffer, n_entries: u32, n_groups: u32, cap: u32) {
+        assert!(n_groups <= 256, "moe_group supports <= 256 experts");
+        let pc = [n_entries, n_groups, cap];
+        self.dispatch_raw(&self.ctx.pipelines.moe_group, &[ids.buf, list.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+    }
+
+    /// Grouped tiled matmul. For each group g (expert or head), multiplies weight slice
+    /// `w_off + g * slice_bytes` ([m, k]) with the group's columns:
+    /// - `list = Some(buf)`: columns are the entries moe_group wrote for g (at most `cols` = cap);
+    /// - `list = None`: columns are entries `j * n_groups + g` for j < `cols`.
+    ///
+    /// Entry e reads X row `(e / x_div) * x_stride` (in floats from x_off) and writes Y row
+    /// `e * m`. Returns false (nothing recorded) when the weight format has no tiled kernel.
+    pub fn qmm_grouped(&mut self, ty: WType, w: &Buffer, w_off: u64, slice_bytes: u64, x: &Buffer, x_off: u64, x_stride: u32, x_div: u32, y: &Buffer, y_off: u64, k: u32, m: u32, n_groups: u32, list: Option<&Buffer>, cols: u32) -> bool {
+        let Some(i) = qmmt_index(ty) else { return false };
+        if !k.is_multiple_of(32) {
+            return false;
+        }
+        let use_list = list.is_some() as u32;
+        let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), x_stride, x_div, off_u32(slice_bytes), n_groups, cols, use_list, cols];
+        let lbuf = list.map(|b| b.buf).unwrap_or(self.ctx.iq_buf);
+        let p = &self.ctx.pipelines.qmmg[i];
+        self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, lbuf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), n_groups, cols.div_ceil(QMMG_BN));
+        true
+    }
+
+    /// `add_scaled_id_batch` for `batch` consecutive tokens (token t: a row t, b rows
+    /// t*count.., weights slot_base + t*count..).
+    pub fn add_scaled_id_tokens(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool, batch: u32) {
+        let pc = [off_u32(a_off), off_u32(b_off), n, slot_base, count, overwrite as u32];
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), batch, 1);
+    }
+
     pub fn add_scaled_id_batch(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
         let pc = [off_u32(a_off), off_u32(b_off), n, slot_base, count, overwrite as u32];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
@@ -1979,6 +2053,131 @@ mod tests {
             let dt = t.elapsed().as_secs_f64() / iters as f64;
             let tflops = 2.0 * (k * m * batch) as f64 / dt / 1e12;
             eprintln!("{wt:?}: {:.3} ms  {:.2} TFLOPS", dt * 1e3, tflops);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vk_qmm_grouped_bench() {
+        let c = VkContext::new().expect("vulkan init");
+        let (n_exp, n_used, batch) = (64usize, 4usize, 256usize);
+        let mut s = 0x2545_F491u64;
+        let mut next = || -> u32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        let mut ids = Vec::new();
+        for _ in 0..batch {
+            let mut picked: Vec<u32> = Vec::new();
+            while picked.len() < n_used {
+                let e = next() % n_exp as u32;
+                if !picked.contains(&e) { picked.push(e); }
+            }
+            ids.extend(picked);
+        }
+        let bids = c.create_device_buffer((ids.len() * 4) as u64).unwrap();
+        c.upload(&bids, 0, bytemuck::cast_slice(&ids)).unwrap();
+        let blist = c.create_device_buffer((n_exp * (batch + 1) * 4) as u64).unwrap();
+        for (k, m) in [(3584usize, 1024usize), (1024, 3584)] {
+            let x: Vec<f32> = (0..batch * n_used * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+            let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+            c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+            let by = c.create_device_buffer((batch * n_used * m * 4) as u64).unwrap();
+            for wt in [WType::IQ3XXS, WType::IQ3S] {
+                let slice = m * wt.row_bytes(k as u32) as usize;
+                let raw: Vec<u8> = (0..n_exp * slice).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
+                let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+                c.upload(&bw, 0, &raw).unwrap();
+                let run = |n: usize| {
+                    let mut rec = c.begin();
+                    rec.moe_group(&bids, &blist, (batch * n_used) as u32, n_exp as u32, batch as u32);
+                    rec.barrier();
+                    for _ in 0..n {
+                        rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, if k > m { n_used as u32 } else { 1 }, &by, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32);
+                    }
+                    rec.finish_and_wait().unwrap();
+                };
+                run(2);
+                let t = std::time::Instant::now();
+                run(20);
+                let dt = t.elapsed().as_secs_f64() / 20.0;
+                eprintln!("{wt:?} k={k} m={m}: {:.3} ms  {:.2} TFLOPS", dt * 1e3, 2.0 * (k * m * batch * n_used) as f64 / dt / 1e12);
+            }
+        }
+    }
+
+    #[test]
+    fn vk_qmm_grouped_matches_qmv() {
+        let c = VkContext::new().expect("vulkan init");
+        let (k, m, n_exp, n_used, batch) = (512usize, 70usize, 6usize, 2usize, 45usize);
+        let mut s = 0x9E37_79B9u64;
+        let mut next = || -> u32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        // Routing: n_used distinct experts per token, skewed so some experts exceed one 32-column tile.
+        let mut ids = Vec::new();
+        for _ in 0..batch {
+            let a = if next() % 3 == 0 { (next() % n_exp as u32) as usize } else { 0 };
+            let mut b = (next() % n_exp as u32) as usize;
+            if b == a { b = (a + 1) % n_exp; }
+            ids.push(a as u32);
+            ids.push(b as u32);
+        }
+        let x: Vec<f32> = (0..batch * k).map(|i| ((i % 37) as f32 - 18.0) * 0.03).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let bids = c.create_device_buffer((ids.len() * 4) as u64).unwrap();
+        c.upload(&bids, 0, bytemuck::cast_slice(&ids)).unwrap();
+        let blist = c.create_device_buffer((n_exp * (batch + 1) * 4) as u64).unwrap();
+        let n_ent = batch * n_used;
+        let by_g = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
+        let by_r = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
+        for wt in [WType::IQ3S, WType::Q4K, WType::IQ4NL, WType::Q8_0] {
+            let rb = wt.row_bytes(k as u32) as usize;
+            let slice = m * rb;
+            let raw: Vec<u8> = (0..n_exp * slice).map(|_| (next() & 0x3F) as u8).collect();
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            // Expert mode: entry e = t * n_used + slot reads X row t.
+            let mut rec = c.begin();
+            rec.moe_group(&bids, &blist, n_ent as u32, n_exp as u32, batch as u32);
+            rec.barrier();
+            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, n_used as u32, &by_g, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32));
+            for (e, &ex) in ids.iter().enumerate() {
+                rec.qmv(wt, &bw, ex as u64 * slice as u64, &bx, ((e / n_used) * k) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
+            }
+            rec.finish_and_wait().unwrap();
+            let mut yg = vec![0f32; n_ent * m];
+            let mut yr = vec![0f32; n_ent * m];
+            c.download(&by_g, 0, bytemuck::cast_slice_mut(&mut yg)).unwrap();
+            c.download(&by_r, 0, bytemuck::cast_slice_mut(&mut yr)).unwrap();
+            let scale = yr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            for i in 0..n_ent * m {
+                assert!((yg[i] - yr[i]).abs() <= 3e-3 * scale, "grouped(list) {wt:?} idx={i}: {} vs {}", yg[i], yr[i]);
+            }
+            // Head mode: group g = head, entry = t * n_groups + g, X rows strided.
+            let (nh, stride) = (3usize, k + 64);
+            let cols = 15usize;
+            let xh: Vec<f32> = (0..cols * nh * stride).map(|i| ((i % 41) as f32 - 20.0) * 0.02).collect();
+            let bxh = c.create_device_buffer((xh.len() * 4) as u64).unwrap();
+            c.upload(&bxh, 0, bytemuck::cast_slice(&xh)).unwrap();
+            let mut rec = c.begin();
+            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bxh, 0, stride as u32, 1, &by_g, 0, k as u32, m as u32, nh as u32, None, cols as u32));
+            for t in 0..cols {
+                for h in 0..nh {
+                    let e = t * nh + h;
+                    rec.qmv(wt, &bw, (h * slice) as u64, &bxh, (e * stride) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
+                }
+            }
+            rec.finish_and_wait().unwrap();
+            let n = cols * nh * m;
+            c.download(&by_g, 0, bytemuck::cast_slice_mut(&mut yg[..n])).unwrap();
+            c.download(&by_r, 0, bytemuck::cast_slice_mut(&mut yr[..n])).unwrap();
+            let scale = yr[..n].iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            for i in 0..n {
+                assert!((yg[i] - yr[i]).abs() <= 3e-3 * scale, "grouped(heads) {wt:?} idx={i}: {} vs {}", yg[i], yr[i]);
+            }
         }
     }
 

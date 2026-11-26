@@ -1,0 +1,24 @@
+#version 460
+// Bucket MoE routing entries by expert for the grouped matmul (qmm_tiled.comp -DGROUPED).
+// Entry i = token * n_used + slot routes to expert ids[i]. Output buffer layout:
+//   list[0 .. n_groups)                      = number of entries per expert
+//   list[n_groups + e * cap + j], j < count  = entry indices routed to expert e
+// Order within an expert is arbitrary; each output row is computed independently, so results
+// do not depend on it. Single workgroup; n_groups <= 256.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 1) writeonly buffer L { uint list[]; };
+layout(push_constant) uniform PC { uint n_entries; uint n_groups; uint cap; } pc;
+shared uint cnt[256];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    cnt[tid] = 0u;
+    barrier();
+    for (uint i = tid; i < pc.n_entries; i += 256u) {
+        uint e = min(ids[i], pc.n_groups - 1u);
+        uint j = atomicAdd(cnt[e], 1u);
+        list[pc.n_groups + e * pc.cap + j] = i;
+    }
+    barrier();
+    if (tid < pc.n_groups) list[tid] = cnt[tid];
+}

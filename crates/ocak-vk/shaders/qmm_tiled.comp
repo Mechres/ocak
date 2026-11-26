@@ -8,11 +8,21 @@
 // BN x BK activation tile, then every thread accumulates a TM x TN register block. Each weight
 // is dequantized once per BN tokens (vs. once per 8 in qmm_*.comp).
 // Compiled once per weight format with -D<TYPE> (see build.rs).
+// -DGROUPED: grouped ("mul_mat_id") variant. Workgroup y = group g (MoE expert or attention
+// head), z = column tile. Group g uses weight slice w_off + g * slice_bytes. Its columns are
+// entries: from the moe_group.comp list (use_list != 0) or entry = j * n_groups + g for
+// j < count (per-head batched matmul). Entry e reads X row (e / x_div) * x_stride and writes
+// Y row e * m.
+#ifdef GROUPED
+#define TM 4u
+#define TN 2u
+#else
 #ifndef TM
 #define TM 4u
 #endif
 #ifndef TN
 #define TN 8u
+#endif
 #endif
 #define BM (16u * TM)
 #define BN (16u * TN)
@@ -22,7 +32,15 @@ layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+#ifdef GROUPED
+layout(set = 0, binding = 4) readonly buffer L { uint glist[]; };
+layout(push_constant) uniform PC {
+    uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes;
+    uint x_stride; uint x_div; uint slice_bytes; uint n_groups; uint count; uint use_list; uint cap;
+} pc;
+#else
 layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+#endif
 
 shared float16_t ws[BK * BM];
 shared float16_t xs[BK * BN];
@@ -260,19 +278,38 @@ void dq8(uint rb, uint k0, out float v[8]) {
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint row0 = gl_WorkGroupID.x * BM;
+#ifdef GROUPED
+    uint grp = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.z * BN;
+    uint ncols = (pc.use_list != 0u) ? glist[grp] : pc.count;
+    if (tok0 >= ncols) return;
+    uint wbase = pc.w_off + grp * pc.slice_bytes;
+#else
     uint tok0 = gl_WorkGroupID.y * BN;
+    uint ncols = pc.batch;
+    uint wbase = pc.w_off;
+#endif
 
-    // Loader mapping: 64 lines x 4 segments of 8 along K per pass; BM/64 (BN/64) passes.
+    // Weight loader: 64 rows x 4 segments of 8 along K per pass; BM/64 passes.
     uint ld_line = lid >> 2;
     uint ld_seg = (lid & 3u) * 8u;
     uint rbs[BM / 64u];
     for (uint p = 0u; p < BM / 64u; p++)
-        rbs[p] = pc.w_off + min(row0 + ld_line + 64u * p, pc.m - 1u) * pc.row_bytes;
-    uint xbs[BN / 64u];
-    for (uint p = 0u; p < BN / 64u; p++)
-        xbs[p] = pc.x_off + min(tok0 + ld_line + 64u * p, pc.batch - 1u) * pc.k + ld_seg;
+        rbs[p] = wbase + min(row0 + ld_line + 64u * p, pc.m - 1u) * pc.row_bytes;
+    // Activation loader: TPL threads per column, SEGL consecutive K values each.
+    const uint TPL = 256u / BN;
+    const uint SEGL = BK / TPL;
+    uint x_line = lid / TPL;
+    uint x_seg = (lid % TPL) * SEGL;
+    uint col = min(tok0 + x_line, ncols - 1u);
+#ifdef GROUPED
+    uint xentry = (pc.use_list != 0u) ? glist[pc.n_groups + grp * pc.cap + col] : col * pc.n_groups + grp;
+    uint xb = pc.x_off + (xentry / pc.x_div) * pc.x_stride + x_seg;
+#else
+    uint xb = pc.x_off + col * pc.k + x_seg;
+#endif
 
-    // Compute mapping: thread owns rows tx*TM.. and tokens ty*TN..
+    // Compute mapping: thread owns rows tx*TM.. and columns ty*TN..
     uint tx = lid & 15u;
     uint ty = lid >> 4;
     float acc[TN][TM];
@@ -285,8 +322,7 @@ void main() {
             dq8(rbs[p], k0 + ld_seg, v);
             for (uint i = 0u; i < 8u; i++) ws[(ld_seg + i) * BM + ld_line + 64u * p] = float16_t(v[i]);
         }
-        for (uint p = 0u; p < BN / 64u; p++)
-            for (uint i = 0u; i < 8u; i++) xs[(ld_seg + i) * BN + ld_line + 64u * p] = float16_t(x[xbs[p] + k0 + i]);
+        for (uint i = 0u; i < SEGL; i++) xs[(x_seg + i) * BN + x_line] = float16_t(x[xb + k0 + i]);
         barrier();
         for (uint kk = 0u; kk < BK; kk++) {
             float wr[TM];
@@ -300,11 +336,16 @@ void main() {
     }
 
     for (uint j = 0u; j < TN; j++) {
-        uint tok = tok0 + ty * TN + j;
-        if (tok >= pc.batch) break;
+        uint c = tok0 + ty * TN + j;
+        if (c >= ncols) break;
+#ifdef GROUPED
+        uint yentry = (pc.use_list != 0u) ? glist[pc.n_groups + grp * pc.cap + c] : c * pc.n_groups + grp;
+#else
+        uint yentry = c;
+#endif
         for (uint i = 0u; i < TM; i++) {
             uint row = row0 + tx * TM + i;
-            if (row < pc.m) y[pc.y_off + tok * pc.m + row] = acc[j][i];
+            if (row < pc.m) y[pc.y_off + yentry * pc.m + row] = acc[j][i];
         }
     }
 }
