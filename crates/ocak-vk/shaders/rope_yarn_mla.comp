@@ -2,7 +2,7 @@
 layout(local_size_x = 32) in;
 layout(set = 0, binding = 0) buffer QFull { float qf[]; };
 layout(set = 0, binding = 1) buffer KvRaw { float kvr[]; };
-layout(set = 0, binding = 2) writeonly buffer KvCache { float kvc[]; };
+layout(set = 0, binding = 2) writeonly buffer KvCache { uint kvc[]; };
 layout(push_constant) uniform PC {
     uint nh;
     uint key_dim;
@@ -20,7 +20,15 @@ layout(push_constant) uniform PC {
 void main() {
     uint wg = gl_WorkGroupID.x;
     uint i = gl_LocalInvocationID.x;
-    uint half_r = pc.n_rot / 2u;
+    uint half_r = pc.n_rot >> 1;
+    uint half_lat = pc.latent >> 1;
+    uint half_hd = half_lat + half_r;
+    if (wg == pc.nh) {
+        uint dst_lat = pc.kv_layer_off + pc.pos * half_hd;
+        for (uint j = i; j < half_lat; j += 32u) {
+            kvc[dst_lat + j] = packHalf2x16(vec2(kvr[2u * j], kvr[2u * j + 1u]));
+        }
+    }
     if (wg <= pc.nh && i < half_r) {
         float freq_inv = pow(pc.rope_base, -2.0 * float(i) / float(pc.n_rot));
         float freq = freq_inv;
@@ -47,10 +55,8 @@ void main() {
             float y1 = x0 * ss + x1 * sc;
             kvr[base + 2u * i] = y0;
             kvr[base + 2u * i + 1u] = y1;
-            uint hd = pc.latent + pc.n_rot;
-            uint dst = pc.kv_layer_off + pc.pos * hd + pc.latent;
-            kvc[dst + 2u * i] = y0;
-            kvc[dst + 2u * i + 1u] = y1;
+            uint dst = pc.kv_layer_off + pc.pos * half_hd + half_lat;
+            kvc[dst + i] = packHalf2x16(vec2(y0, y1));
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Multi-protocol HTTP/SSE server: OpenAI, Anthropic `/v1/messages`, Embeddings, Audio/ASR,
 //! Prometheus `/metrics`, Admin SSE, embedded `/ui`, and RX 6700 XT WarmSleep watchdog.
+pub mod batch;
 pub mod tools;
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
@@ -72,6 +73,8 @@ pub struct AppState {
     pub llama_bridge: ManagedLlamaBridge,
     governor: Mutex<VramGovernor>,
     native: Mutex<Option<ActiveNative>>,
+    active_meta: std::sync::RwLock<Option<(String, ocak_tok::TemplateFamily, bool)>>,
+    batcher: Arc<batch::BatchCoordinator>,
     bridges: Mutex<HashMap<String, LlamaBridgeHandle>>,
     next_bridge_port: AtomicU64,
     pub tokens_generated_total: AtomicU64,
@@ -80,7 +83,7 @@ pub struct AppState {
 }
 
 fn engine_kind_for(e: &CatalogEntry) -> &'static str {
-    if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0") && !["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_S"].iter().any(|u| e.quant_summary.contains(u)) {
+    if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") {
         "native-vulkan"
     } else {
         "bridge-llama"
@@ -118,6 +121,8 @@ impl AppState {
             llama_bridge: ManagedLlamaBridge::default(),
             governor: Mutex::new(gov),
             native: Mutex::new(None),
+            active_meta: std::sync::RwLock::new(None),
+            batcher: Arc::new(batch::BatchCoordinator::new()),
             bridges: Mutex::new(HashMap::new()),
             next_bridge_port: AtomicU64::new(39100),
             tokens_generated_total: AtomicU64::new(0),
@@ -157,6 +162,7 @@ impl AppState {
             let mut nat = self.native.lock().await;
             if nat.as_ref().map(|a| a.id.as_str()) == Some(id) {
                 *nat = None; // Drop VkExec -> vkDestroyDevice -> releases RX 6700 XT clocks
+                *self.active_meta.write().unwrap() = None;
             }
         }
         {
@@ -169,12 +175,23 @@ impl AppState {
         g.set_state(id, 0, ModelResidencyState::WarmSleep, Instant::now());
     }
 
-    pub async fn ensure_native(&self, entry: &CatalogEntry) -> Result<(), String> {
+    pub async fn ensure_native(&self, entry: &CatalogEntry) -> Result<(ocak_tok::TemplateFamily, bool), String> {
+        // Fast lock-free check so concurrent requests can join the continuous batcher immediately!
+        if let Some((ref id, fam, multi)) = *self.active_meta.read().unwrap() {
+            if id == &entry.id {
+                return Ok((fam, multi));
+            }
+        }
         {
             let nat = self.native.lock().await;
-            if nat.as_ref().map(|a| a.id.as_str()) == Some(entry.id.as_str()) {
-                self.governor.lock().await.touch(&entry.id, Instant::now());
-                return Ok(());
+            if let Some(a) = nat.as_ref() {
+                if a.id == entry.id {
+                    let fam = detect_family(a.engine.tokenizer.chat_template());
+                    let multi = a.engine.supports_multi_slot();
+                    *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi));
+                    self.governor.lock().await.touch(&entry.id, Instant::now());
+                    return Ok((fam, multi));
+                }
             }
         }
         let est = entry.size_bytes + 512 * 1024 * 1024;
@@ -191,6 +208,7 @@ impl AppState {
         }
         // Drop previous native model before loading new one
         *self.native.lock().await = None;
+        *self.active_meta.write().unwrap() = None;
         self.governor
             .lock()
             .await
@@ -207,12 +225,15 @@ impl AppState {
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         let vram = eng.estimated_vram_bytes();
+        let fam = detect_family(eng.tokenizer.chat_template());
+        let multi = eng.supports_multi_slot();
         *self.native.lock().await = Some(ActiveNative { id: entry.id.clone(), engine: eng });
+        *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi));
         self.governor
             .lock()
             .await
             .set_state(&entry.id, vram, ModelResidencyState::ActiveGpu, Instant::now());
-        Ok(())
+        Ok((fam, multi))
     }
 
     pub async fn ensure_bridge(&self, entry: &CatalogEntry) -> Result<String, String> {
@@ -361,7 +382,7 @@ async fn ocak_load(State(st): State<Arc<AppState>>, AxPath(id): AxPath<String>) 
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "model not found" }))).into_response();
     };
     let res = if engine_kind_for(&entry) == "native-vulkan" {
-        st.ensure_native(&entry).await
+        st.ensure_native(&entry).await.map(|_| ())
     } else {
         st.ensure_bridge(&entry).await.map(|_| ())
     };
@@ -504,9 +525,10 @@ async fn chat_completions(
         };
     }
 
-    if let Err(e) = st.ensure_native(&entry).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
-    }
+    let (fam, multi_slot) = match st.ensure_native(&entry).await {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    };
 
     let json_mode = req
         .response_format
@@ -522,39 +544,45 @@ async fn chat_completions(
     let has_tools = !tool_defs.is_empty();
     let chat_msgs = tools::openai_to_chat(&req.messages, &tool_defs);
 
+    let prompt = render(fam, &chat_msgs, true, true);
+    let greq = GenRequest {
+        prompt,
+        parse_special: true,
+        max_tokens: req.max_tokens,
+        sampler,
+        stop: req.stop,
+        json_mode,
+        thinking: req.reasoning_max_tokens.map(|m| ThinkingCfg { max_tokens: m }),
+    };
+
     if req.stream {
         let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
-        let st_c = Arc::clone(&st);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = st_c.native.blocking_lock();
-            let Some(active) = guard.as_mut() else { return };
-            let fam = detect_family(active.engine.tokenizer.chat_template());
-            let prompt = render(fam, &chat_msgs, true, true);
-            let greq = GenRequest {
-                prompt,
-                parse_special: true,
-                max_tokens: req.max_tokens,
-                sampler,
-                stop: req.stop,
-                json_mode,
-                thinking: req.reasoning_max_tokens.map(|m| ThinkingCfg { max_tokens: m }),
-            };
-            let id_c = id.clone();
-            let model_c = model_id.clone();
-            let tx_c = tx.clone();
-            let res = active.engine.generate(&greq, |_tok, piece| {
-                if piece.is_empty() || has_tools { return true; }
-                let chunk = json!({
-                    "id": id_c,
-                    "object": "chat.completion.chunk",
-                    "model": model_c,
-                    "choices": [{ "index": 0, "delta": { "content": piece }, "finish_reason": null }]
-                });
-                tx_c.blocking_send(Ok(Event::default().data(chunk.to_string()))).is_ok()
-            });
-            if let Ok(gr) = res {
-                st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
-                st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+        let (tok_tx, mut tok_rx) = mpsc::channel::<String>(256);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        st.batcher.submit(
+            Arc::clone(&st),
+            batch::BatchJob {
+                model_id: model_id.clone(),
+                greq,
+                token_tx: if has_tools { None } else { Some(tok_tx) },
+                done_tx,
+            },
+        );
+        tokio::spawn(async move {
+            if !has_tools {
+                while let Some(piece) = tok_rx.recv().await {
+                    let chunk = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "model": model_id,
+                        "choices": [{ "index": 0, "delta": { "content": piece }, "finish_reason": null }]
+                    });
+                    if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if let Ok(Ok(gr)) = done_rx.await {
                 let mut finish_reason = json!(gr.finish_reason);
                 if has_tools {
                     let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
@@ -565,7 +593,7 @@ async fn chat_completions(
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "content": clean }, "finish_reason": null }]
                         });
-                        let _ = tx.blocking_send(Ok(Event::default().data(c.to_string())));
+                        let _ = tx.send(Ok(Event::default().data(c.to_string()))).await;
                     }
                     if !calls.is_empty() {
                         let tc_json: Vec<Value> = calls
@@ -584,7 +612,7 @@ async fn chat_completions(
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "tool_calls": tc_json }, "finish_reason": null }]
                         });
-                        let _ = tx.blocking_send(Ok(Event::default().data(tc_chunk.to_string())));
+                        let _ = tx.send(Ok(Event::default().data(tc_chunk.to_string()))).await;
                         finish_reason = json!("tool_calls");
                     }
                 }
@@ -595,34 +623,29 @@ async fn chat_completions(
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                     "timings": gr.timings
                 });
-                let _ = tx.blocking_send(Ok(Event::default().data(done_chunk.to_string())));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                let _ = tx.send(Ok(Event::default().data(done_chunk.to_string()))).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
             }
-            st_c.governor.blocking_lock().touch(&model_id, Instant::now());
         });
         return Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response();
     }
 
-    let mut guard = st.native.lock().await;
-    let active = guard.as_mut().unwrap();
-    let fam = detect_family(active.engine.tokenizer.chat_template());
-    let prompt = render(fam, &chat_msgs, true, true);
-    let greq = GenRequest {
-        prompt,
-        parse_special: true,
-        max_tokens: req.max_tokens,
-        sampler,
-        stop: req.stop,
-        json_mode,
-        thinking: req.reasoning_max_tokens.map(|m| ThinkingCfg { max_tokens: m }),
-    };
-    let gr = match active.engine.generate(&greq, |_, _| true) {
-        Ok(r) => r,
+    let _ = multi_slot;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    st.batcher.submit(
+        Arc::clone(&st),
+        batch::BatchJob {
+            model_id: model_id.clone(),
+            greq,
+            token_tx: None,
+            done_tx,
+        },
+    );
+    let gr = match done_rx.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     };
-    st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
-    st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
-    st.governor.lock().await.touch(&model_id, Instant::now());
     let (msg_obj, finish_reason) = if has_tools {
         let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
         if !calls.is_empty() {
@@ -1106,6 +1129,51 @@ mod tests {
         let norm = vec.iter().map(|v| v.as_f64().unwrap().powi(2)).sum::<f64>().sqrt();
         println!("Embeddings: dim={}, L2 norm={norm:.6}", vec.len());
         assert!((norm - 1.0).abs() < 1e-4);
+
+        // 6b. Continuous multi-slot batching: 3 concurrent /v1/chat/completions decoded together!
+        let r_a = call(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "tinyllama-1.1b-chat-v1.0.Q4_K_M",
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "messages": [{ "role": "user", "content": "What is 2 + 2?" }]
+            })),
+        );
+        let r_b = call(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "tinyllama-1.1b-chat-v1.0.Q4_K_M",
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "messages": [{ "role": "user", "content": "Name one planet." }]
+            })),
+        );
+        let r_c = call(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "tinyllama-1.1b-chat-v1.0.Q4_K_M",
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "messages": [{ "role": "user", "content": "Say hello." }]
+            })),
+        );
+        let ((sa, ba), (sb, bb), (sc, bc)) = tokio::join!(r_a, r_b, r_c);
+        assert_eq!(sa, StatusCode::OK, "{ba}");
+        assert_eq!(sb, StatusCode::OK, "{bb}");
+        assert_eq!(sc, StatusCode::OK, "{bc}");
+        let ja: Value = serde_json::from_str(&ba).unwrap();
+        let jb: Value = serde_json::from_str(&bb).unwrap();
+        let jc: Value = serde_json::from_str(&bc).unwrap();
+        assert!(!ja["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty());
+        assert!(!jb["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty());
+        assert!(!jc["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty());
 
         // 7. WarmSleep idle teardown & RX 6700 XT power/VRAM release + automatic wake
         let vram_active = state.status_snapshot().await.gpu.map(|g| g.vram_used_bytes).unwrap_or(0);

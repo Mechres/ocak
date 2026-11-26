@@ -1,6 +1,6 @@
 use crate::config::ModelConfig;
 use crate::cpu_exec::CpuExec;
-use crate::exec::{EngineError, Executor, Out};
+use crate::exec::{EngineError, Executor, Out, SlotStep};
 use crate::sampler::{Sampler, SamplerParams};
 #[cfg(feature = "vulkan")]
 use crate::vk_exec::VkExec;
@@ -128,6 +128,7 @@ impl NativeEngine {
     }
 
     pub fn has_mtp(&self) -> bool { self.mtp.is_some() }
+    pub fn supports_multi_slot(&self) -> bool { !self.cfg.is_hybrid }
 
     pub fn backend_name(&self) -> &str { &self.backend_name }
     pub fn estimated_vram_bytes(&self) -> u64 { self.vram_bytes }
@@ -511,4 +512,208 @@ impl NativeEngine {
         self.pager.release(&pages);
         Ok(text)
     }
+
+    /// Opens a continuous-batching decode slot: matches Radix KV prefix, prefills uncached prompt tokens,
+    /// and returns an `ActiveSlot` ready for interleaved multi-slot `step_slots` calls.
+    pub fn open_slot(&mut self, req: GenRequest) -> Result<ActiveSlot, EngineError> {
+        let mut tokens = self.tokenizer.encode(&req.prompt, true, req.parse_special);
+        if tokens.is_empty() {
+            if let Some(b) = self.tokenizer.bos() { tokens.push(b); } else { tokens.push(0); }
+        }
+        if tokens.len() >= self.max_ctx {
+            return Err(EngineError::Context(format!("prompt {} >= max_ctx {}", tokens.len(), self.max_ctx)));
+        }
+        let match_slice = if tokens.len() > 1 { &tokens[..tokens.len() - 1] } else { &[] };
+        let pm = self.pager.match_prefix(match_slice);
+        let cache_n = pm.matched_tokens;
+        let mut pages = pm.pages;
+
+        let prompt_len = tokens.len();
+        let need_pages = (prompt_len - 1) / PAGE_TOKENS + 1;
+        while pages.len() < need_pages {
+            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
+        }
+        let t_prefill = Instant::now();
+        if cache_n < prompt_len {
+            if let Err(e) = self.exec.forward_batch(&tokens[cache_n..prompt_len], cache_n, &pages, Out { logits: true, hidden: false }) {
+                self.pager.release(&pages);
+                return Err(e);
+            }
+        }
+        let prompt_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        let prefill_eval_n = prompt_len - cache_n;
+        self.pager.insert_prefix(&tokens, &pages);
+
+        let mut sampler = Sampler::new(req.sampler.clone());
+        for &t in &tokens {
+            sampler.accept(t);
+        }
+        let json_g = req.json_mode.then(JsonGrammar::new);
+        let think_gov = req.thinking.as_ref().and_then(|tc| {
+            let open = self.tokenizer.token_id("<think>")?;
+            let close = self.tokenizer.token_id("</think>")?;
+            Some(ThinkingGovernor::new(open, close, tc.max_tokens))
+        });
+        Ok(ActiveSlot {
+            max_tokens: req.max_tokens,
+            stop: req.stop,
+            tokens,
+            pages,
+            logits: self.exec.logits().to_vec(),
+            sampler,
+            detok: IncrementalDetokenizer::new(),
+            json_g,
+            think_gov,
+            gen_tokens: Vec::new(),
+            full_text: String::new(),
+            finish: FinishReason::Length,
+            prompt_len,
+            cache_n,
+            prefill_eval_n,
+            prompt_ms,
+            t_dec: Instant::now(),
+            done: false,
+        })
+    }
+
+    /// Advances all active slots by 1 token, executing the forward pass for all remaining slots
+    /// in a single batched `forward_multi_slot` GPU submit! Returns `done[i]` for each slot.
+    pub fn step_slots<F>(&mut self, slots: &mut [ActiveSlot], mut on_token: F) -> Result<Vec<bool>, EngineError>
+    where
+        F: FnMut(usize, u32, &str) -> bool,
+    {
+        let mut need_fwd: Vec<usize> = Vec::with_capacity(slots.len());
+        for (i, s) in slots.iter_mut().enumerate() {
+            if s.done {
+                continue;
+            }
+            if s.gen_tokens.len() >= s.max_tokens || s.tokens.len() >= self.max_ctx {
+                s.done = true;
+                continue;
+            }
+            let next_tok = if let Some(forced) = s.think_gov.as_mut().and_then(|g| g.forced_next()) {
+                forced
+            } else {
+                if let Some(jg) = &s.json_g {
+                    jg.mask_logits(&self.tokenizer, &mut s.logits);
+                }
+                s.sampler.sample(&mut s.logits)
+            };
+            if self.tokenizer.is_eog(next_tok) {
+                s.finish = FinishReason::Stop;
+                s.done = true;
+                continue;
+            }
+            s.sampler.accept(next_tok);
+            if let Some(tg) = &mut s.think_gov {
+                tg.observe(next_tok);
+            }
+            let bytes = self.tokenizer.token_bytes(next_tok);
+            if let Some(jg) = &mut s.json_g {
+                for &b in &bytes {
+                    jg.feed_byte(b);
+                }
+            }
+            let piece = s.detok.push(&bytes);
+            s.gen_tokens.push(next_tok);
+            s.tokens.push(next_tok);
+            s.full_text.push_str(&piece);
+            if s.stop.iter().any(|st| !st.is_empty() && s.full_text.ends_with(st)) {
+                s.finish = FinishReason::Stop;
+                s.done = true;
+                let _ = on_token(i, next_tok, &piece);
+                continue;
+            }
+            if !on_token(i, next_tok, &piece) {
+                s.finish = FinishReason::Cancelled;
+                s.done = true;
+                continue;
+            }
+            if s.gen_tokens.len() >= s.max_tokens || s.tokens.len() >= self.max_ctx {
+                s.done = true;
+                continue;
+            }
+            let pos = s.tokens.len() - 1;
+            let need = pos / PAGE_TOKENS + 1;
+            while s.pages.len() < need {
+                s.pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
+            }
+            need_fwd.push(i);
+        }
+
+        if need_fwd.len() >= 2 {
+            let steps: Vec<SlotStep<'_>> = need_fwd
+                .iter()
+                .map(|&idx| {
+                    let s = &slots[idx];
+                    SlotStep {
+                        token: *s.tokens.last().unwrap(),
+                        pos: s.tokens.len() - 1,
+                        page_table: &s.pages,
+                    }
+                })
+                .collect();
+            if let Some(all_logits) = self.exec.forward_multi_slot(&steps)? {
+                for (&idx, l) in need_fwd.iter().zip(all_logits) {
+                    slots[idx].logits = l;
+                }
+            } else {
+                for &idx in &need_fwd {
+                    let s = &mut slots[idx];
+                    self.exec.forward(*s.tokens.last().unwrap(), s.tokens.len() - 1, &s.pages, Out { logits: true, hidden: false })?;
+                    s.logits.copy_from_slice(self.exec.logits());
+                }
+            }
+        } else if let Some(&idx) = need_fwd.first() {
+            let s = &mut slots[idx];
+            self.exec.forward(*s.tokens.last().unwrap(), s.tokens.len() - 1, &s.pages, Out { logits: true, hidden: false })?;
+            s.logits.copy_from_slice(self.exec.logits());
+        }
+
+        Ok(slots.iter().map(|s| s.done).collect())
+    }
+
+    /// Finalizes an `ActiveSlot`, registering its pages in the Radix KV tree and releasing active refs.
+    pub fn close_slot(&mut self, mut slot: ActiveSlot) -> GenResult {
+        let tail = slot.detok.flush();
+        if !tail.is_empty() {
+            slot.full_text.push_str(&tail);
+        }
+        self.pager.insert_prefix(&slot.tokens, &slot.pages);
+        self.pager.release(&slot.pages);
+        let dec_ms = slot.t_dec.elapsed().as_secs_f64() * 1000.0;
+        let timings = Timings {
+            prompt_n: slot.prompt_len,
+            cache_n: slot.cache_n,
+            prompt_ms: slot.prompt_ms,
+            prompt_per_second: if slot.prompt_ms > 0.0 { slot.prefill_eval_n as f64 / (slot.prompt_ms / 1000.0) } else { 0.0 },
+            predicted_n: slot.gen_tokens.len(),
+            predicted_ms: dec_ms,
+            predicted_per_second: if dec_ms > 0.0 { slot.gen_tokens.len() as f64 / (dec_ms / 1000.0) } else { 0.0 },
+            mtp_drafted: 0,
+            mtp_accepted: 0,
+        };
+        GenResult { text: slot.full_text, tokens: slot.gen_tokens, finish_reason: slot.finish, timings }
+    }
+}
+
+pub struct ActiveSlot {
+    max_tokens: usize,
+    stop: Vec<String>,
+    tokens: Vec<u32>,
+    pages: Vec<u32>,
+    logits: Vec<f32>,
+    sampler: Sampler,
+    detok: IncrementalDetokenizer,
+    json_g: Option<JsonGrammar>,
+    think_gov: Option<ThinkingGovernor>,
+    gen_tokens: Vec<u32>,
+    full_text: String,
+    finish: FinishReason,
+    prompt_len: usize,
+    cache_n: usize,
+    prefill_eval_n: usize,
+    prompt_ms: f64,
+    t_dec: Instant,
+    done: bool,
 }

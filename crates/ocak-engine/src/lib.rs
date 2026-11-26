@@ -12,6 +12,6 @@ pub mod xing_exec;
 pub mod vk_exec;
 
 pub use config::ModelConfig;
-pub use engine::{BackendKind, EngineOptions, FinishReason, GenRequest, GenResult, NativeEngine, ThinkingCfg, Timings};
-pub use exec::{EngineError, Executor, Out};
+pub use engine::{ActiveSlot, BackendKind, EngineOptions, FinishReason, GenRequest, GenResult, NativeEngine, ThinkingCfg, Timings};
+pub use exec::{EngineError, Executor, Out, SlotStep};
 pub use sampler::{Sampler, SamplerParams};

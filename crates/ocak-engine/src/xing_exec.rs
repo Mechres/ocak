@@ -518,7 +518,7 @@ impl XingExec {
                         mk(24), mk(24), mk(cfg.n_embd), mk(cfg.n_embd), mk(cfg.n_embd),
                         mk(cfg.q_rank), mk(cfg.q_rank), mk(hd),
                         mk(cfg.n_head * cfg.key_dim), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.value_dim),
-                        mk(cfg.n_layer * max_ctx * hd),
+                        mk(cfg.n_layer * max_ctx * (hd / 2)),
                         mk(cfg.n_expert), mk(cfg.n_used), mk(cfg.n_used), upload_f32_buf(c, &zero_b),
                         upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(cfg.n_used * cfg.n_embd),
                     ) {
@@ -779,9 +779,8 @@ impl Executor for XingExec {
                 rec.qmv(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m);
                 rec.barrier();
                 rec.rms_norm(&gp.q_a, 0, &gl.q_a_norm, 0, &gp.q_an, 0, c.q_rank as u32, c.eps);
-                let kv_layer_off = (li * self.max_ctx * hd) as u32;
-                let kv_dst_off = (kv_layer_off as usize + pos * hd) as u64;
-                rec.rms_norm(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_cache, kv_dst_off, latent as u32, c.eps);
+                let kv_layer_off = (li * self.max_ctx * (hd / 2)) as u32;
+                rec.rms_norm(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_raw, 0, latent as u32, c.eps);
                 rec.barrier();
                 rec.qmv(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m);
                 rec.barrier();

@@ -18,6 +18,14 @@ pub struct Out {
     pub hidden: bool,
 }
 
+/// One active sequence's decode step for continuous multi-slot batching.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotStep<'a> {
+    pub token: u32,
+    pub pos: usize,
+    pub page_table: &'a [u32],
+}
+
 /// One-token-at-a-time transformer/hybrid forward pass with paged KV + recurrent states.
 pub trait Executor: Send {
     fn name(&self) -> String;
@@ -48,6 +56,11 @@ pub trait Executor: Send {
         _pos0: usize,
         _page_table: &[u32],
     ) -> Result<Option<([Vec<f32>; 2], [Vec<f32>; 2])>, EngineError> {
+        Ok(None)
+    }
+    /// Runs a continuous multi-slot decode batch across independent sequences (each with its own `pos` and `page_table`),
+    /// returning one logits vector per slot when supported.
+    fn forward_multi_slot(&mut self, _slots: &[SlotStep<'_>]) -> Result<Option<Vec<Vec<f32>>>, EngineError> {
         Ok(None)
     }
     /// Snapshots recurrent (DeltaNet / ShortConv) states for speculative rollback.

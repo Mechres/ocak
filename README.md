@@ -19,7 +19,7 @@ Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Rade
   - **Xing4.0 MoE (29B-A4B)** (4-stream Sinkhorn **Hyper-Connections** + **YaRN MLA** latent KV cache + 64-expert / 4-active MoE + shared expert with fused GPU MoE dispatch, parallel MLA, and automatic hybrid GPU+CPU expert offloading `n_cpu_moe`)
   - **Inkling-2-Mini (26.4B Looped MoE)** (24 physical layers with middle 12 looped 3× = 48 logical layers, depth-wise Attention Residuals, cross-pass gain/forget controllers, dynamic `ShortConv`, relative-position bias + attention sinks, GPU `situ.comp` activation, 128-expert / 8-active `NVFP4` MoE on VRAM + GTT sparse paging)
   - **Qwen3-ASR-1.7B (Native Audio)** (zero-dep WAV/16 kHz resampler + 128-bin Slaney log-mel spectrogram + `qwen3a` 3×Conv2D + 24-layer Transformer audio encoder + `qwen3vl` Vulkan decoder for `/v1/audio/transcriptions` and `ocak asr`)
-- **Radix Prefix Paged FP16 KV Cache & Q8 Compression (`ocak-kv`, `ocak-vk`)**: 16-token packed `F16` (`packHalf2x16`) physical KV pages with hardware Wave32 `subgroupClusteredAdd` attention (2× longer context & half KV bandwidth on 12 GiB VRAM), organized in a Copy-on-Write Radix prefix tree with LRU zero-ref leaf eviction and `CompressedKvStore` (3.55× Q8 host-RAM spill).
+- **Radix Prefix Paged FP16 KV Cache, Continuous Multi-Slot Batching & Q8 Compression (`ocak-kv`, `ocak-vk`, `ocak-server`)**: 16-token packed `F16` (`packHalf2x16`) physical KV pages across all GPU executors (`VkExec`, `MtpDrafter`, `XingExec` MLA, `InklingExec`) with hardware Wave32 `subgroupClusteredAdd` attention (2× longer context & half KV bandwidth on 12 GiB VRAM), continuous multi-slot request batching (`BatchCoordinator` + `forward_multi_slot` up to 8 concurrent slots), Copy-on-Write Radix prefix tree with LRU eviction, and `CompressedKvStore` (3.55× Q8 host-RAM spill).
 - **RX 6700 XT 12 GiB VRAM & `WarmSleep` Power Governor (`ocak-sysfs`)**: Auto-discovers `amdgpu` DRM/hwmon sensors (VRAM, GTT, wattage, temperature, busy %) and destroys active Vulkan compute contexts after `sleep-idle-seconds`, dropping GPU idle draw back to desktop idle (~29 W) while waking from Linux page cache in ~300 ms.
 - **Multi-Protocol Server (`ocak-server`)**:
   - **OpenAI API**: `GET /v1/models`, `POST /v1/chat/completions` (sync + streaming SSE + native `tools`/`tool_calls` function calling + JSON grammar mode + `<think>` token budget), `POST /v1/completions`, `POST /v1/embeddings` (L2-normalized), `POST /v1/audio/transcriptions`
@@ -62,8 +62,8 @@ Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak
 | `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GB | `1.000000` | `0.999584` | **19.9 tok/s** *(41.2 prefill)* |
 | `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GB | — | greedy verified | **7.8 tok/s** |
 | `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + 2-tok GPU MTP) | 9.14 GB | — | lossless 2-tok MTP (59–85% acc) | **12.1–14.3 tok/s** *(9.5 base)* |
-| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, 1-submit batched 2D GPU VRAM+GTT) | 10.79 GB | — | greedy verified | **26.7 tok/s** |
-| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4`/`Q8_0` MoE, core-VRAM priority) | 16.42 GB | — | greedy verified | **17.5 tok/s** |
+| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, 1-submit batched 2D GPU, FP16 MLA KV) | 10.79 GB | — | greedy verified | **27.1 tok/s** |
+| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4`/`Q8_0` MoE, FP16 KV) | 16.42 GB | — | greedy verified | **17.5 tok/s** |
 | `Qwen3-ASR-1.7B` | `qwen3a` + `qwen3vl` (Native Audio) | 2.35 GB | — | end-to-end WAV verified | **1.49 s / clip** |
 
 - **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`).
@@ -158,7 +158,7 @@ cargo test --release --workspace
 - [x] **M4 / M4b**: Native `LFM2`, `LFM3`, `Qwen3.5`/`Qwen3.8` Gated DeltaNet & Gated Attention, `Q2_K`/`Q3_K` & all `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` shaders.
 - [x] **M5 / M5b**: Native hybrid GPU+CPU MoE for `Xing4.0-29B-A4B` (fused GPU MoE + parallel MLA) and `Inkling-2-Mini` (`inkling2_loop` 3× looped MoE + `NVFP4` & `BF16` shaders).
 - [x] **M6**: Native `Qwen3.5`/`RVN` NextN MTP draft head (`MtpDrafter` wired into `generate()` + `ocak mtp-test`, 100% draft match), native `Qwen3-ASR-1.7B` audio frontend (`qwen3a` + `qwen3vl` on Vulkan for `/v1/audio/transcriptions` and `ocak asr`), and dynamic `ocak-hip` HSACO runtime (`dlopen("libamdhip64.so")`).
-- [ ] **Future**: Vision (`Qwen3-VL` image input), `ocak bench` + CI release polish (`v0.2.0`), and continuous multi-slot request batching.
+- [ ] **Future**: Native vision (`Qwen3-VL` `mmproj` image input) and `ocak bench` + GitHub Actions CI release polish (`v0.2.0`).
 
 ---
 

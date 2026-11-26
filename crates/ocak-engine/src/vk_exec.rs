@@ -1,5 +1,5 @@
 use crate::config::{LayerKind, ModelConfig};
-use crate::exec::{EngineError, Executor, Out};
+use crate::exec::{EngineError, Executor, Out, SlotStep};
 use ocak_gguf::{GgufFile, TensorInfo};
 use ocak_vk::{Buffer, VkContext, WType};
 use std::sync::Arc;
@@ -238,8 +238,8 @@ impl VkExec {
         Ok(Self {
             kv: mk(layer_stride as usize * cfg.n_kv_layers)?,
             layer_stride,
-            pt_buf: mk(n_pages.max(16))?,
-            max_pages: n_pages.max(16),
+            pt_buf: mk((n_pages * 4).max(64))?,
+            max_pages: (n_pages * 4).max(64),
             x: mk(PREFILL_BATCH * cfg.n_embd)?,
             xn: mk(PREFILL_BATCH * cfg.n_embd)?,
             qg: mk(PREFILL_BATCH * 2 * qd)?,
@@ -419,6 +419,147 @@ impl Executor for VkExec {
     fn mtp_gpu_shared(&self) -> Option<(Arc<VkContext>, Arc<Buffer>, WType, u32, u32)> {
         let w = self.output.as_ref().unwrap_or(&self.embd);
         Some((Arc::clone(&self.ctx), Arc::clone(&w.buf), w.ty, w.k, w.m))
+    }
+
+    fn forward_multi_slot(&mut self, slots: &[SlotStep<'_>]) -> Result<Option<Vec<Vec<f32>>>, EngineError> {
+        if self.cfg.is_hybrid || slots.is_empty() || slots.len() > PREFILL_BATCH {
+            return Ok(None);
+        }
+        // Pack all slots' page tables contiguously into self.pt_buf
+        let mut pt_packed = Vec::new();
+        let mut pt_offs = Vec::with_capacity(slots.len());
+        for s in slots {
+            pt_offs.push(pt_packed.len() as u64);
+            pt_packed.extend_from_slice(s.page_table);
+        }
+        if pt_packed.len() > self.max_pages {
+            return Err(EngineError::Context("multi-slot page tables exceed GPU capacity".into()));
+        }
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(&pt_packed)).map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        let c = &self.cfg;
+        let batch = slots.len() as u32;
+        let ne = c.n_embd as u32;
+        let qd = (c.n_head * c.head_dim) as u32;
+
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        for (b, s) in slots.iter().enumerate() {
+            rec.embed(self.embd.ty, &self.embd.buf, s.token, &self.x, (b * c.n_embd) as u64, ne);
+        }
+        rec.barrier();
+
+        for l in &self.layers {
+            for b in 0..slots.len() {
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+            }
+            rec.barrier();
+            if let VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } = &l.mixer {
+                let kv_dim = (*n_head_kv as usize) * c.head_dim;
+                if *gated_q {
+                    rec.qmm(wq.ty, &wq.buf, 0, &self.xn, 0, &self.qg, 0, wq.k, wq.m, batch);
+                } else {
+                    rec.qmm(wq.ty, &wq.buf, 0, &self.xn, 0, &self.q, 0, wq.k, wq.m, batch);
+                }
+                rec.qmm(wk.ty, &wk.buf, 0, &self.xn, 0, &self.k, 0, wk.k, wk.m, batch);
+                rec.qmm(wv.ty, &wv.buf, 0, &self.xn, 0, &self.v, 0, wv.k, wv.m, batch);
+                if let Some(hg) = head_gate_w {
+                    rec.qmm(hg.ty, &hg.buf, 0, &self.xn, 0, &self.head_gate_buf, 0, hg.k, hg.m, batch);
+                }
+                rec.barrier();
+                if *gated_q {
+                    rec.split_qg_batch(&self.qg, &self.q, &self.q_gate, c.n_head as u32, c.head_dim as u32, batch);
+                    rec.barrier();
+                }
+                if bq.is_some() || bk.is_some() || bv.is_some() {
+                    for b in 0..slots.len() {
+                        if let Some(bias) = bq { rec.add(&self.q, (b * qd as usize) as u64, bias, 0, qd); }
+                        if let Some(bias) = bk { rec.add(&self.k, (b * kv_dim) as u64, bias, 0, wk.m); }
+                        if let Some(bias) = bv { rec.add(&self.v, (b * kv_dim) as u64, bias, 0, wv.m); }
+                    }
+                    rec.barrier();
+                }
+                if q_norm.is_some() || k_norm.is_some() {
+                    for b in 0..slots.len() {
+                        if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, (b * qd as usize) as u64, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
+                        if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, (b * kv_dim) as u64, kn, *n_head_kv, c.head_dim as u32, c.eps); }
+                    }
+                    rec.barrier();
+                }
+                for (b, s) in slots.iter().enumerate() {
+                    rec.rope_ext(&self.q, (b * qd as usize) as u64, &self.k, (b * kv_dim) as u64, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, s.pos as u32, *rope_base, c.rope_mode);
+                }
+                rec.barrier();
+                let kv_off = *kv_layer_idx as u64 * self.layer_stride;
+                for (b, s) in slots.iter().enumerate() {
+                    rec.kv_write(&self.k, (b * kv_dim) as u64, &self.v, (b * kv_dim) as u64, &self.kv, kv_off, &self.pt_buf, pt_offs[b], s.pos as u32, kv_dim as u32);
+                }
+                rec.barrier();
+                for (b, s) in slots.iter().enumerate() {
+                    rec.attention_swa(&self.q, (b * qd as usize) as u64, &self.kv, kv_off, &self.pt_buf, pt_offs[b], &self.attn, (b * qd as usize) as u64, c.n_head as u32, *n_head_kv, c.head_dim as u32, s.pos as u32, *sliding_window);
+                }
+                rec.barrier();
+                if *gated_q {
+                    rec.mul_sigmoid(&self.attn, &self.q_gate, batch * qd);
+                    rec.barrier();
+                }
+                if head_gate_w.is_some() {
+                    rec.mul_head_sigmoid_batch(&self.attn, &self.head_gate_buf, c.n_head as u32, c.head_dim as u32, batch);
+                    rec.barrier();
+                }
+                rec.qmm(wo.ty, &wo.buf, 0, &self.attn, 0, &self.o, 0, wo.k, wo.m, batch);
+                rec.barrier();
+            }
+            if let Some(pan) = &l.post_attn_norm {
+                for b in 0..slots.len() {
+                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pan, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            }
+            rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            rec.barrier();
+            for b in 0..slots.len() {
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.ffn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+            }
+            rec.barrier();
+            rec.qmm(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m, batch);
+            rec.qmm(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m, batch);
+            rec.barrier();
+            rec.swiglu(&self.gate, 0, &self.up, 0, &self.act, 0, batch * c.n_ff as u32);
+            rec.barrier();
+            rec.qmm(l.down.ty, &l.down.buf, 0, &self.act, 0, &self.o, 0, l.down.k, l.down.m, batch);
+            rec.barrier();
+            if let Some(pfn) = &l.post_ffw_norm {
+                for b in 0..slots.len() {
+                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pfn, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            }
+            rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            rec.barrier();
+        }
+
+        // Final norm for all B slots into self.xn (sized PREFILL_BATCH * n_embd)
+        for b in 0..slots.len() {
+            rec.rms_norm(&self.x, (b * c.n_embd) as u64, &self.out_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+        }
+        rec.barrier();
+        // Output logits for all B slots: allocate/use a temporary buffer if B > 2, else logits_buf2
+        let w = self.output.as_ref().unwrap_or(&self.embd);
+        let dyn_logits = if slots.len() > 2 {
+            Some(self.ctx.create_device_buffer((slots.len() * c.n_vocab * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?)
+        } else {
+            None
+        };
+        let lbuf = dyn_logits.as_ref().unwrap_or(&self.logits_buf2);
+        rec.qmm(w.ty, &w.buf, 0, &self.xn, 0, lbuf, 0, w.k, w.m, batch);
+        rec.barrier();
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        let mut all = vec![0f32; slots.len() * c.n_vocab];
+        self.ctx.download(lbuf, 0, bytemuck::cast_slice_mut(&mut all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let out: Vec<Vec<f32>> = all.chunks_exact(c.n_vocab).map(|ch| ch.to_vec()).collect();
+        Ok(Some(out))
     }
 
     fn forward_embd(&mut self, embd: &[f32], pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {

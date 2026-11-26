@@ -9,8 +9,8 @@ layout(set = 0, binding = 5) readonly buffer Gate { float gate[]; };
 layout(set = 0, binding = 6) readonly buffer QClip { float qclip[]; };
 layout(set = 0, binding = 7) readonly buffer RClip { float rclip[]; };
 layout(set = 0, binding = 8) readonly buffer RelBias { float rbias[]; };
-layout(set = 0, binding = 9) buffer KCache { float kcache[]; };
-layout(set = 0, binding = 10) buffer VCache { float vcache[]; };
+layout(set = 0, binding = 9) buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 10) buffer VCache { uint vcache[]; };
 layout(set = 0, binding = 11) writeonly buffer Out { float o[]; };
 layout(push_constant) uniform PC {
     uint q_off;
@@ -44,10 +44,11 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint gqa = pc.n_head / pc.n_head_kv;
     uint kvh = h / gqa;
-    uint kv_dim = pc.n_head_kv * pc.hd;
+    uint half_hd = pc.hd >> 1;
+    uint half_kv_dim = pc.n_head_kv * half_hd;
     uint slot_pos = (pc.is_swa != 0u) ? (pc.pos % pc.cap) : pc.pos;
 
-    // 1. Compute clipped K and RMSNormed V for current pos; first head in GQA group stores to cache
+    // 1. Compute clipped K and RMSNormed V for current pos; first head in GQA group stores packed FP16 to cache
     float k_cur_val;
     float v_cur_val;
     {
@@ -67,10 +68,14 @@ void main() {
         float v_ss = sk_tmp[0];
         barrier();
         v_cur_val = vv * inversesqrt(v_ss / float(pc.hd) + pc.eps);
-        if (h % gqa == 0u) {
-            kcache[pc.kv_slot_off + slot_pos * kv_dim + kvh * pc.hd + tid] = k_cur_val;
-            vcache[pc.kv_slot_off + slot_pos * kv_dim + kvh * pc.hd + tid] = v_cur_val;
+        sk_tmp[tid] = v_cur_val;
+        barrier();
+        if (h % gqa == 0u && tid < half_hd) {
+            uint dst = pc.kv_slot_off + slot_pos * half_kv_dim + kvh * half_hd + tid;
+            kcache[dst] = packHalf2x16(vec2(sk_cur[2u * tid], sk_cur[2u * tid + 1u]));
+            vcache[dst] = packHalf2x16(vec2(sk_tmp[2u * tid], sk_tmp[2u * tid + 1u]));
         }
+        barrier();
     }
 
     // 2. Clip Q (with qclip) and R (with rclip)
@@ -112,8 +117,11 @@ void main() {
         if (t == pc.pos) {
             for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * sk_cur[d];
         } else {
-            uint kb = pc.kv_slot_off + sp * kv_dim + kvh * pc.hd;
-            for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * kcache[kb + d];
+            uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd;
+            for (uint d2 = 0u; d2 < half_hd; d2++) {
+                vec2 kv = unpackHalf2x16(kcache[kb + d2]);
+                dot += sq[2u * d2] * kv.x + sq[2u * d2 + 1u] * kv.y;
+            }
         }
         uint dist = pc.pos - t;
         float rb = 0.0;
@@ -142,11 +150,19 @@ void main() {
     float inv = 1.0 / ssum[0];
 
     // 4. Weighted V sum + sigmoid gate
+    uint d2 = tid >> 1;
+    uint lane = tid & 1u;
     float acc = 0.0;
     for (uint idx = 0u; idx < t_len; idx++) {
         uint t = t_start + idx;
         uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-        float vv = (t == pc.pos) ? v_cur_val : vcache[pc.kv_slot_off + sp * kv_dim + kvh * pc.hd + tid];
+        float vv;
+        if (t == pc.pos) {
+            vv = v_cur_val;
+        } else {
+            vec2 vp = unpackHalf2x16(vcache[pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd + d2]);
+            vv = (lane == 0u) ? vp.x : vp.y;
+        }
         acc += (scores[idx] * inv) * vv;
     }
     float gv = 1.0 / (1.0 + exp(-gate[pc.g_off + h * pc.hd + tid]));

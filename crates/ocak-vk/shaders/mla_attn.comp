@@ -2,7 +2,7 @@
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
 layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
-layout(set = 0, binding = 2) readonly buffer KvCache { float kvc[]; };
+layout(set = 0, binding = 2) readonly buffer KvCache { uint kvc[]; };
 layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
 layout(push_constant) uniform PC {
     uint key_dim;
@@ -19,17 +19,25 @@ shared float w_shared[4096];
 void main() {
     uint h = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
-    uint hd = pc.latent + pc.n_rot;
+    uint half_lat = pc.latent >> 1;
+    uint half_rot = pc.n_rot >> 1;
+    uint half_hd = half_lat + half_rot;
     uint n_t = pc.pos + 1u;
     uint ql_base = h * pc.latent;
     uint qp_base = h * pc.key_dim + pc.nope;
 
     float local_max = -1e30;
     for (uint t = tid; t < n_t; t += 256u) {
-        uint kb = pc.kv_layer_off + t * hd;
+        uint kb = pc.kv_layer_off + t * half_hd;
         float dot = 0.0;
-        for (uint i = 0u; i < pc.latent; i++) dot += ql[ql_base + i] * kvc[kb + i];
-        for (uint i = 0u; i < pc.n_rot; i++) dot += qf[qp_base + i] * kvc[kb + pc.latent + i];
+        for (uint i = 0u; i < half_lat; i++) {
+            vec2 kv = unpackHalf2x16(kvc[kb + i]);
+            dot += ql[ql_base + 2u * i] * kv.x + ql[ql_base + 2u * i + 1u] * kv.y;
+        }
+        for (uint i = 0u; i < half_rot; i++) {
+            vec2 kv = unpackHalf2x16(kvc[kb + half_lat + i]);
+            dot += qf[qp_base + 2u * i] * kv.x + qf[qp_base + 2u * i + 1u] * kv.y;
+        }
         float s = dot * pc.kq_scale;
         w_shared[t] = s;
         local_max = max(local_max, s);
@@ -57,11 +65,12 @@ void main() {
     float inv = 1.0 / ssum[0];
 
     uint out_base = h * pc.latent;
-    for (uint i = tid; i < pc.latent; i += 256u) {
-        float acc = 0.0;
+    for (uint i = tid; i < half_lat; i += 256u) {
+        vec2 acc = vec2(0.0);
         for (uint t = 0u; t < n_t; t++) {
-            acc += (w_shared[t] * inv) * kvc[pc.kv_layer_off + t * hd + i];
+            acc += (w_shared[t] * inv) * unpackHalf2x16(kvc[pc.kv_layer_off + t * half_hd + i]);
         }
-        o[out_base + i] = acc;
+        o[out_base + 2u * i] = acc.x;
+        o[out_base + 2u * i + 1u] = acc.y;
     }
 }

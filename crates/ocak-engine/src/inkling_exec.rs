@@ -632,13 +632,13 @@ impl InklingExec {
                 let kv_dim = phys[0].n_head_kv * head_dim;
                 let mut slot_kv_offsets = Vec::with_capacity(n_slot);
                 let mut slot_caps = Vec::with_capacity(n_slot);
-                let mut total_kv_elems = 0usize;
+                let mut total_kv_u32 = 0usize;
                 for il in 0..n_slot {
                     let ip = if il < n_phys { il } else { core_start + (il - n_phys) % (core_end - core_start) };
                     let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16) } else { max_ctx };
-                    slot_kv_offsets.push(total_kv_elems as u32);
+                    slot_kv_offsets.push(total_kv_u32 as u32);
                     slot_caps.push(cap as u32);
-                    total_kv_elems += cap * kv_dim;
+                    total_kv_u32 += cap * (kv_dim / 2);
                 }
                 let mk = |n: usize| c.create_device_buffer((n * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()));
                 let k_hist = mk(n_slot * kv_dim * (n_conv - 1))?;
@@ -691,8 +691,8 @@ impl InklingExec {
                     moe_out: mk(n_embd)?,
                     hidden_buf: mk(n_embd)?,
                     logits_buf: mk(n_vocab_padded)?,
-                    k_cache: mk(total_kv_elems)?,
-                    v_cache: mk(total_kv_elems)?,
+                    k_cache: mk(total_kv_u32)?,
+                    v_cache: mk(total_kv_u32)?,
                     k_hist,
                     v_hist,
                     attn_post_hist,
