@@ -42,6 +42,7 @@ pub struct RadixPager {
     pages: Vec<PageMeta>,
     free_list: Vec<PageId>,
     nodes: Vec<Node>,
+    free_nodes: Vec<usize>,
     roots: FxHashMap<[u32; PAGE_TOKENS], usize>,
     clock: u64,
     stats: PagerStats,
@@ -57,6 +58,7 @@ impl RadixPager {
             pages,
             free_list,
             nodes: Vec::new(),
+            free_nodes: Vec::new(),
             roots: FxHashMap::default(),
             clock: 0,
             stats: PagerStats::default(),
@@ -142,6 +144,7 @@ impl RadixPager {
             let n = &mut self.nodes[nid];
             debug_assert!(n.children.is_empty());
             n.alive = false;
+            n.children.clear();
             (n.parent, n.key)
         };
         match parent {
@@ -152,6 +155,7 @@ impl RadixPager {
                 self.nodes[p].children.remove(&key);
             }
         }
+        self.free_nodes.push(nid);
     }
 
     pub fn insert_prefix(&mut self, tokens: &[u32], pages: &[PageId]) {
@@ -175,14 +179,21 @@ impl RadixPager {
                 // Already bound elsewhere in the tree; stop extending.
                 break;
             }
-            let new_nid = self.nodes.len();
-            self.nodes.push(Node {
+            let node = Node {
                 parent: cur,
                 key,
                 page: pid,
                 children: FxHashMap::default(),
                 alive: true,
-            });
+            };
+            let new_nid = if let Some(slot) = self.free_nodes.pop() {
+                self.nodes[slot] = node;
+                slot
+            } else {
+                let idx = self.nodes.len();
+                self.nodes.push(node);
+                idx
+            };
             match cur {
                 None => {
                     self.roots.insert(key, new_nid);
@@ -217,6 +228,10 @@ impl RadixPager {
 
     pub fn cached_pages(&self) -> usize {
         self.nodes.iter().filter(|n| n.alive).count()
+    }
+
+    pub fn node_slots(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn stats(&self) -> PagerStats {
@@ -398,5 +413,19 @@ mod tests {
         assert!(store.get(&[1, 2, 3], &mut out));
         let max_err = kv.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(max_err < 0.025, "max_err={max_err}");
+    }
+
+    #[test]
+    fn radix_tree_reclaims_dead_nodes_bounded() {
+        let mut p = RadixPager::new(8);
+        for round in 0u32..500 {
+            let toks = seq(round * 100 + 1, 32);
+            let a = p.alloc_page().unwrap();
+            let b = p.alloc_page().unwrap();
+            p.insert_prefix(&toks, &[a, b]);
+            p.release(&[a, b]);
+        }
+        assert!(p.node_slots() <= 8, "node_slots leaked: {}", p.node_slots());
+        assert!(p.stats().evictions > 900);
     }
 }

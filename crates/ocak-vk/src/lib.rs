@@ -854,6 +854,11 @@ pub struct Recorder<'a> {
     defer_barriers: bool,
 }
 
+#[inline]
+fn off_u32(v: u64) -> u32 {
+    u32::try_from(v).unwrap_or_else(|_| panic!("vulkan buffer offset {v} exceeds u32::MAX (4 GiB)"))
+}
+
 impl<'a> Recorder<'a> {
     pub fn set_defer_barriers(&mut self, defer: bool) {
         self.defer_barriers = defer;
@@ -947,7 +952,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
-        let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k)];
+        let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k)];
         let gx = match ty {
             WType::IQ2XS => (m + 15) / 16,
             _ => (m + 3) / 4,
@@ -987,7 +992,7 @@ impl<'a> Recorder<'a> {
             self.qmv(ty, w, w_off, x, x_off, y, y_off, k, m);
             return;
         }
-        let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), batch];
+        let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), batch];
         let gx = (m + 3) / 4;
         if batch == 2 {
             match ty {
@@ -1036,28 +1041,28 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rms_norm(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
-        let pc = [x_off as u32, w_off as u32, out_off as u32, n, eps.to_bits()];
+        let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_rms_norm(&mut self, x: &Buffer, x_off: u64, r: &Buffer, r_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
-        let pc = [x_off as u32, r_off as u32, w_off as u32, out_off as u32, n, eps.to_bits()];
+        let pc = [off_u32(x_off), off_u32(r_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.add_rms_norm, &[x.buf, r.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
     }
 
     pub fn argmax(&mut self, x: &Buffer, x_off: u64, out: &Buffer, n: u32) {
-        let pc = [x_off as u32, n];
+        let pc = [off_u32(x_off), n];
         self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
     }
 
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {
-        let pc = [a_off as u32, b_off as u32, n];
+        let pc = [off_u32(a_off), off_u32(b_off), n];
         self.dispatch_raw(&self.ctx.pipelines.add, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
     pub fn add_scaled(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32, scale: f32) {
-        let pc = [a_off as u32, b_off as u32, n, scale.to_bits()];
+        let pc = [off_u32(a_off), off_u32(b_off), n, scale.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
@@ -1123,17 +1128,17 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn copy(&mut self, src: &Buffer, s_off: u64, dst: &Buffer, d_off: u64, n: u32) {
-        let pc = [s_off as u32, d_off as u32, n];
+        let pc = [off_u32(s_off), off_u32(d_off), n];
         self.dispatch_raw(&self.ctx.pipelines.copy, &[src.buf, dst.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
     pub fn swiglu(&mut self, gate: &Buffer, g_off: u64, up: &Buffer, u_off: u64, out: &Buffer, o_off: u64, n: u32) {
-        let pc = [g_off as u32, u_off as u32, o_off as u32, n];
+        let pc = [off_u32(g_off), off_u32(u_off), off_u32(o_off), n];
         self.dispatch_raw(&self.ctx.pipelines.swiglu, &[gate.buf, up.buf, out.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
     pub fn situ(&mut self, gu: &Buffer, gu_off: u64, out: &Buffer, o_off: u64, n_ff: u32, scale: f32, beta: f32, lin_beta: f32) {
-        let pc = [gu_off as u32, o_off as u32, n_ff, scale.to_bits(), beta.to_bits(), lin_beta.to_bits()];
+        let pc = [off_u32(gu_off), off_u32(o_off), n_ff, scale.to_bits(), beta.to_bits(), lin_beta.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.situ, &[gu.buf, out.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
     }
 
@@ -1202,7 +1207,7 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn qmv_id_batch(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot_base: u32, count: u32, x: &Buffer, x_off: u64, x_stride: u32, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
-        let pc = [slot_base, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), slice_bytes as u32, x_stride];
+        let pc = [slot_base, off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), off_u32(slice_bytes), x_stride];
         let gx = (m + 3) / 4;
         match ty {
             WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
@@ -1220,7 +1225,7 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_scaled_id_batch(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
-        let pc = [a_off as u32, b_off as u32, n, slot_base, count, overwrite as u32];
+        let pc = [off_u32(a_off), off_u32(b_off), n, slot_base, count, overwrite as u32];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
@@ -1254,12 +1259,12 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn inkling_ctrl(&mut self, cur: &Buffer, cur_off: u64, msg: &Buffer, msg_off: u64, gf: &Buffer, gf_off: u64, ne: u32) {
-        let pc = [cur_off as u32, msg_off as u32, gf_off as u32, ne];
+        let pc = [off_u32(cur_off), off_u32(msg_off), off_u32(gf_off), ne];
         self.dispatch_raw(&self.ctx.pipelines.inkling_ctrl, &[cur.buf, msg.buf, gf.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, 1, 1);
     }
 
     pub fn inkling_conv(&mut self, inp: &Buffer, inp_off: u64, wt: &Buffer, dy: &Buffer, dy_off: u64, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32) {
-        let pc = [inp_off as u32, dy_off as u32, hist_off as u32, out_off as u32, n_ch, n_conv, has_dyn as u32, head_ch];
+        let pc = [off_u32(inp_off), off_u32(dy_off), off_u32(hist_off), off_u32(out_off), n_ch, n_conv, has_dyn as u32, head_ch];
         self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), (n_ch + 255) / 256, 1, 1);
     }
 
@@ -1285,12 +1290,12 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rope(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {
-        let pc = [q_off as u32, k_off as u32, n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits()];
+        let pc = [off_u32(q_off), off_u32(k_off), n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.rope, &[q.buf, k.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, 1, 1);
     }
 
     pub fn kv_write(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, pos: u32, kv_dim: u32) {
-        let pc = [k_off as u32, v_off as u32, layer_kv_off as u32, pt_off as u32, pos, kv_dim];
+        let pc = [off_u32(k_off), off_u32(v_off), off_u32(layer_kv_off), off_u32(pt_off), pos, kv_dim];
         self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), ((kv_dim / 2) + 255) / 256, 1, 1);
     }
 
@@ -1298,17 +1303,17 @@ impl<'a> Recorder<'a> {
         self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
     }
     pub fn attention_swa(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32) {
-        let pc = [q_off as u32, layer_kv_off as u32, pt_off as u32, out_off as u32, n_heads, n_kv_heads, head_dim, pos, sliding_window];
+        let pc = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), off_u32(out_off), n_heads, n_kv_heads, head_dim, pos, sliding_window];
         self.dispatch_raw(&self.ctx.pipelines.attention, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
     }
 
     pub fn embed(&mut self, ty: WType, table: &Buffer, token: u32, out: &Buffer, out_off: u64, k: u32) {
-        let pc = [ty.ggml().id(), token, out_off as u32, k, ty.row_bytes(k)];
+        let pc = [ty.ggml().id(), token, off_u32(out_off), k, ty.row_bytes(k)];
         self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), (k + 255) / 256, 1, 1);
     }
 
     pub fn rms_norm_heads(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
-        let pc = [x_off as u32, n_heads, head_dim, eps.to_bits()];
+        let pc = [off_u32(x_off), n_heads, head_dim, eps.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.rms_norm_heads, &[x.buf, w.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
     }
 
@@ -1375,7 +1380,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn rope_ext(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, factors: &Buffer, use_factors: bool, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {
-        let pc = [q_off as u32, k_off as u32, n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits(), use_factors as u32];
+        let pc = [off_u32(q_off), off_u32(k_off), n_heads, n_kv_heads, head_dim, n_rot, pos, mode, freq_base.to_bits(), use_factors as u32];
         self.dispatch_raw(&self.ctx.pipelines.rope_ext, &[q.buf, k.buf, factors.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, 1, 1);
     }
 

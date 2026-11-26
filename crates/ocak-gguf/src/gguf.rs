@@ -188,16 +188,33 @@ impl GgufFile {
             for d in 0..n_dims as usize { ne[d] = c.u64()?; }
             let ty = GgmlType::from_u32(c.u32()?);
             let offset = c.u64()?;
-            let n_elems: u64 = ne.iter().product();
+            let mut n_elems: u64 = 1;
+            for &dim in &ne {
+                n_elems = n_elems
+                    .checked_mul(dim)
+                    .ok_or_else(|| GgufError::Bad(format!("tensor {name} dims overflow")))?;
+            }
             let n_bytes = match ty.block() {
-                Some((be, bb)) => n_elems / be as u64 * bb as u64,
+                Some((be, bb)) => {
+                    let blocks = n_elems / be as u64;
+                    blocks
+                        .checked_mul(bb as u64)
+                        .ok_or_else(|| GgufError::Bad(format!("tensor {name} byte size overflow")))?
+                }
                 None => 0,
             };
             tensors.push(TensorInfo { name, ne, n_dims, ty, offset, n_bytes });
         }
-        let data_offset = (c.p as u64 + alignment - 1) / alignment * alignment;
+        let data_offset = (c.p as u64)
+            .checked_add(alignment - 1)
+            .and_then(|v| (v / alignment).checked_mul(alignment))
+            .ok_or_else(|| GgufError::Bad("data_offset overflow".into()))?;
         for t in &tensors {
-            if data_offset + t.offset + t.n_bytes > mmap.len() as u64 {
+            let end = data_offset
+                .checked_add(t.offset)
+                .and_then(|v| v.checked_add(t.n_bytes))
+                .ok_or_else(|| GgufError::Bad(format!("tensor {} offset overflow", t.name)))?;
+            if end > mmap.len() as u64 {
                 return Err(GgufError::Bad(format!("tensor {} out of bounds", t.name)));
             }
         }
@@ -306,6 +323,25 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ocak-gguf-bad-{}.gguf", std::process::id()));
         std::fs::write(&p, b"NOPE0000000000000000").unwrap();
         assert!(GgufFile::open(&p).is_err());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn rejects_overflowing_tensor_sizes() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        b.extend_from_slice(&0u64.to_le_bytes()); // 0 kv
+        push_str(&mut b, "evil");
+        b.extend_from_slice(&2u32.to_le_bytes()); // 2 dims
+        b.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        b.extend_from_slice(&(1u64 << 40).to_le_bytes()); // product overflows u64
+        b.extend_from_slice(&0u32.to_le_bytes()); // F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+        let p = std::env::temp_dir().join(format!("ocak-gguf-ovf-{}.gguf", std::process::id()));
+        std::fs::File::create(&p).unwrap().write_all(&b).unwrap();
+        assert!(matches!(GgufFile::open(&p), Err(GgufError::Bad(_))));
         let _ = std::fs::remove_file(p);
     }
 }

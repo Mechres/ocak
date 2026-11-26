@@ -402,6 +402,23 @@ impl InklingExec {
         let n_expert = req("expert_count")? as usize;
         let n_expert_used = req("expert_used_count")? as usize;
         let n_rel = g.arch_u64("attention.relative_length").unwrap_or(16) as usize;
+        if use_vulkan {
+            if head_dim != 128 {
+                return Err(EngineError::Unsupported(format!(
+                    "inkling_attn.comp requires head_dim == 128 (got {head_dim})"
+                )));
+            }
+            if n_rel > 32 {
+                return Err(EngineError::Unsupported(format!(
+                    "inkling_attn.comp supports n_rel <= 32 (got {n_rel})"
+                )));
+            }
+            if n_embd > 4096 {
+                return Err(EngineError::Unsupported(format!(
+                    "inkling_mix.comp supports n_embd <= 4096 (got {n_embd})"
+                )));
+            }
+        }
         let n_rel_ext = g.arch_u64("attention.relative_extent").unwrap_or(1024) as usize;
         let n_swa = g.arch_u64("attention.sliding_window").unwrap_or(1024) as usize;
         let n_conv = g.arch_u64("shortconv.l_cache").unwrap_or(4) as usize;
