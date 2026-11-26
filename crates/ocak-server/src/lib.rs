@@ -42,6 +42,7 @@ pub struct ServerConfig {
     pub backend: BackendKind,
     pub max_ctx: usize,
     pub api_key: Option<String>,
+    pub allow_remote_host: bool,
 }
 
 impl Default for ServerConfig {
@@ -56,6 +57,7 @@ impl Default for ServerConfig {
             backend: BackendKind::Vulkan,
             max_ctx: 2048,
             api_key: std::env::var("OCAK_API_KEY").ok().filter(|s| !s.is_empty()),
+            allow_remote_host: std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1"),
         }
     }
 }
@@ -182,15 +184,21 @@ impl AppState {
 
     pub async fn ensure_native(&self, entry: &CatalogEntry) -> Result<(ocak_tok::TemplateFamily, bool), String> {
         // Fast lock-free check so concurrent requests can join the continuous batcher immediately!
-        if let Some((ref id, fam, multi)) = *self.active_meta.read().unwrap() {
-            if id == &entry.id {
+        let fast = self.active_meta.read().unwrap().clone();
+        if let Some((id, fam, multi)) = fast {
+            if id == entry.id {
+                if let Ok(mut g) = self.governor.try_lock() {
+                    g.touch(&entry.id, Instant::now());
+                }
                 return Ok((fam, multi));
             }
         }
         // Serialize model loads so two cold requests never double-load and OOM VRAM
         let _load_guard = self.load_lock.lock().await;
-        if let Some((ref id, fam, multi)) = *self.active_meta.read().unwrap() {
-            if id == &entry.id {
+        let cached = self.active_meta.read().unwrap().clone();
+        if let Some((id, fam, multi)) = cached {
+            if id == entry.id {
+                self.governor.lock().await.touch(&entry.id, Instant::now());
                 return Ok((fam, multi));
             }
         }
@@ -230,7 +238,7 @@ impl AppState {
         let opts = EngineOptions {
             backend: self.cfg.backend,
             max_ctx: self.cfg.max_ctx,
-            kv_pages: (self.cfg.max_ctx / 16 * 4).max(512),
+            kv_pages: (self.cfg.max_ctx / 16 * 8).max(1024),
         };
         let eng = tokio::task::spawn_blocking(move || NativeEngine::load(&path, opts))
             .await
@@ -249,6 +257,14 @@ impl AppState {
     }
 
     pub async fn ensure_bridge(&self, entry: &CatalogEntry) -> Result<String, String> {
+        {
+            let br = self.bridges.lock().await;
+            if let Some(h) = br.get(&entry.id) {
+                self.governor.lock().await.touch(&entry.id, Instant::now());
+                return Ok(h.base_addr());
+            }
+        }
+        let _load_guard = self.load_lock.lock().await;
         {
             let br = self.bridges.lock().await;
             if let Some(h) = br.get(&entry.id) {
@@ -349,15 +365,33 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(bare, "localhost" | "127.0.0.1" | "::1")
 }
 
+fn is_loopback_origin(origin: &str) -> bool {
+    let s = origin.trim();
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or("");
+    if rest.is_empty() {
+        return false;
+    }
+    let host_port = rest.split('/').next().unwrap_or("");
+    is_loopback_host(host_port)
+}
+
 async fn security_middleware(
     State(st): State<Arc<AppState>>,
     req: AxRequest,
     next: Next,
 ) -> Response {
-    if std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() != Some("1") {
+    if !st.cfg.allow_remote_host {
         if let Some(host) = req.headers().get("host").and_then(|v| v.to_str().ok()) {
             if !is_loopback_host(host) {
                 return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid Host header" }))).into_response();
+            }
+        }
+        if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+            if !is_loopback_origin(origin) {
+                return (StatusCode::FORBIDDEN, Json(json!({ "error": "cross-origin request blocked" }))).into_response();
             }
         }
     }
@@ -370,7 +404,14 @@ async fn security_middleware(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "));
             let x_api = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-            if bearer != Some(expected.as_str()) && x_api != Some(expected.as_str()) {
+            let query_key = req.uri().query().and_then(|q| {
+                q.split('&')
+                    .find_map(|pair| pair.strip_prefix("api_key="))
+            });
+            if bearer != Some(expected.as_str())
+                && x_api != Some(expected.as_str())
+                && query_key != Some(expected.as_str())
+            {
                 return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
             }
         }
@@ -678,6 +719,10 @@ async fn chat_completions(
                     "timings": gr.timings
                 });
                 let _ = tx.send(Ok(Event::default().data(done_chunk.to_string()))).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+            } else {
+                let err_chunk = json!({ "error": { "message": "generation failed or model swapped" } });
+                let _ = tx.send(Ok(Event::default().data(err_chunk.to_string()))).await;
                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
             }
         });
@@ -1239,6 +1284,14 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.clone().oneshot(bad_host).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let bad_origin = Request::builder()
+            .method("POST")
+            .uri("/v1/ocak/models/foo/sleep")
+            .header("origin", "https://evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad_origin).await.unwrap().status(), StatusCode::FORBIDDEN);
 
         let mut auth_cfg = ServerConfig::default();
         auth_cfg.api_key = Some("secret-test-key".into());

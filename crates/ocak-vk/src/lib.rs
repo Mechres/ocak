@@ -607,6 +607,7 @@ impl VkContext {
 
     pub fn upload(&self, dst: &Buffer, dst_off: u64, data: &[u8]) -> Result<(), VkError> {
         if data.is_empty() { return Ok(()); }
+        assert!(dst_off.saturating_add(data.len() as u64) <= dst.size, "vk upload out of bounds");
         let exec = self.exec.lock().unwrap();
         let mut off = 0usize;
         while off < data.len() {
@@ -623,6 +624,18 @@ impl VkContext {
                     .dst_offset(dst_off + off as u64)
                     .size(chunk as u64)];
                 self.device.cmd_copy_buffer(exec.cmd_buf, exec.staging_buf, dst.buf, &region);
+                let compute_bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                self.device.cmd_pipeline_barrier(
+                    exec.cmd_buf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &compute_bar,
+                    &[],
+                    &[],
+                );
                 self.device.end_command_buffer(exec.cmd_buf)?;
                 self.submit_wait(&exec)?;
             }
@@ -633,6 +646,7 @@ impl VkContext {
 
     pub fn download(&self, src: &Buffer, src_off: u64, out: &mut [u8]) -> Result<(), VkError> {
         if out.is_empty() { return Ok(()); }
+        assert!(src_off.saturating_add(out.len() as u64) <= src.size, "vk download out of bounds");
         let exec = self.exec.lock().unwrap();
         let mut off = 0usize;
         while off < out.len() {
@@ -643,6 +657,18 @@ impl VkContext {
                     exec.cmd_buf,
                     &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )?;
+                let pre_bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+                self.device.cmd_pipeline_barrier(
+                    exec.cmd_buf,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &pre_bar,
+                    &[],
+                    &[],
+                );
                 let region = [vk::BufferCopy::default()
                     .src_offset(src_off + off as u64)
                     .dst_offset(0)

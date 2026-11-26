@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let backend = if args.backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
+    let allow_remote_host = !matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+        || std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1");
     let cfg = ServerConfig {
         models_dirs: vec![args.models_dir, args.extra_models_dir],
         presets_path: args.presets,
@@ -43,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         backend,
         max_ctx: args.max_ctx,
         api_key: args.api_key.filter(|s| !s.is_empty()),
+        allow_remote_host,
     };
     let state = AppState::new(cfg);
     state.spawn_watchdog();

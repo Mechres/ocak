@@ -28,7 +28,12 @@
 </style>
 </head>
 <body>
-  <h1>OCAK <span style="font-size:12px;color:var(--mut)">RX 6700 XT Ground-Up LLM Server</span></h1>
+  <h1>OCAK <span style="font-size:12px;color:var(--mut)">RX 6700 XT Ground-Up LLM Server</span>
+    <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+      <input id="apiKey" type="password" placeholder="API key (optional)" style="width:180px;padding:4px 8px;font-size:11px"/>
+      <button onclick="saveKey()">Set Key</button>
+    </span>
+  </h1>
   <div class="grid">
     <div class="card"><div class="label">GPU VRAM</div><div class="val" id="vram">--</div><div class="bar"><div class="fill" id="vramBar" style="width:0%"></div></div></div>
     <div class="card"><div class="label">GPU GTT</div><div class="val" id="gtt">--</div><div class="bar"><div class="fill" id="gttBar" style="width:0%"></div></div></div>
@@ -75,8 +80,26 @@ function render(s) {
     document.getElementById('selModel').innerHTML = s.models.filter(m => !m.is_mmproj).map(m => `<option value="${m.id}">${m.id} (${m.engine})</option>`).join('');
   }
 }
+let es = null;
+function authHeaders(extra = {}) {
+  const k = localStorage.getItem('ocak_api_key') || '';
+  return k ? { ...extra, 'Authorization': 'Bearer ' + k } : extra;
+}
+function connectEvents() {
+  if (es) es.close();
+  const k = localStorage.getItem('ocak_api_key') || '';
+  const url = k ? '/v1/ocak/events?api_key=' + encodeURIComponent(k) : '/v1/ocak/events';
+  es = new EventSource(url);
+  es.onmessage = e => { try { render(JSON.parse(e.data)); } catch {} };
+}
+function saveKey() {
+  const k = document.getElementById('apiKey').value.trim();
+  if (k) localStorage.setItem('ocak_api_key', k); else localStorage.removeItem('ocak_api_key');
+  connectEvents();
+}
+document.getElementById('apiKey').value = localStorage.getItem('ocak_api_key') || '';
 async function act(id, op) {
-  await fetch('/v1/ocak/models/' + encodeURIComponent(id) + '/' + op, { method: 'POST' });
+  await fetch('/v1/ocak/models/' + encodeURIComponent(id) + '/' + op, { method: 'POST', headers: authHeaders() });
 }
 async function sendChat() {
   const out = document.getElementById('chatOut');
@@ -84,9 +107,10 @@ async function sendChat() {
   const model = document.getElementById('selModel').value;
   const prompt = document.getElementById('prompt').value;
   const res = await fetch('/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ model, stream: true, max_tokens: 128, temperature: 0.7, messages: [{ role: 'user', content: prompt }] })
   });
+  if (!res.ok) { out.textContent = 'Error ' + res.status + ': ' + await res.text(); return; }
   const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
   while (true) {
     const { done, value } = await reader.read(); if (done) break;
@@ -98,8 +122,7 @@ async function sendChat() {
     buf = buf.slice(buf.lastIndexOf('\n') + 1);
   }
 }
-const es = new EventSource('/v1/ocak/events');
-es.onmessage = e => { try { render(JSON.parse(e.data)); } catch {} };
+connectEvents();
 </script>
 </body>
 </html>

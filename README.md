@@ -113,10 +113,10 @@ cargo test --release --workspace
 ./target/release/ocakd \
   --host 127.0.0.1 \
   --port 8090 \
-  --compat-port 11434 \
   --models-dir ~/models \
   --sleep-idle-seconds 120
 ```
+*(Optional: pass `--compat-port 11434` to mirror the same OpenAI-compatible routes on a second port — note it does not implement Ollama `/api/*` endpoints; pass `--api-key` or `OCAK_API_KEY` to require bearer/`x-api-key` auth on `/v1/*`; binding `--host 0.0.0.0` automatically enables remote `Host` headers.)*
 
 - **Web Dashboard**: `http://127.0.0.1:8090/ui`
 - **Live Terminal Monitor**: `./target/release/ocak top --addr 127.0.0.1:8090`
