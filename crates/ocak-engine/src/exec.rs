@@ -52,6 +52,18 @@ pub trait Executor: Send {
         }
         Ok(())
     }
+    /// Like `forward_batch`, optionally returning the final-norm hidden state for every token in the batch
+    /// (used to warm up MTP self-speculative drafters with prompt context).
+    fn forward_batch_collect_hiddens(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+        out: Out,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        self.forward_batch(tokens, pos0, page_table, out)?;
+        Ok(Vec::new())
+    }
     /// Runs a 2-token speculative verify batch `[t0, t1]` at `pos0, pos0 + 1`, returning
     /// `Some(([logits0, logits1], [hidden0, hidden1]))` when supported.
     fn forward_verify2(

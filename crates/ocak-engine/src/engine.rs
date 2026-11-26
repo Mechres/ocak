@@ -256,8 +256,33 @@ impl NativeEngine {
                 return Err(e);
             }
         }
+        let mut mtp_pos = 0usize;
         if cache_n < prompt_len {
-            if let Err(e) = self.exec.forward_batch(
+            if use_mtp && cache_n == 0 && prompt_len >= 2 {
+                let hiddens = match self.exec.forward_batch_collect_hiddens(
+                    &tokens[cache_n..prompt_len],
+                    cache_n,
+                    &pages,
+                    Out { logits: true, hidden: true },
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.pager.release(&pages);
+                        return Err(e);
+                    }
+                };
+                if hiddens.len() == prompt_len {
+                    if let Some(m) = self.mtp.as_mut() {
+                        let start = prompt_len.saturating_sub(256);
+                        for i in start..prompt_len - 1 {
+                            if m.warmup_kv(&hiddens[i], tokens[i + 1], mtp_pos).is_err() {
+                                break;
+                            }
+                            mtp_pos += 1;
+                        }
+                    }
+                }
+            } else if let Err(e) = self.exec.forward_batch(
                 &tokens[cache_n..prompt_len],
                 cache_n,
                 &pages,
@@ -295,7 +320,6 @@ impl NativeEngine {
         let mut hidden_buf = if use_mtp { self.exec.hidden().to_vec() } else { Vec::new() };
         let mut mtp_drafted = 0usize;
         let mut mtp_accepted = 0usize;
-        let mut mtp_pos = 0usize;
         let mut forced_tok: Option<u32> = None;
         let pure_greedy = req.sampler.temperature <= 0.0
             && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
@@ -353,12 +377,9 @@ impl NativeEngine {
             if use_mtp && gen_tokens.len() + 1 < req.max_tokens && tokens.len() + 1 < self.max_ctx {
                 let t0 = Instant::now();
                 let draft_tok = self.mtp.as_mut().and_then(|m| {
-                    let dl = m.draft_logits(&hidden_buf, next_tok, mtp_pos).ok()?;
+                    let dt = m.draft_token(&hidden_buf, next_tok, mtp_pos).ok()?;
                     mtp_pos += 1;
-                    dl.iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(i, _)| i as u32)
+                    Some(dt)
                 });
                 ms_draft += t0.elapsed().as_secs_f64() * 1000.0;
                 if let Some(dt) = draft_tok {

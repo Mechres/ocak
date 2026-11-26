@@ -335,10 +335,42 @@ impl Executor for VkExec {
             let chunk = &tokens[offset..(offset + chunk_max).min(tokens.len())];
             let is_last_chunk = offset + chunk.len() == tokens.len();
             let chunk_out = Out { logits: is_last_chunk && out.logits, hidden: is_last_chunk && out.hidden };
-            self.forward_batch_chunk(chunk, pos0 + offset, chunk_out)?;
+            self.forward_batch_chunk(chunk, pos0 + offset, chunk_out, None)?;
             offset += chunk.len();
         }
         Ok(())
+    }
+
+    fn forward_batch_collect_hiddens(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+        out: Out,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if tokens.len() == 1 {
+            self.forward(tokens[0], pos0, page_table, Out { logits: out.logits, hidden: true })?;
+            return Ok(vec![self.hidden.clone()]);
+        }
+        if page_table.len() > self.max_pages {
+            return Err(EngineError::Context("page table exceeds GPU capacity".into()));
+        }
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        let chunk_max = if self.cfg.n_layer >= 48 { 8 } else { PREFILL_BATCH };
+        let mut hiddens = Vec::with_capacity(tokens.len());
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let chunk = &tokens[offset..(offset + chunk_max).min(tokens.len())];
+            let is_last_chunk = offset + chunk.len() == tokens.len();
+            let chunk_out = Out { logits: is_last_chunk && out.logits, hidden: is_last_chunk && out.hidden };
+            self.forward_batch_chunk(chunk, pos0 + offset, chunk_out, Some(&mut hiddens))?;
+            offset += chunk.len();
+        }
+        Ok(hiddens)
     }
 
     fn forward_verify2(
@@ -770,7 +802,13 @@ impl VkExec {
         Ok(())
     }
 
-    fn forward_batch_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+    fn forward_batch_chunk(
+        &mut self,
+        chunk: &[u32],
+        pos0: usize,
+        out: Out,
+        mut collect_hiddens: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<(), EngineError> {
         let c = &self.cfg;
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
@@ -778,18 +816,42 @@ impl VkExec {
         self.record_batch_layers(&mut rec, chunk, pos0, false);
 
         let last_off = ((chunk.len() - 1) * c.n_embd) as u64;
-        if out.logits || out.hidden {
-            rec.rms_norm(&self.x, last_off, &self.out_norm, 0, &self.hidden_buf, 0, ne, c.eps);
+        if collect_hiddens.is_some() {
+            for b in 0..chunk.len() {
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &self.out_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+            }
             rec.barrier();
-        }
-        if out.logits {
-            let w = self.output.as_ref().unwrap_or(&self.embd);
-            rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
-            rec.barrier();
+            if out.logits {
+                let w = self.output.as_ref().unwrap_or(&self.embd);
+                rec.qmv(w.ty, &w.buf, 0, &self.xn, last_off, &self.logits_buf, 0, w.k, w.m);
+                rec.barrier();
+            }
+        } else {
+            if out.logits || out.hidden {
+                rec.rms_norm(&self.x, last_off, &self.out_norm, 0, &self.hidden_buf, 0, ne, c.eps);
+                rec.barrier();
+            }
+            if out.logits {
+                let w = self.output.as_ref().unwrap_or(&self.embd);
+                rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
+                rec.barrier();
+            }
         }
         rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
 
-        if out.hidden {
+        if let Some(h_out) = collect_hiddens.as_mut() {
+            let mut batch_h = vec![0f32; chunk.len() * c.n_embd];
+            self.ctx
+                .download(&self.xn, 0, bytemuck::cast_slice_mut(&mut batch_h))
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            for b in 0..chunk.len() {
+                h_out.push(batch_h[b * c.n_embd..(b + 1) * c.n_embd].to_vec());
+            }
+            if out.hidden {
+                let last = (chunk.len() - 1) * c.n_embd;
+                self.hidden.copy_from_slice(&batch_h[last..last + c.n_embd]);
+            }
+        } else if out.hidden {
             self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
         }
         if out.logits {

@@ -58,6 +58,7 @@ struct MtpGpu {
     af: Buffer,
     h_out: Buffer,
     logits: Buffer,
+    argmax_out: Buffer,
 }
 
 pub struct MtpDrafter {
@@ -223,6 +224,7 @@ impl MtpDrafter {
             af: mk(c.n_ff)?,
             h_out: mk(c.n_embd)?,
             logits: mk(c.n_vocab)?,
+            argmax_out: mk(4)?,
             ctx,
             head_buf,
             head_ty,
@@ -245,6 +247,147 @@ impl MtpDrafter {
 
     fn mv(&self, ti: &TensorInfo, x: &[f32], y: &mut [f32]) {
         gemv(ti.ty, self.g.tensor_data(ti), x, y, ti.n_cols(), ti.n_rows());
+    }
+
+    /// Populates the MTP drafter's KV cache at `pos` from `(h_main, token)` during prompt warmup.
+    /// Skips attention, FFN, and lm_head (only computes `eh_proj -> wk/wv -> k_norm -> rope -> kv_write`).
+    pub fn warmup_kv(&mut self, h_main: &[f32], token: u32, pos: usize) -> Result<(), EngineError> {
+        if pos >= self.max_ctx {
+            return Err(EngineError::Context("MTP pos >= max_ctx".into()));
+        }
+        let c = &self.cfg;
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_head_kv, c.head_dim);
+        let kv_dim = nkv * hd;
+        let mut tok_e = vec![0f32; ne];
+        let rb = self.embd.row_bytes();
+        let r = token as usize;
+        dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
+
+        #[cfg(feature = "vulkan")]
+        if let Some(gp) = &self.gpu {
+            gp.ctx.upload(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h_main)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut rec = gp.ctx.begin();
+            rec.set_defer_barriers(true);
+            rec.rms_norm(&gp.tok_e, 0, &gp.enorm, 0, &gp.concat, 0, ne as u32, c.eps);
+            rec.rms_norm(&gp.h_in, 0, &gp.hnorm, 0, &gp.concat, ne as u64, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.eh_proj.ty, &gp.eh_proj.buf, 0, &gp.concat, 0, &gp.x, 0, gp.eh_proj.k, gp.eh_proj.m);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.attn_norm, 0, &gp.xn, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.wk.ty, &gp.wk.buf, 0, &gp.xn, 0, &gp.k, 0, gp.wk.k, gp.wk.m);
+            rec.qmv(gp.wv.ty, &gp.wv.buf, 0, &gp.xn, 0, &gp.v, 0, gp.wv.k, gp.wv.m);
+            rec.barrier();
+            rec.rms_norm_heads(&gp.k, 0, &gp.k_norm, nkv as u32, hd as u32, c.eps);
+            rec.barrier();
+            rec.rope(&gp.q, 0, &gp.k, 0, nh as u32, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1);
+            rec.barrier();
+            rec.kv_write(&gp.k, 0, &gp.v, 0, &gp.kv, 0, &gp.pt_buf, 0, pos as u32, kv_dim as u32);
+            rec.barrier();
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            return Ok(());
+        }
+
+        let mut e_norm = vec![0f32; ne];
+        let mut h_norm = vec![0f32; ne];
+        ops::rms_norm(&tok_e, &self.enorm, &mut e_norm, c.eps);
+        ops::rms_norm(h_main, &self.hnorm, &mut h_norm, c.eps);
+        let mut concat = Vec::with_capacity(2 * ne);
+        concat.extend_from_slice(&e_norm);
+        concat.extend_from_slice(&h_norm);
+        let mut x = vec![0f32; ne];
+        self.mv(&self.eh_proj, &concat, &mut x);
+        let mut xn = vec![0f32; ne];
+        ops::rms_norm(&x, &self.attn_norm, &mut xn, c.eps);
+        let mut k = vec![0f32; kv_dim];
+        let mut v = vec![0f32; kv_dim];
+        self.mv(&self.wk, &xn, &mut k);
+        self.mv(&self.wv, &xn, &mut v);
+        ops::rms_norm_heads(&mut k, &self.k_norm, nkv, hd, c.eps);
+        ops::rope(&mut k, nkv, hd, c.n_rot, pos, c.rope_base, 1);
+        let k_base = pos * kv_dim;
+        let v_base = self.max_ctx * kv_dim + pos * kv_dim;
+        self.kv[k_base..k_base + kv_dim].copy_from_slice(&k);
+        self.kv[v_base..v_base + kv_dim].copy_from_slice(&v);
+        Ok(())
+    }
+
+    /// Fast greedy draft token using on-device GPU argmax (downloads 4 bytes instead of full vocab logits).
+    pub fn draft_token(&mut self, h_main: &[f32], token: u32, pos: usize) -> Result<u32, EngineError> {
+        #[cfg(feature = "vulkan")]
+        if let Some(gp) = &self.gpu {
+            if pos >= self.max_ctx {
+                return Err(EngineError::Context("MTP pos >= max_ctx".into()));
+            }
+            let c = &self.cfg;
+            let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_head_kv, c.head_dim);
+            let kv_dim = nkv * hd;
+            let mut tok_e = vec![0f32; ne];
+            let rb = self.embd.row_bytes();
+            let r = token as usize;
+            dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
+            gp.ctx.upload(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h_main)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut rec = gp.ctx.begin();
+            rec.set_defer_barriers(true);
+            rec.rms_norm(&gp.tok_e, 0, &gp.enorm, 0, &gp.concat, 0, ne as u32, c.eps);
+            rec.rms_norm(&gp.h_in, 0, &gp.hnorm, 0, &gp.concat, ne as u64, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.eh_proj.ty, &gp.eh_proj.buf, 0, &gp.concat, 0, &gp.x, 0, gp.eh_proj.k, gp.eh_proj.m);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.attn_norm, 0, &gp.xn, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.wq.ty, &gp.wq.buf, 0, &gp.xn, 0, &gp.qg, 0, gp.wq.k, gp.wq.m);
+            rec.qmv(gp.wk.ty, &gp.wk.buf, 0, &gp.xn, 0, &gp.k, 0, gp.wk.k, gp.wk.m);
+            rec.qmv(gp.wv.ty, &gp.wv.buf, 0, &gp.xn, 0, &gp.v, 0, gp.wv.k, gp.wv.m);
+            rec.barrier();
+            rec.split_qg(&gp.qg, &gp.q, &gp.q_gate, nh as u32, hd as u32);
+            rec.barrier();
+            rec.rms_norm_heads(&gp.q, 0, &gp.q_norm, nh as u32, hd as u32, c.eps);
+            rec.rms_norm_heads(&gp.k, 0, &gp.k_norm, nkv as u32, hd as u32, c.eps);
+            rec.barrier();
+            rec.rope(&gp.q, 0, &gp.k, 0, nh as u32, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1);
+            rec.barrier();
+            rec.kv_write(&gp.k, 0, &gp.v, 0, &gp.kv, 0, &gp.pt_buf, 0, pos as u32, kv_dim as u32);
+            rec.barrier();
+            rec.attention_swa(&gp.q, 0, &gp.kv, 0, &gp.pt_buf, 0, &gp.attn, 0, nh as u32, nkv as u32, hd as u32, pos as u32, 0);
+            rec.barrier();
+            rec.mul_sigmoid(&gp.attn, &gp.q_gate, (nh * hd) as u32);
+            rec.barrier();
+            rec.qmv(gp.wo.ty, &gp.wo.buf, 0, &gp.attn, 0, &gp.o, 0, gp.wo.k, gp.wo.m);
+            rec.barrier();
+            rec.add(&gp.x, 0, &gp.o, 0, ne as u32);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.post_attn_norm, 0, &gp.xn, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.ffn_gate.ty, &gp.ffn_gate.buf, 0, &gp.xn, 0, &gp.gf, 0, gp.ffn_gate.k, gp.ffn_gate.m);
+            rec.qmv(gp.ffn_up.ty, &gp.ffn_up.buf, 0, &gp.xn, 0, &gp.uf, 0, gp.ffn_up.k, gp.ffn_up.m);
+            rec.barrier();
+            rec.swiglu(&gp.gf, 0, &gp.uf, 0, &gp.af, 0, c.n_ff as u32);
+            rec.barrier();
+            rec.qmv(gp.ffn_down.ty, &gp.ffn_down.buf, 0, &gp.af, 0, &gp.o, 0, gp.ffn_down.k, gp.ffn_down.m);
+            rec.barrier();
+            rec.add(&gp.x, 0, &gp.o, 0, ne as u32);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.head_norm, 0, &gp.h_out, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.head_ty, &gp.head_buf, 0, &gp.h_out, 0, &gp.logits, 0, gp.head_k, gp.head_m);
+            rec.barrier();
+            rec.argmax(&gp.logits, 0, &gp.argmax_out, c.n_vocab as u32);
+            rec.barrier();
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut best = [0u32; 1];
+            gp.ctx.download(&gp.argmax_out, 0, bytemuck::cast_slice_mut(&mut best)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            return Ok(best[0]);
+        }
+        let dl = self.draft_logits(h_main, token, pos)?;
+        Ok(dl
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0))
     }
 
     /// Predicts draft logits for the token AFTER `token`, given the main trunk's post-norm hidden `h_main`.
