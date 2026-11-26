@@ -107,6 +107,7 @@ pub struct VkExec {
     logits_buf: Buffer,
     hidden_buf2: Buffer,
     logits_buf2: Buffer,
+    multi_logits_buf: Option<(usize, Buffer)>,
     argmax_buf: Buffer,
     rec_snaps: Option<Vec<(Buffer, Option<Buffer>)>>,
     logits: Vec<f32>,
@@ -265,6 +266,7 @@ impl VkExec {
             logits_buf: mk(cfg.n_vocab)?,
             hidden_buf2: mk(2 * cfg.n_embd)?,
             logits_buf2: mk(2 * cfg.n_vocab)?,
+            multi_logits_buf: None,
             argmax_buf: mk(4)?,
             rec_snaps: None,
             logits: vec![0.0; cfg.n_vocab],
@@ -443,6 +445,15 @@ impl Executor for VkExec {
         }
         self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(&pt_packed)).map_err(|e| EngineError::Backend(e.to_string()))?;
 
+        if slots.len() > 2 {
+            let need_alloc = self.multi_logits_buf.as_ref().map_or(true, |(cap, _)| *cap < slots.len());
+            if need_alloc {
+                let cap = slots.len().max(8);
+                let buf = self.ctx.create_device_buffer((cap * self.cfg.n_vocab * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
+                self.multi_logits_buf = Some((cap, buf));
+            }
+        }
+
         let c = &self.cfg;
         let batch = slots.len() as u32;
         let ne = c.n_embd as u32;
@@ -455,11 +466,14 @@ impl Executor for VkExec {
         }
         rec.barrier();
 
-        for l in &self.layers {
+        if !self.layers.is_empty() {
             for b in 0..slots.len() {
-                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &self.layers[0].attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
             }
             rec.barrier();
+        }
+
+        for (li, l) in self.layers.iter().enumerate() {
             if let VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } = &l.mixer {
                 let kv_dim = (*n_head_kv as usize) * c.head_dim;
                 if *gated_q {
@@ -522,10 +536,8 @@ impl Executor for VkExec {
                 }
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, batch * ne);
-            rec.barrier();
             for b in 0..slots.len() {
-                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.ffn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+                rec.add_rms_norm(&self.x, (b * c.n_embd) as u64, &self.o, (b * c.n_embd) as u64, &l.ffn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
             }
             rec.barrier();
             rec.qmm(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m, batch);
@@ -541,23 +553,26 @@ impl Executor for VkExec {
                 }
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, batch * ne);
-            rec.barrier();
+            if li + 1 < self.layers.len() {
+                for b in 0..slots.len() {
+                    rec.add_rms_norm(&self.x, (b * c.n_embd) as u64, &self.o, (b * c.n_embd) as u64, &self.layers[li + 1].attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            } else {
+                for b in 0..slots.len() {
+                    rec.add_rms_norm(&self.x, (b * c.n_embd) as u64, &self.o, (b * c.n_embd) as u64, &self.out_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            }
         }
 
-        // Final norm for all B slots into self.xn (sized PREFILL_BATCH * n_embd)
-        for b in 0..slots.len() {
-            rec.rms_norm(&self.x, (b * c.n_embd) as u64, &self.out_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
-        }
-        rec.barrier();
-        // Output logits for all B slots: allocate/use a temporary buffer if B > 2, else logits_buf2
+        // Output logits for all B slots using cached multi-slot buffer (zero per-step VRAM allocs)
         let w = self.output.as_ref().unwrap_or(&self.embd);
-        let dyn_logits = if slots.len() > 2 {
-            Some(self.ctx.create_device_buffer((slots.len() * c.n_vocab * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?)
+        let lbuf = if slots.len() > 2 {
+            &self.multi_logits_buf.as_ref().unwrap().1
         } else {
-            None
+            &self.logits_buf2
         };
-        let lbuf = dyn_logits.as_ref().unwrap_or(&self.logits_buf2);
         rec.qmm(w.ty, &w.buf, 0, &self.xn, 0, lbuf, 0, w.k, w.m, batch);
         rec.barrier();
         rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;

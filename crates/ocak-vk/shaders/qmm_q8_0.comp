@@ -1,43 +1,33 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_8bit_storage : require
-layout(local_size_x = 32, local_size_y = 4) in;
+layout(local_size_x = 32, local_size_y = 8) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+shared float sx[8][32];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
-    uint row = gl_WorkGroupID.x * 4u + ly;
+    uint row = gl_WorkGroupID.x * 8u + ly;
     uint b0 = gl_WorkGroupID.y * 8u;
     uint bm = pc.batch - 1u;
-    uint o0 = pc.x_off + b0 * pc.k;
-    uint o1 = pc.x_off + min(b0 + 1u, bm) * pc.k;
-    uint o2 = pc.x_off + min(b0 + 2u, bm) * pc.k;
-    uint o3 = pc.x_off + min(b0 + 3u, bm) * pc.k;
-    uint o4 = pc.x_off + min(b0 + 4u, bm) * pc.k;
-    uint o5 = pc.x_off + min(b0 + 5u, bm) * pc.k;
-    uint o6 = pc.x_off + min(b0 + 6u, bm) * pc.k;
-    uint o7 = pc.x_off + min(b0 + 7u, bm) * pc.k;
+    uint o_ly = pc.x_off + min(b0 + ly, bm) * pc.k;
     vec4 acc0 = vec4(0.0), acc1 = vec4(0.0);
-    if (row < pc.m) {
-        uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nblk = pc.k / 32u;
-        for (uint blk = tid; blk < nblk; blk += 32u) {
+    uint rbase = pc.w_off + row * pc.row_bytes;
+    uint nblk = pc.k / 32u;
+    for (uint blk = 0u; blk < nblk; blk++) {
+        sx[ly][tid] = x[o_ly + blk * 32u + tid];
+        barrier();
+        if (row < pc.m) {
             uint b = rbase + blk * 34u;
             float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
-            vec4 s0 = vec4(0.0), s1 = vec4(0.0);
-            uint xbase = blk * 32u;
-            for (uint j = 0u; j < 32u; j++) {
-                float q = float(bitfieldExtract(int(w[b + 2u + j]), 0, 8));
-                uint xr = xbase + j;
-                s0 += q * vec4(x[o0 + xr], x[o1 + xr], x[o2 + xr], x[o3 + xr]);
-                s1 += q * vec4(x[o4 + xr], x[o5 + xr], x[o6 + xr], x[o7 + xr]);
-            }
-            acc0 += d * s0;
-            acc1 += d * s1;
+            float wf = d * float(bitfieldExtract(int(w[b + 2u + tid]), 0, 8));
+            acc0 += wf * vec4(sx[0][tid], sx[1][tid], sx[2][tid], sx[3][tid]);
+            acc1 += wf * vec4(sx[4][tid], sx[5][tid], sx[6][tid], sx[7][tid]);
         }
+        barrier();
     }
     vec4 r0 = subgroupClusteredAdd(acc0, 32u);
     vec4 r1 = subgroupClusteredAdd(acc1, 32u);
