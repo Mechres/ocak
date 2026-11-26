@@ -109,4 +109,33 @@ mod tests {
         let ink = template::render(TemplateFamily::Inkling, &[ChatMessage { role: "user".into(), content: "2+2?".into() }], true, false);
         assert!(ink.contains("Thinking effort level: 0<|end_message|><|message_user|><|content_text|>2+2?<|end_message|>"));
     }
+
+    #[test]
+    fn bpe_and_spm_scale_linearly_on_large_inputs() {
+        let big_chunk = "The quick brown fox jumps over the lazy dog 1234567890! ";
+        let big_text = big_chunk.repeat(600); // ~33 KB
+        let p_qwen = Path::new("/home/mechres/models/Qwen3.5-4B-Q4_K_M.gguf");
+        if p_qwen.exists() {
+            let gf = ocak_gguf::GgufFile::open(p_qwen).unwrap();
+            let tok = Tokenizer::from_gguf(&gf).unwrap();
+            let t0 = std::time::Instant::now();
+            let ids = tok.encode(&big_text, false, false);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!("Qwen3.5 BPE 33KB ({} tok) encoded in {ms:.1} ms", ids.len());
+            assert_eq!(tok.decode(&ids), big_text);
+            assert!(ms < 500.0, "BPE encode too slow: {ms:.1} ms");
+        }
+        // Also test a long single contiguous word (worst case for quadratic BPE!)
+        let long_word = "supercalifragilisticexpialidocious".repeat(80); // 2720 chars, single pre-token
+        if p_qwen.exists() {
+            let gf = ocak_gguf::GgufFile::open(p_qwen).unwrap();
+            let tok = Tokenizer::from_gguf(&gf).unwrap();
+            let t0 = std::time::Instant::now();
+            let ids = tok.encode(&long_word, false, false);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!("Qwen3.5 BPE 2.7KB single-word ({} tok) encoded in {ms:.1} ms", ids.len());
+            assert_eq!(tok.decode(&ids), long_word);
+            assert!(ms < 200.0, "single-word BPE too slow: {ms:.1} ms");
+        }
+    }
 }

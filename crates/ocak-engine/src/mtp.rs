@@ -182,7 +182,7 @@ impl MtpDrafter {
         let c = &self.cfg;
         let qd = c.n_head * c.head_dim;
         let kv_dim = c.n_head_kv * c.head_dim;
-        let n_pages = (self.max_ctx + 15) / 16 + 1;
+        let n_pages = self.max_ctx.div_ceil(16) + 1;
         let pt: Vec<u32> = (0..n_pages as u32).collect();
         let pt_buf = ctx.create_device_buffer((pt.len() * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
         ctx.upload(&pt_buf, 0, bytemuck::cast_slice(&pt)).map_err(|e| EngineError::Backend(e.to_string()))?;

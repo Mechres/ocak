@@ -452,7 +452,7 @@ impl Executor for VkExec {
         self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(&pt_packed)).map_err(|e| EngineError::Backend(e.to_string()))?;
 
         if slots.len() > 2 {
-            let need_alloc = self.multi_logits_buf.as_ref().map_or(true, |(cap, _)| *cap < slots.len());
+            let need_alloc = self.multi_logits_buf.as_ref().is_none_or(|(cap, _)| *cap < slots.len());
             if need_alloc {
                 let cap = slots.len().max(8);
                 let buf = self.ctx.create_device_buffer((cap * self.cfg.n_vocab * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?;

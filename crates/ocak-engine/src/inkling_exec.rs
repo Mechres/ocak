@@ -348,7 +348,7 @@ fn convolve_step(
     let mut out = vec![0f32; n_ch];
     let scale = 1.0 / ((if dynamic.is_some() { 2 } else { 1 } * n_conv + 1) as f32).sqrt();
     let n_heads = dynamic.map(|d| d.len() / n_conv).unwrap_or(0);
-    let head_ch = if n_heads > 0 { n_ch / n_heads } else { 0 };
+    let head_ch = n_ch.checked_div(n_heads).unwrap_or(0);
 
     for c in 0..n_ch {
         let h_off = c * nh;
@@ -1005,7 +1005,7 @@ impl InklingExec {
         let mut cur = convolve_step(&o_proj, &self.phys[ip].attn_post_conv, None, &mut self.slots[il].attn_post_hist, self.n_conv);
 
         // 8. Block boundary vs residual add
-        if ip % self.block_size == 0 {
+        if ip.is_multiple_of(self.block_size) {
             blocks.push(inp_sa);
         } else {
             for i in 0..self.n_embd { cur[i] += inp_sa[i]; }
@@ -1225,7 +1225,7 @@ impl InklingExec {
         rec.inkling_conv(&gp.o_proj, 0, &gph.attn_post_conv, &gp.dummy_dyn, 0, &gp.attn_post_hist, post_hist_off, &gp.cur, 0, ne, self.n_conv as u32, false, 1);
 
         // 8. Block boundary vs residual add
-        if ip % self.block_size == 0 {
+        if ip.is_multiple_of(self.block_size) {
             rec.rms_norm(&gp.inp_sa, 0, &gp.ones, 0, &gp.blocks_norm, (*blk_count * ne) as u64, ne, 1e-6);
             *blk_count += 1;
             rec.barrier();

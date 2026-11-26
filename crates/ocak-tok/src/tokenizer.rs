@@ -1,5 +1,7 @@
 use ocak_gguf::GgufFile;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokError {
@@ -38,8 +40,8 @@ fn gpt2_byte_to_char() -> [char; 256] {
     let mut next = 256u32;
     for b in 0..256u32 {
         let printable = (b >= b'!' as u32 && b <= b'~' as u32)
-            || (b >= 0xA1 && b <= 0xAC)
-            || (b >= 0xAE && b <= 0xFF);
+            || (0xA1..=0xAC).contains(&b)
+            || (0xAE..=0xFF).contains(&b);
         let cp = if printable { b } else { let v = next; next += 1; v };
         map[b as usize] = char::from_u32(cp).unwrap();
     }
@@ -94,7 +96,7 @@ impl Tokenizer {
             }
         }
         // Longest-first for greedy special-token matching
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
 
         let mut merges = FxHashMap::default();
         if let Some(ms) = g.strings("tokenizer.ggml.merges") {
@@ -245,30 +247,105 @@ impl Tokenizer {
                 norm.push(c);
             }
         }
-        let mut pieces: Vec<String> = norm.chars().map(|c| c.to_string()).collect();
-        while pieces.len() >= 2 {
-            let mut best: Option<(usize, f32, String)> = None;
-            for i in 0..pieces.len() - 1 {
-                let mut cand = String::with_capacity(pieces[i].len() + pieces[i + 1].len());
-                cand.push_str(&pieces[i]);
-                cand.push_str(&pieces[i + 1]);
-                if let Some(&id) = self.tok_to_id.get(&cand) {
-                    let sc = self.scores.get(id as usize).copied().unwrap_or(0.0);
-                    if best.as_ref().map_or(true, |b| sc > b.1) {
-                        best = Some((i, sc, cand));
-                    }
-                }
-            }
-            match best {
-                Some((idx, _, merged)) => {
-                    pieces[idx] = merged;
-                    pieces.remove(idx + 1);
-                }
-                None => break,
+        #[derive(Clone, Copy)]
+        struct SpmCand {
+            score: f32,
+            left: usize,
+            right: usize,
+            gen_l: u32,
+            gen_r: u32,
+        }
+        impl PartialEq for SpmCand {
+            fn eq(&self, other: &Self) -> bool {
+                self.score.to_bits() == other.score.to_bits() && self.left == other.left
             }
         }
-        for p in pieces {
-            if let Some(&id) = self.tok_to_id.get(&p) {
+        impl Eq for SpmCand {}
+        impl PartialOrd for SpmCand {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for SpmCand {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.score
+                    .total_cmp(&other.score)
+                    .then_with(|| other.left.cmp(&self.left))
+            }
+        }
+        struct Node {
+            sym: String,
+            prev: usize,
+            next: usize,
+            alive: bool,
+            gen: u32,
+        }
+        const NONE: usize = usize::MAX;
+        let mut nodes: Vec<Node> = norm
+            .chars()
+            .enumerate()
+            .map(|(i, c)| Node {
+                sym: c.to_string(),
+                prev: if i == 0 { NONE } else { i - 1 },
+                next: i + 1,
+                alive: true,
+                gen: 0,
+            })
+            .collect();
+        if let Some(last) = nodes.last_mut() {
+            last.next = NONE;
+        }
+        if nodes.len() >= 2 {
+            let mut heap: BinaryHeap<SpmCand> = BinaryHeap::with_capacity(nodes.len());
+            let mut cand = String::new();
+            let try_push = |l: usize, r: usize, nodes: &[Node], cand: &mut String, heap: &mut BinaryHeap<SpmCand>| {
+                if l == NONE || r == NONE || !nodes[l].alive || !nodes[r].alive {
+                    return;
+                }
+                cand.clear();
+                cand.push_str(&nodes[l].sym);
+                cand.push_str(&nodes[r].sym);
+                if let Some(&id) = self.tok_to_id.get(cand.as_str()) {
+                    let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
+                    heap.push(SpmCand {
+                        score,
+                        left: l,
+                        right: r,
+                        gen_l: nodes[l].gen,
+                        gen_r: nodes[r].gen,
+                    });
+                }
+            };
+            for i in 0..nodes.len() - 1 {
+                try_push(i, i + 1, &nodes, &mut cand, &mut heap);
+            }
+            while let Some(c) = heap.pop() {
+                let (l, r) = (c.left, c.right);
+                if !nodes[l].alive
+                    || !nodes[r].alive
+                    || nodes[l].next != r
+                    || nodes[l].gen != c.gen_l
+                    || nodes[r].gen != c.gen_r
+                {
+                    continue;
+                }
+                let r_sym = std::mem::take(&mut nodes[r].sym);
+                nodes[l].sym.push_str(&r_sym);
+                nodes[l].gen += 1;
+                nodes[r].alive = false;
+                let rn = nodes[r].next;
+                nodes[l].next = rn;
+                if rn != NONE {
+                    nodes[rn].prev = l;
+                }
+                try_push(nodes[l].prev, l, &nodes, &mut cand, &mut heap);
+                try_push(l, rn, &nodes, &mut cand, &mut heap);
+            }
+        }
+        let mut cur = if nodes.is_empty() { NONE } else { 0 };
+        while cur != NONE {
+            let p = &nodes[cur].sym;
+            if let Some(&id) = self.tok_to_id.get(p) {
                 out.push(id);
             } else {
                 for b in p.as_bytes() {
@@ -277,38 +354,80 @@ impl Tokenizer {
                     }
                 }
             }
+            cur = nodes[cur].next;
         }
     }
 
     fn encode_bpe(&self, text: &str, out: &mut Vec<u32>) {
+        struct Node {
+            sym: String,
+            prev: usize,
+            next: usize,
+            alive: bool,
+            gen: u32,
+        }
+        const NONE: usize = usize::MAX;
         let b2c = gpt2_byte_to_char();
         for (s, e) in pre_tokenize_bpe(text, self.llama3_pre) {
-            let mut syms: Vec<String> = text[s..e]
-                .as_bytes()
+            let bytes = &text.as_bytes()[s..e];
+            let mut nodes: Vec<Node> = bytes
                 .iter()
-                .map(|&b| b2c[b as usize].to_string())
+                .enumerate()
+                .map(|(i, &b)| Node {
+                    sym: b2c[b as usize].to_string(),
+                    prev: if i == 0 { NONE } else { i - 1 },
+                    next: i + 1,
+                    alive: true,
+                    gen: 0,
+                })
                 .collect();
-            if !self.merges.is_empty() {
-                while syms.len() >= 2 {
-                    let mut best: Option<(usize, usize)> = None;
-                    for i in 0..syms.len() - 1 {
-                        if let Some(&rank) = self.merges.get(&(syms[i].clone(), syms[i + 1].clone())) {
-                            if best.map_or(true, |b| rank < b.1) {
-                                best = Some((i, rank));
-                            }
-                        }
+            if let Some(last) = nodes.last_mut() {
+                last.next = NONE;
+            }
+            if !self.merges.is_empty() && nodes.len() >= 2 {
+                // O(n log n) min-heap BPE merge with exact leftmost tie-breaking
+                let mut heap: BinaryHeap<Reverse<(usize, usize, usize, u32, u32)>> =
+                    BinaryHeap::with_capacity(nodes.len());
+                let try_push = |l: usize,
+                                r: usize,
+                                nodes: &[Node],
+                                heap: &mut BinaryHeap<Reverse<(usize, usize, usize, u32, u32)>>| {
+                    if l == NONE || r == NONE || !nodes[l].alive || !nodes[r].alive {
+                        return;
                     }
-                    match best {
-                        Some((idx, _)) => {
-                            let right = syms.remove(idx + 1);
-                            syms[idx].push_str(&right);
-                        }
-                        None => break,
+                    if let Some(&rank) = self.merges.get(&(nodes[l].sym.clone(), nodes[r].sym.clone())) {
+                        heap.push(Reverse((rank, l, r, nodes[l].gen, nodes[r].gen)));
                     }
+                };
+                for i in 0..nodes.len() - 1 {
+                    try_push(i, i + 1, &nodes, &mut heap);
+                }
+                while let Some(Reverse((_, l, r, gl, gr))) = heap.pop() {
+                    if !nodes[l].alive
+                        || !nodes[r].alive
+                        || nodes[l].next != r
+                        || nodes[l].gen != gl
+                        || nodes[r].gen != gr
+                    {
+                        continue;
+                    }
+                    let r_sym = std::mem::take(&mut nodes[r].sym);
+                    nodes[l].sym.push_str(&r_sym);
+                    nodes[l].gen += 1;
+                    nodes[r].alive = false;
+                    let rn = nodes[r].next;
+                    nodes[l].next = rn;
+                    if rn != NONE {
+                        nodes[rn].prev = l;
+                    }
+                    try_push(nodes[l].prev, l, &nodes, &mut heap);
+                    try_push(l, rn, &nodes, &mut heap);
                 }
             }
-            for sym in syms {
-                if let Some(&id) = self.tok_to_id.get(&sym) {
+            let mut cur = if nodes.is_empty() { NONE } else { 0 };
+            while cur != NONE {
+                let sym = &nodes[cur].sym;
+                if let Some(&id) = self.tok_to_id.get(sym) {
                     out.push(id);
                 } else {
                     // Fallback byte-by-byte
@@ -319,6 +438,7 @@ impl Tokenizer {
                         }
                     }
                 }
+                cur = nodes[cur].next;
             }
         }
     }
@@ -363,9 +483,11 @@ impl Tokenizer {
         let mut raw = Vec::new();
         for (i, &id) in ids.iter().enumerate() {
             let b = self.token_bytes(id);
-            if i == 0 && self.kind == VocabKind::Spm && self.add_space_prefix && b.starts_with(b" ") {
-                raw.extend_from_slice(&b[1..]);
-            } else if i == 1 && self.bos == Some(ids[0]) && self.kind == VocabKind::Spm && self.add_space_prefix && b.starts_with(b" ") {
+            let strip_lead = self.kind == VocabKind::Spm
+                && self.add_space_prefix
+                && b.starts_with(b" ")
+                && (i == 0 || (i == 1 && self.bos == Some(ids[0])));
+            if strip_lead {
                 raw.extend_from_slice(&b[1..]);
             } else {
                 raw.extend_from_slice(&b);

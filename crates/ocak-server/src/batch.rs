@@ -24,6 +24,12 @@ pub struct BatchCoordinator {
     running: AtomicBool,
 }
 
+impl Default for BatchCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BatchCoordinator {
     pub fn new() -> Self {
         Self {
@@ -187,7 +193,7 @@ impl BatchCoordinator {
                 match step_res {
                     Ok(done_flags) => {
                         for ((slot, (token_tx, done_tx)), is_done) in
-                            slots_tmp.into_iter().zip(metas.into_iter()).zip(done_flags.into_iter())
+                            slots_tmp.into_iter().zip(metas).zip(done_flags)
                         {
                             if is_done {
                                 let gr = active.engine.close_slot(slot);
@@ -203,7 +209,7 @@ impl BatchCoordinator {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        for (slot, (_tx, done_tx)) in slots_tmp.into_iter().zip(metas.into_iter()) {
+                        for (slot, (_tx, done_tx)) in slots_tmp.into_iter().zip(metas) {
                             let _ = active.engine.close_slot(slot);
                             let _ = done_tx.send(Err(msg.clone()));
                         }

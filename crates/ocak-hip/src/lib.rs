@@ -129,6 +129,9 @@ impl HipRuntime {
         }
     }
 
+    /// # Safety
+    /// Caller must ensure `func` is a valid HIP kernel function handle and `params`
+    /// points to valid kernel argument buffers matching the kernel signature.
     pub unsafe fn launch_kernel(
         &self,
         func: *mut c_void,

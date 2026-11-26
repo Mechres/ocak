@@ -107,7 +107,7 @@ impl StreamReasoningSplitter {
             let mut best: Option<(usize, &str)> = None;
             for &tag in TAGS {
                 if let Some(pos) = self.buf.find(tag) {
-                    if best.map_or(true, |(bp, _)| pos < bp) {
+                    if best.is_none_or(|(bp, _)| pos < bp) {
                         best = Some((pos, tag));
                     }
                 }

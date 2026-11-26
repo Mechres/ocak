@@ -102,7 +102,7 @@ struct Cur<'a> { b: &'a [u8], p: usize }
 
 impl<'a> Cur<'a> {
     fn take(&mut self, n: usize) -> R<&'a [u8]> {
-        if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
+        if self.p.checked_add(n).is_none_or(|e| e > self.b.len()) {
             return Err(GgufError::Bad("truncated".into()));
         }
         let s = &self.b[self.p..self.p + n];

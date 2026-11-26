@@ -89,11 +89,10 @@ impl JsonGrammar {
         if !self.stack.is_empty() {
             return false;
         }
-        match self.state {
-            State::AfterValue => true,
-            State::InNumber { need_digit: false, .. } => true,
-            _ => false,
-        }
+        matches!(
+            self.state,
+            State::AfterValue | State::InNumber { need_digit: false, .. }
+        )
     }
 
     pub fn feed_byte(&mut self, b: u8) -> bool {

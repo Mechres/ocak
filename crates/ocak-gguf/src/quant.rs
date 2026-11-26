@@ -115,7 +115,7 @@ impl GgmlType {
 
     pub fn row_bytes(self, n_elems: usize) -> Option<usize> {
         let (be, bb) = self.block()?;
-        if n_elems % be != 0 {
+        if !n_elems.is_multiple_of(be) {
             return None;
         }
         Some(n_elems / be * bb)

@@ -489,9 +489,9 @@ async fn security_middleware(
             } else {
                 None
             };
-            let ok = bearer.map_or(false, |k| ct_eq(k, expected))
-                || x_api.map_or(false, |k| ct_eq(k, expected))
-                || query_key.map_or(false, |k| ct_eq(k, expected));
+            let ok = bearer.is_some_and(|k| ct_eq(k, expected))
+                || x_api.is_some_and(|k| ct_eq(k, expected))
+                || query_key.is_some_and(|k| ct_eq(k, expected));
             if !ok {
                 return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
             }
@@ -1411,8 +1411,7 @@ mod tests {
         if !model_path.exists() {
             return;
         }
-        let mut cfg = ServerConfig::default();
-        cfg.sleep_idle_seconds = 2;
+        let cfg = ServerConfig { sleep_idle_seconds: 2, ..Default::default() };
         let state = AppState::new(cfg);
         state.spawn_watchdog();
         let app = build_router(state.clone());
@@ -1525,8 +1524,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.clone().oneshot(bad_origin).await.unwrap().status(), StatusCode::FORBIDDEN);
 
-        let mut auth_cfg = ServerConfig::default();
-        auth_cfg.api_key = Some("secret-test-key".into());
+        let auth_cfg = ServerConfig { api_key: Some("secret-test-key".into()), ..Default::default() };
         let auth_app = build_router(AppState::new(auth_cfg));
         let no_key = Request::builder().method("GET").uri("/v1/models").body(Body::empty()).unwrap();
         assert_eq!(auth_app.clone().oneshot(no_key).await.unwrap().status(), StatusCode::UNAUTHORIZED);

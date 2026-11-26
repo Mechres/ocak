@@ -356,7 +356,7 @@ impl VkContext {
                 let mut score = 0i32;
                 if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU { score += 100; }
                 if props.vendor_id == 0x1002 { score += 50; }
-                if best.as_ref().map_or(true, |b| score > b.5) {
+                if best.as_ref().is_none_or(|b| score > b.5) {
                     best = Some((pd, qf, name, sg.subgroup_size, vram, score));
                 }
             }
@@ -765,12 +765,9 @@ unsafe fn find_mem_type(
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
-    for i in 0..mp.memory_type_count {
-        if (type_bits & (1 << i)) != 0 && mp.memory_types[i as usize].property_flags.contains(flags) {
-            return Some(i);
-        }
-    }
-    None
+    (0..mp.memory_type_count).find(|&i| {
+        (type_bits & (1 << i)) != 0 && mp.memory_types[i as usize].property_flags.contains(flags)
+    })
 }
 
 unsafe fn alloc_raw_buffer(
@@ -956,8 +953,8 @@ impl<'a> Recorder<'a> {
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
         let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k)];
         let gx = match ty {
-            WType::IQ2XS => (m + 15) / 16,
-            _ => (m + 3) / 4,
+            WType::IQ2XS => m.div_ceil(16),
+            _ => m.div_ceil(4),
         };
         let (pipe, needs_iq) = match ty {
             WType::F32 => (&self.ctx.pipelines.qmv_f32, false),
@@ -995,11 +992,11 @@ impl<'a> Recorder<'a> {
             return;
         }
         let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), batch];
-        let gx = (m + 3) / 4;
+        let gx = m.div_ceil(4);
         if batch == 2 {
             match ty {
                 WType::IQ2XS => {
-                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), (m + 15) / 16, 1, 1);
+                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(16), 1, 1);
                     return;
                 }
                 WType::Q4K => {
@@ -1021,8 +1018,8 @@ impl<'a> Recorder<'a> {
                 }
             }
         }
-        let gy = (batch + 7) / 8;
-        let gx8 = (m + 7) / 8;
+        let gy = batch.div_ceil(8);
+        let gx8 = m.div_ceil(8);
         match ty {
             WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             WType::Q6K => self.dispatch_raw(&self.ctx.pipelines.qmm_q6_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
@@ -1061,12 +1058,12 @@ impl<'a> Recorder<'a> {
 
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {
         let pc = [off_u32(a_off), off_u32(b_off), n];
-        self.dispatch_raw(&self.ctx.pipelines.add, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add, &[a.buf, b.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn add_scaled(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32, scale: f32) {
         let pc = [off_u32(a_off), off_u32(b_off), n, scale.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.add_scaled, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled, &[a.buf, b.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn copy_buf_bytes(&mut self, src: &Buffer, dst: &Buffer, bytes: u64) {
@@ -1132,17 +1129,17 @@ impl<'a> Recorder<'a> {
 
     pub fn copy(&mut self, src: &Buffer, s_off: u64, dst: &Buffer, d_off: u64, n: u32) {
         let pc = [off_u32(s_off), off_u32(d_off), n];
-        self.dispatch_raw(&self.ctx.pipelines.copy, &[src.buf, dst.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.copy, &[src.buf, dst.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn swiglu(&mut self, gate: &Buffer, g_off: u64, up: &Buffer, u_off: u64, out: &Buffer, o_off: u64, n: u32) {
         let pc = [off_u32(g_off), off_u32(u_off), off_u32(o_off), n];
-        self.dispatch_raw(&self.ctx.pipelines.swiglu, &[gate.buf, up.buf, out.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.swiglu, &[gate.buf, up.buf, out.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn situ(&mut self, gu: &Buffer, gu_off: u64, out: &Buffer, o_off: u64, n_ff: u32, scale: f32, beta: f32, lin_beta: f32) {
         let pc = [off_u32(gu_off), off_u32(o_off), n_ff, scale.to_bits(), beta.to_bits(), lin_beta.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.situ, &[gu.buf, out.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.situ, &[gu.buf, out.buf], bytemuck::cast_slice(&pc), n_ff.div_ceil(256), 1, 1);
     }
 
     pub fn hc_sinkhorn(&mut self, mixes: &Buffer, params: &Buffer, out_hc: &Buffer, iters: u32, hc_eps: f32) {
@@ -1160,7 +1157,7 @@ impl<'a> Recorder<'a> {
 
     pub fn hc_mix_batch(&mut self, streams: &Buffer, blk: &Buffer, hc: &Buffer, out: &Buffer, ne: u32, mode: u32, batch: u32) {
         let pc = [ne, mode];
-        self.dispatch_raw(&self.ctx.pipelines.hc_mix, &[streams.buf, blk.buf, hc.buf, out.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, batch, 1);
+        self.dispatch_raw(&self.ctx.pipelines.hc_mix, &[streams.buf, blk.buf, hc.buf, out.buf], bytemuck::cast_slice(&pc), ne.div_ceil(256), batch, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1270,7 +1267,7 @@ impl<'a> Recorder<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn qmv_id_batch(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot_base: u32, count: u32, x: &Buffer, x_off: u64, x_stride: u32, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
         let pc = [slot_base, off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), off_u32(slice_bytes), x_stride];
-        let gx = (m + 3) / 4;
+        let gx = m.div_ceil(4);
         match ty {
             WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
@@ -1288,7 +1285,7 @@ impl<'a> Recorder<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn add_scaled_id_batch(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
         let pc = [off_u32(a_off), off_u32(b_off), n, slot_base, count, overwrite as u32];
-        self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn qmv_nvfp4_id(&mut self, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
@@ -1302,7 +1299,7 @@ impl<'a> Recorder<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn situ_id_batch(&mut self, gu: &Buffer, out: &Buffer, ids: &Buffer, scales: &Buffer, n_ff: u32, slot_base: u32, count: u32, beta: f32, lin_beta: f32) {
         let pc = [n_ff, slot_base, beta.to_bits(), lin_beta.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.situ_id, &[gu.buf, out.buf, ids.buf, scales.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, count, 1);
+        self.dispatch_raw(&self.ctx.pipelines.situ_id, &[gu.buf, out.buf, ids.buf, scales.buf], bytemuck::cast_slice(&pc), n_ff.div_ceil(256), count, 1);
     }
 
     pub fn add_scaled_exp_id(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot: u32) {
@@ -1312,7 +1309,7 @@ impl<'a> Recorder<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn add_scaled_exp_id_batch(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
         let pc = [n, slot_base, count, overwrite as u32];
-        self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn inkling_mix(&mut self, blocks: &Buffer, cur: &Buffer, query: &Buffer, out: &Buffer, ne: u32, blk_start: u32, n_blk: u32, n_q: u32) {
@@ -1322,12 +1319,12 @@ impl<'a> Recorder<'a> {
 
     pub fn inkling_ctrl(&mut self, cur: &Buffer, cur_off: u64, msg: &Buffer, msg_off: u64, gf: &Buffer, gf_off: u64, ne: u32) {
         let pc = [off_u32(cur_off), off_u32(msg_off), off_u32(gf_off), ne];
-        self.dispatch_raw(&self.ctx.pipelines.inkling_ctrl, &[cur.buf, msg.buf, gf.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.inkling_ctrl, &[cur.buf, msg.buf, gf.buf], bytemuck::cast_slice(&pc), ne.div_ceil(256), 1, 1);
     }
 
     pub fn inkling_conv(&mut self, inp: &Buffer, inp_off: u64, wt: &Buffer, dy: &Buffer, dy_off: u64, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32) {
         let pc = [off_u32(inp_off), off_u32(dy_off), off_u32(hist_off), off_u32(out_off), n_ch, n_conv, has_dyn as u32, head_ch];
-        self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), (n_ch + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), n_ch.div_ceil(256), 1, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1358,7 +1355,7 @@ impl<'a> Recorder<'a> {
 
     pub fn kv_write(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, pos: u32, kv_dim: u32) {
         let pc = [off_u32(k_off), off_u32(v_off), off_u32(layer_kv_off), off_u32(pt_off), pos, kv_dim];
-        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), ((kv_dim / 2) + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), (kv_dim / 2).div_ceil(256), 1, 1);
     }
 
     pub fn attention(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32) {
@@ -1371,7 +1368,7 @@ impl<'a> Recorder<'a> {
 
     pub fn embed(&mut self, ty: WType, table: &Buffer, token: u32, out: &Buffer, out_off: u64, k: u32) {
         let pc = [ty.ggml().id(), token, off_u32(out_off), k, ty.row_bytes(k)];
-        self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), (k + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.embed, &[table.buf, out.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), k.div_ceil(256), 1, 1);
     }
 
     pub fn rms_norm_heads(&mut self, x: &Buffer, x_off: u64, w: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
@@ -1385,7 +1382,7 @@ impl<'a> Recorder<'a> {
 
     pub fn shortconv_step_batch(&mut self, bcx: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, n_embd: u32, l_cache: u32, batch: u32) {
         let pc = [n_embd, l_cache, batch];
-        self.dispatch_raw(&self.ctx.pipelines.shortconv_step, &[bcx.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (n_embd + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.shortconv_step, &[bcx.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), n_embd.div_ceil(256), 1, 1);
     }
 
     pub fn ssm_conv_silu(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32) {
@@ -1394,7 +1391,7 @@ impl<'a> Recorder<'a> {
 
     pub fn ssm_conv_silu_batch(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32, batch: u32) {
         let pc = [channels, k_conv, batch];
-        self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (channels + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), channels.div_ceil(256), 1, 1);
     }
 
     pub fn deltanet_step(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32) {
@@ -1424,12 +1421,12 @@ impl<'a> Recorder<'a> {
     pub fn split_qg_batch(&mut self, qg: &Buffer, q: &Buffer, g: &Buffer, n_heads: u32, head_dim: u32, batch: u32) {
         let pc = [n_heads, head_dim];
         let total = n_heads * head_dim;
-        self.dispatch_raw(&self.ctx.pipelines.split_qg, &[qg.buf, q.buf, g.buf], bytemuck::cast_slice(&pc), (total + 255) / 256, batch, 1);
+        self.dispatch_raw(&self.ctx.pipelines.split_qg, &[qg.buf, q.buf, g.buf], bytemuck::cast_slice(&pc), total.div_ceil(256), batch, 1);
     }
 
     pub fn mul_sigmoid(&mut self, x: &Buffer, g: &Buffer, n: u32) {
         let pc = [n];
-        self.dispatch_raw(&self.ctx.pipelines.mul_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.mul_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
     }
 
     pub fn mul_head_sigmoid(&mut self, x: &Buffer, g: &Buffer, n_heads: u32, head_dim: u32) {
@@ -1438,7 +1435,7 @@ impl<'a> Recorder<'a> {
 
     pub fn mul_head_sigmoid_batch(&mut self, x: &Buffer, g: &Buffer, n_heads: u32, head_dim: u32, batch: u32) {
         let pc = [n_heads, head_dim];
-        self.dispatch_raw(&self.ctx.pipelines.mul_head_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n_heads * head_dim + 255) / 256, batch, 1);
+        self.dispatch_raw(&self.ctx.pipelines.mul_head_sigmoid, &[x.buf, g.buf], bytemuck::cast_slice(&pc), (n_heads * head_dim).div_ceil(256), batch, 1);
     }
 
     pub fn rope_ext(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, factors: &Buffer, use_factors: bool, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {

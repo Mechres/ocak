@@ -202,7 +202,7 @@ impl ModelConfig {
             arch,
         };
 
-        if cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && g.arch_f64("rope.scaling.factor").map_or(false, |f| (f - 1.0).abs() > 1e-6) {
+        if cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && g.arch_f64("rope.scaling.factor").is_some_and(|f| (f - 1.0).abs() > 1e-6) {
             return Err(EngineError::Unsupported("rope scaling".into()));
         }
 
@@ -212,16 +212,15 @@ impl ModelConfig {
                 // Skip MTP extra layers (blk.{n_layer}..)
                 if let Some(rest) = t.name.strip_prefix("blk.") {
                     if let Some((num, _)) = rest.split_once('.') {
-                        if num.parse::<usize>().map_or(false, |idx| idx >= n_layer) {
+                        if num.parse::<usize>().is_ok_and(|idx| idx >= n_layer) {
                             continue;
                         }
                     }
                 }
-                if t.name.starts_with("blk.") || t.name == "output.weight" || t.name == "token_embd.weight" {
-                    if !ocak_cpu::gemv::supported(t.ty) {
+                if (t.name.starts_with("blk.") || t.name == "output.weight" || t.name == "token_embd.weight")
+                    && !ocak_cpu::gemv::supported(t.ty) {
                         return Err(EngineError::Unsupported(format!("tensor {} has type {}", t.name, t.ty.name())));
                     }
-                }
             }
         }
         Ok(cfg)

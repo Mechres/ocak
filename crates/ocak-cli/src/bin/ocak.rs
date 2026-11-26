@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
         Cmd::Inspect { models_dir, extra_dir } => {
             let presets = Presets::load(&models_dir.join("models-preset.ini"));
             let entries = scan(&[models_dir, extra_dir]);
-            println!("{:<34} {:<10} {:>8} {:<14} {:<10} {}", "MODEL", "ARCH", "SIZE", "BACKEND", "SHA256", "QUANTS");
+            println!("{:<34} {:<10} {:>8} {:<14} {:<10} QUANTS", "MODEL", "ARCH", "SIZE", "BACKEND", "SHA256");
             for e in entries {
                 let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "qwen3vl" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") { "native-vk" } else { "bridge-llama" };
                 let sha = e.sha256.as_deref().map(|s| &s[..8]).unwrap_or("none");
@@ -330,7 +330,7 @@ async fn main() -> Result<()> {
                             }
                             println!("Tokens: {} | Requests: {} | Radix KV hits: {}",
                                 v["tokens_generated_total"], v["requests_total"], v["kv_radix_hits_total"]);
-                            println!("\n{:<34} {:<10} {:<14} {}", "MODEL", "ARCH", "ENGINE", "STATE");
+                            println!("\n{:<34} {:<10} {:<14} STATE", "MODEL", "ARCH", "ENGINE");
                             if let Some(ms) = v.get("models").and_then(|x| x.as_array()) {
                                 for m in ms {
                                     println!("{:<34} {:<10} {:<14} {}",

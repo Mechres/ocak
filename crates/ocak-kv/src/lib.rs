@@ -121,11 +121,10 @@ impl RadixPager {
                 continue;
             }
             let pm = &self.pages[node.page as usize];
-            if pm.refcount == 0 {
-                if victim.map_or(true, |(_, _, best_t)| pm.last_access < best_t) {
+            if pm.refcount == 0
+                && victim.is_none_or(|(_, _, best_t)| pm.last_access < best_t) {
                     victim = Some((nid, node.page, pm.last_access));
                 }
-            }
         }
         let (nid, pid, _) = victim?;
         self.unlink_leaf(nid);

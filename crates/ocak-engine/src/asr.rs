@@ -21,7 +21,7 @@ fn gelu_erf(x: f32) -> f32 {
     let sign = if z < 0.0 { -1.0 } else { 1.0 };
     let a = z.abs();
     let t = 1.0 / (1.0 + 0.3275911 * a);
-    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-a * a).exp();
+    let y = 1.0 - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t + 0.254_829_6) * t * (-a * a).exp();
     0.5 * x * (1.0 + sign * y)
 }
 
@@ -254,7 +254,7 @@ pub fn compute_qwen3a_mel_windows(samples: &[f32]) -> Vec<(Vec<f32>, usize)> {
     let mut off = 0usize;
     while off < n_eff {
         let win_eff = WINDOW.min(n_eff - off);
-        let n_chunks = (win_eff + CHUNK - 1) / CHUNK;
+        let n_chunks = win_eff.div_ceil(CHUNK);
         let n_pad = n_chunks * CHUNK;
         let mut data = vec![0f32; N_MEL * n_pad];
         for t in 0..win_eff {

@@ -27,7 +27,7 @@ fn quant_summary(g: &GgufFile) -> String {
             None => counts.push((n, 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     counts.iter().map(|(k, c)| format!("{k}x{c}")).collect::<Vec<_>>().join(",")
 }
 
@@ -67,7 +67,7 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<CatalogEntry> {
                 files.push(p);
             }
             for f in files {
-                if f.extension().map_or(false, |e| e == "gguf") {
+                if f.extension().is_some_and(|e| e == "gguf") {
                     if let Some(e) = describe(&f) {
                         out.push(e);
                     }

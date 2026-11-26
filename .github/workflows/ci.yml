@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan / glslang shader compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools libvulkan-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::type_complexity -D warnings
+
+      - name: Unit tests (CPU / non-GPU crates)
+        run: cargo test --workspace --exclude ocak-vk --exclude ocak-engine --exclude ocak-server

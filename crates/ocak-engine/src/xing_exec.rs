@@ -190,6 +190,7 @@ struct HcWeights {
     base: Vec<f32>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum XingFfn {
     Dense {
         gate: TensorInfo,
@@ -1190,7 +1191,7 @@ impl Executor for XingExec {
 
                     let mut wts: Vec<f32> = sel.iter().map(|&(idx, _)| probs[idx]).collect();
                     if c.exp_weights_norm {
-                        let sum = wts.iter().sum::<f32>().max(6.103515625e-5);
+                        let sum = wts.iter().sum::<f32>().max(6.103_515_6e-5);
                         for w in &mut wts { *w /= sum; }
                     }
                     if c.exp_weights_scale != 1.0 && c.exp_weights_scale != 0.0 {
