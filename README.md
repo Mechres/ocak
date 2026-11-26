@@ -62,12 +62,12 @@ Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak
 | `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GB | `1.000000` | `0.999584` | **19.9 tok/s** |
 | `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GB | — | greedy verified | **7.8 tok/s** |
 | `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + NextN MTP) | 9.14 GB | — | greedy + MTP 7/7 (100%) | **9.7 tok/s** |
-| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, 1-submit full-GPU VRAM+GTT) | 10.79 GB | — | greedy verified | **23.1 tok/s** |
-| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4`/`Q8_0` MoE, 1-submit full-GPU) | 16.42 GB | — | greedy verified | **12.3 tok/s** |
+| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, 1-submit batched 2D GPU VRAM+GTT) | 10.79 GB | — | greedy verified | **26.7 tok/s** |
+| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4`/`Q8_0` MoE, core-VRAM priority) | 16.42 GB | — | greedy verified | **17.5 tok/s** |
 | `Qwen3-ASR-1.7B` | `qwen3a` + `qwen3vl` (Native Audio) | 2.35 GB | — | end-to-end WAV verified | **1.49 s / clip** |
 
 - **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`).
-- **1-submit-per-token full-GPU MoE (`XingExec` & `InklingExec`)**: Zero per-layer CPU↔GPU fence waits — `Xing4.0-29B-A4B` reaches **23.1 tok/s** decode / **22.6 tok/s** prefill (13.6× over initial hybrid path), and `Inkling-2-Mini` reaches **12.3 tok/s** decode / **12.3 tok/s** prefill (12.3× over initial path).
+- **1-submit-per-token batched 2D full-GPU MoE (`XingExec` & `InklingExec`)**: Zero per-layer CPU↔GPU fence waits, 2D `top_k`-batched MoE dispatches, deferred parallel barriers, and 3×-looped-core VRAM priority — `Xing4.0-29B-A4B` reaches **26.7 tok/s** decode / **26.6 tok/s** prefill (15.7× over initial hybrid path), and `Inkling-2-Mini` reaches **17.5 tok/s** decode / **17.4 tok/s** prefill (17.5× over initial path, outpacing `llama.cpp` on the same 12 GiB RX 6700 XT).
 - **`WarmSleep` idle power check**: Active VRAM `1.79 GiB` -> `1.07 GiB` on teardown, RX 6700 XT power returns to **`29.0 W`** idle, automatic wake on next request in **`307 ms`**.
 - **Radix KV prefix cache**: Verified 100% prefix hit (`cache_n=48` on 48-token conversation prefix).
 

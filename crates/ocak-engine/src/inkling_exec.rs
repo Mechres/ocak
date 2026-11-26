@@ -137,8 +137,9 @@ struct InklingGpuState {
     in_norm_buf: Buffer,  // 3 * ne
     msgs_buf: Buffer,     // 4 * ne
     ctrl_cat: Buffer,     // 2 * ne
-    ctrl_gate: Buffer,    // rank
-    ctrl_gf: Buffer,      // 2 * ne
+    ctrl_gate: Buffer,    // 3 * rank
+    ctrl_gf: Buffer,      // 6 * ne
+    ctrl_rank: u32,
     proj_buf: Buffer,     // q + k + v + r + sinks + gate + k_dyn + v_dyn
     k_conv_buf: Buffer,   // kv_dim
     v_conv_buf: Buffer,   // kv_dim
@@ -148,8 +149,10 @@ struct InklingGpuState {
     router_logits: Buffer, // n_expert
     top_ids: Buffer,      // n_expert_used
     top_w: Buffer,        // n_expert_used
+    moe_gu: Buffer,       // n_expert_used * 2 * n_ff_exp
+    moe_mid: Buffer,      // n_expert_used * n_ff_exp
+    moe_tmp: Buffer,      // n_expert_used * ne
     moe_out: Buffer,      // ne
-    ffn_out: Buffer,      // ne
     hidden_buf: Buffer,   // ne
     logits_buf: Buffer,   // n_vocab_padded
     // Persistent slot states (KV + ShortConv histories)
@@ -478,7 +481,31 @@ impl InklingExec {
             let gu_scale = load_f32_vec(&g, &format!("blk.{i}.ffn_gate_up_exps.scale")).unwrap_or_else(|_| vec![1.0; n_expert]);
             let dn_scale = load_f32_vec(&g, &format!("blk.{i}.ffn_down_exps.scale")).unwrap_or_else(|_| vec![1.0; n_expert]);
 
-            let put_vram = i < gpu_moe_limit;
+            // Defer MoE expert GPU placement until after all non-MoE weights are placed so we can
+            // prioritize VRAM for the 3x-looped core (core_start..core_end) before prelude/postlude!
+            phys.push(PhysLayer {
+                is_swa, n_head, n_head_kv, n_extent,
+                wq, wk, wv, wo, wqkv_gate, attn_q_clip, attn_sink_proj,
+                attn_rel, attn_rel_bias, attn_rel_clip,
+                attn_k_conv, attn_v_conv, attn_post_conv, ffn_post_conv,
+                attn_norm, attn_q_inp_norm, attn_k_inp_norm, attn_v_inp_norm,
+                attn_k_conv_proj, attn_v_conv_proj,
+                attn_res_query, ffn_res_query, ffn_norm, ffn_gate_inp, exp_probs_b,
+                exps: MoEExps { gu_name, dn_name, gu_ty: t_gu.ty, dn_ty: t_dn.ty, gu_stride, dn_stride, gu_scale, dn_scale, gpu_gu: None, gpu_dn: None },
+            });
+        }
+
+        // Upload MoE experts with VRAM priority: 3x-looped core FIRST, then prelude & postlude!
+        let mut moe_order: Vec<usize> = Vec::with_capacity(n_phys);
+        for i in core_start..core_end { moe_order.push(i); }
+        for i in 0..core_start { moe_order.push(i); }
+        for i in core_end..n_phys { moe_order.push(i); }
+        let mut vram_moe_placed = 0usize;
+        for &i in &moe_order {
+            let ex = &mut phys[i].exps;
+            let t_gu = g.tensor(&ex.gu_name).unwrap();
+            let t_dn = g.tensor(&ex.dn_name).unwrap();
+            let put_vram = vram_moe_placed < gpu_moe_limit;
             let (gpu_gu, gpu_dn) = if let (Some(c), Ok(wt_gu), Ok(wt_dn)) = (vk.as_ref(), WType::from_ggml(t_gu.ty), WType::from_ggml(t_dn.ty)) {
                 if put_vram {
                     let b_gu = c.create_device_buffer(t_gu.n_bytes).ok();
@@ -486,6 +513,7 @@ impl InklingExec {
                     if let (Some(b_gu), Some(b_dn)) = (b_gu, b_dn) {
                         c.upload(&b_gu, 0, g.tensor_data(t_gu)).map_err(|e| EngineError::Backend(e.to_string()))?;
                         c.upload(&b_dn, 0, g.tensor_data(t_dn)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        vram_moe_placed += 1;
                         gpu_moe_count += 1;
                         (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                     } else if let (Ok(b_gu), Ok(b_dn)) = (c.create_gtt_buffer_from_slice(g.tensor_data(t_gu)), c.create_gtt_buffer_from_slice(g.tensor_data(t_dn))) {
@@ -506,17 +534,8 @@ impl InklingExec {
                 cpu_moe_count += 1;
                 (None, None)
             };
-
-            phys.push(PhysLayer {
-                is_swa, n_head, n_head_kv, n_extent,
-                wq, wk, wv, wo, wqkv_gate, attn_q_clip, attn_sink_proj,
-                attn_rel, attn_rel_bias, attn_rel_clip,
-                attn_k_conv, attn_v_conv, attn_post_conv, ffn_post_conv,
-                attn_norm, attn_q_inp_norm, attn_k_inp_norm, attn_v_inp_norm,
-                attn_k_conv_proj, attn_v_conv_proj,
-                attn_res_query, ffn_res_query, ffn_norm, ffn_gate_inp, exp_probs_b,
-                exps: MoEExps { gu_name, dn_name, gu_ty: t_gu.ty, dn_ty: t_dn.ty, gu_stride, dn_stride, gu_scale, dn_scale, gpu_gu, gpu_dn },
-            });
+            ex.gpu_gu = gpu_gu;
+            ex.gpu_dn = gpu_dn;
         }
 
         let mut loop_layers = Vec::with_capacity(core_end - core_start);
@@ -653,9 +672,10 @@ impl InklingExec {
                     inputs_buf: mk(3 * n_embd)?,
                     in_norm_buf: mk(3 * n_embd)?,
                     msgs_buf: mk(4 * n_embd)?,
-                    ctrl_cat: mk(2 * n_embd)?,
-                    ctrl_gate: mk(rank)?,
-                    ctrl_gf: mk(2 * n_embd)?,
+                    ctrl_cat: mk(6 * n_embd)?,
+                    ctrl_gate: mk(3 * rank)?,
+                    ctrl_gf: mk(6 * n_embd)?,
+                    ctrl_rank: rank as u32,
                     proj_buf: mk(n_embd * 8)?,
                     k_conv_buf: mk(kv_dim)?,
                     v_conv_buf: mk(kv_dim)?,
@@ -665,8 +685,10 @@ impl InklingExec {
                     router_logits: mk(n_expert)?,
                     top_ids: mk(n_expert_used)?,
                     top_w: mk(n_expert_used)?,
+                    moe_gu: mk(n_expert_used * 2 * n_ff_exp)?,
+                    moe_mid: mk(n_expert_used * n_ff_exp)?,
+                    moe_tmp: mk(n_expert_used * n_embd)?,
                     moe_out: mk(n_embd)?,
-                    ffn_out: mk(n_embd)?,
                     hidden_buf: mk(n_embd)?,
                     logits_buf: mk(n_vocab_padded)?,
                     k_cache: mk(total_kv_elems)?,
@@ -1058,60 +1080,71 @@ impl InklingExec {
         let kv_dim = gp.kv_dim as u32;
         let nh_hist = (self.n_conv - 1) as u32;
 
-        // Save inp_sa
+        // Save inp_sa + 1. Attention residual mix -> inputs_buf[3 * ne] (parallel!)
         rec.copy(&gp.cur, 0, &gp.inp_sa, 0, ne);
-
-        // 1. Attention residual mix -> inputs_buf[3 * ne]
         if let Some(ref rq) = gph.attn_res_query {
             let n_q = if p.is_swa { 1u32 } else { 3u32 };
-            rec.inkling_mix(&gp.blocks_norm, &gp.inp_sa, rq, &gp.inputs_buf, ne, 0, *blk_count, n_q);
+            rec.inkling_mix(&gp.blocks_norm, &gp.cur, rq, &gp.inputs_buf, ne, 0, *blk_count, n_q);
+            rec.barrier();
             if p.is_swa {
                 rec.copy(&gp.inputs_buf, 0, &gp.inputs_buf, ne as u64, ne);
                 rec.copy(&gp.inputs_buf, 0, &gp.inputs_buf, (2 * ne) as u64, ne);
+                rec.barrier();
             }
         } else {
             rec.copy(&gp.cur, 0, &gp.inputs_buf, 0, ne);
             rec.copy(&gp.cur, 0, &gp.inputs_buf, ne as u64, ne);
             rec.copy(&gp.cur, 0, &gp.inputs_buf, (2 * ne) as u64, ne);
+            rec.barrier();
         }
 
-        // 2. Cross-pass loop controllers for Q, K, V
+        // 2. Cross-pass loop controllers for Q, K, V (all 3 in parallel!)
         if let Some(li) = loop_idx {
             let gl = &gp.loops[li];
-            for j in 0..3 {
-                let off = (j as u32 * ne) as u64;
-                rec.rms_norm(&gp.inputs_buf, off, &gp.ones, 0, &gp.ctrl_cat, 0, ne, 1e-6);
-                rec.rms_norm(&gp.msgs_buf, off, &gp.ones, 0, &gp.ctrl_cat, ne as u64, ne, 1e-6);
-                let (ref bd, wtd, kd, md) = gl.ctrl_down[j];
-                let (ref bg, wtg, kg, mg) = gl.ctrl_gain[j];
-                let (ref bf, wtf, kf, mf) = gl.ctrl_forget[j];
-                rec.qmv(wtd, bd, 0, &gp.ctrl_cat, 0, &gp.ctrl_gate, 0, kd, md);
-                rec.qmv(wtg, bg, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, 0, kg, mg);
-                rec.qmv(wtf, bf, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, ne as u64, kf, mf);
-                rec.inkling_ctrl(&gp.inputs_buf, off, &gp.msgs_buf, off, &gp.ctrl_gf, 0, ne);
+            let rk = gp.ctrl_rank;
+            for j in 0..3u32 {
+                let off = (j * ne) as u64;
+                let coff = (j * 2 * ne) as u64;
+                rec.rms_norm(&gp.inputs_buf, off, &gp.ones, 0, &gp.ctrl_cat, coff, ne, 1e-6);
+                rec.rms_norm(&gp.msgs_buf, off, &gp.ones, 0, &gp.ctrl_cat, coff + ne as u64, ne, 1e-6);
             }
+            rec.barrier();
+            for j in 0..3u32 {
+                let (ref bd, wtd, kd, md) = gl.ctrl_down[j as usize];
+                rec.qmv(wtd, bd, 0, &gp.ctrl_cat, (j * 2 * ne) as u64, &gp.ctrl_gate, (j * rk) as u64, kd, md);
+            }
+            rec.barrier();
+            for j in 0..3u32 {
+                let (ref bg, wtg, kg, mg) = gl.ctrl_gain[j as usize];
+                let (ref bf, wtf, kf, mf) = gl.ctrl_forget[j as usize];
+                let goff = (j * rk) as u64;
+                let foff = (j * 2 * ne) as u64;
+                rec.qmv(wtg, bg, 0, &gp.ctrl_gate, goff, &gp.ctrl_gf, foff, kg, mg);
+                rec.qmv(wtf, bf, 0, &gp.ctrl_gate, goff, &gp.ctrl_gf, foff + ne as u64, kf, mf);
+            }
+            rec.barrier();
+            for j in 0..3u32 {
+                let off = (j * ne) as u64;
+                rec.inkling_ctrl(&gp.inputs_buf, off, &gp.msgs_buf, off, &gp.ctrl_gf, (j * 2 * ne) as u64, ne);
+            }
+            rec.barrier();
         }
 
-        // 3. Input RMSNorm -> in_norm_buf[3 * ne]
+        // 3. Input RMSNorm -> in_norm_buf[3 * ne] (all 3 in parallel!)
         if p.is_swa {
             let nw = gph.attn_norm.as_ref().unwrap();
-            if loop_idx.is_some() {
-                for j in 0..3 {
-                    let off = (j as u32 * ne) as u64;
-                    rec.rms_norm(&gp.inputs_buf, off, nw, 0, &gp.in_norm_buf, off, ne, self.eps);
-                }
-            } else {
-                rec.rms_norm(&gp.inputs_buf, 0, nw, 0, &gp.in_norm_buf, 0, ne, self.eps);
-                rec.copy(&gp.in_norm_buf, 0, &gp.in_norm_buf, ne as u64, ne);
-                rec.copy(&gp.in_norm_buf, 0, &gp.in_norm_buf, (2 * ne) as u64, ne);
+            for j in 0..3u32 {
+                let off = (j * ne) as u64;
+                rec.rms_norm(&gp.inputs_buf, off, nw, 0, &gp.in_norm_buf, off, ne, self.eps);
             }
         } else {
             rec.rms_norm(&gp.inputs_buf, 0, gph.attn_q_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, 0, ne, self.eps);
             rec.rms_norm(&gp.inputs_buf, ne as u64, gph.attn_k_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, ne as u64, ne, self.eps);
             rec.rms_norm(&gp.inputs_buf, (2 * ne) as u64, gph.attn_v_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, (2 * ne) as u64, ne, self.eps);
         }
+        rec.barrier();
 
-        // 4. Q, K, V, R, Sink, Gate (+ k_dyn, v_dyn) -> proj_buf
+        // 4. Q, K, V, R, Sink, Gate (+ k_dyn, v_dyn) -> proj_buf (all 6-8 in parallel!)
         let o_q = 0u64;
         let o_k = o_q + p.wq.m as u64;
         let o_v = o_k + p.wk.m as u64;
@@ -1142,12 +1175,14 @@ impl InklingExec {
             rec.qmv(*wtvd, bvd, 0, &gp.in_norm_buf, (2 * ne) as u64, &gp.proj_buf, o_vd, ne, vp.m as u32);
             has_dyn = true;
         }
+        rec.barrier();
 
-        // 5. ShortConv on K and V
+        // 5. ShortConv on K and V (both in parallel!)
         let kv_hist_off = (il as u32 * kv_dim * nh_hist) as u64;
         let (dy_buf, kd_off, vd_off) = if has_dyn { (&gp.proj_buf, o_kd, o_vd) } else { (&gp.dummy_dyn, 0, 0) };
         rec.inkling_conv(&gp.proj_buf, o_k, &gph.attn_k_conv, dy_buf, kd_off, &gp.k_hist, kv_hist_off, &gp.k_conv_buf, 0, kv_dim, self.n_conv as u32, has_dyn, hd);
         rec.inkling_conv(&gp.proj_buf, o_v, &gph.attn_v_conv, dy_buf, vd_off, &gp.v_hist, kv_hist_off, &gp.v_conv_buf, 0, kv_dim, self.n_conv as u32, has_dyn, hd);
+        rec.barrier();
 
         // 6. Attention (clip Q/K/R, norm V, KV store, relative bias + zero sink + sigmoid gate) -> attn_cat
         rec.inkling_attn(
@@ -1157,10 +1192,12 @@ impl InklingExec {
             p.n_head as u32, p.n_head_kv as u32, hd, self.n_rel as u32, p.n_extent as u32, self.n_swa as u32, p.is_swa,
             gp.slot_caps[il], pos as u32, gp.slot_kv_offsets[il], self.qk_clip, self.rel_clip, tau, self.eps,
         );
+        rec.barrier();
 
         // 7. wo + attn_post_conv -> cur
         let (bwo, wtwo) = p.wo.gpu.as_ref().unwrap();
         rec.qmv(*wtwo, bwo, 0, &gp.attn_cat, 0, &gp.o_proj, 0, p.wo.k as u32, ne);
+        rec.barrier();
         let post_hist_off = (il as u32 * ne * nh_hist) as u64;
         rec.inkling_conv(&gp.o_proj, 0, &gph.attn_post_conv, &gp.dummy_dyn, 0, &gp.attn_post_hist, post_hist_off, &gp.cur, 0, ne, self.n_conv as u32, false, 1);
 
@@ -1168,53 +1205,64 @@ impl InklingExec {
         if ip % self.block_size == 0 {
             rec.rms_norm(&gp.inp_sa, 0, &gp.ones, 0, &gp.blocks_norm, (*blk_count * ne) as u64, ne, 1e-6);
             *blk_count += 1;
+            rec.barrier();
         } else {
+            rec.barrier();
             rec.add(&gp.cur, 0, &gp.inp_sa, 0, ne);
+            rec.barrier();
         }
-        rec.copy(&gp.cur, 0, &gp.ffn_inp, 0, ne);
 
-        // 9. FFN mix + loop controller 3 + ffn_norm -> x_moe
-        rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gph.ffn_res_query, &gp.cur, ne, 0, *blk_count, 1);
+        // 9. Save ffn_inp + FFN mix (parallel into o_proj!) + loop controller 3 + ffn_norm -> x_moe
+        rec.copy(&gp.cur, 0, &gp.ffn_inp, 0, ne);
+        rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gph.ffn_res_query, &gp.o_proj, ne, 0, *blk_count, 1);
+        rec.barrier();
         if let Some(li) = loop_idx {
             let gl = &gp.loops[li];
             let off = (3 * ne) as u64;
-            rec.rms_norm(&gp.cur, 0, &gp.ones, 0, &gp.ctrl_cat, 0, ne, 1e-6);
+            rec.rms_norm(&gp.o_proj, 0, &gp.ones, 0, &gp.ctrl_cat, 0, ne, 1e-6);
             rec.rms_norm(&gp.msgs_buf, off, &gp.ones, 0, &gp.ctrl_cat, ne as u64, ne, 1e-6);
+            rec.barrier();
             let (ref bd, wtd, kd, md) = gl.ctrl_down[3];
             let (ref bg, wtg, kg, mg) = gl.ctrl_gain[3];
             let (ref bf, wtf, kf, mf) = gl.ctrl_forget[3];
             rec.qmv(wtd, bd, 0, &gp.ctrl_cat, 0, &gp.ctrl_gate, 0, kd, md);
+            rec.barrier();
             rec.qmv(wtg, bg, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, 0, kg, mg);
             rec.qmv(wtf, bf, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, ne as u64, kf, mf);
-            rec.inkling_ctrl(&gp.cur, 0, &gp.msgs_buf, off, &gp.ctrl_gf, 0, ne);
+            rec.barrier();
+            rec.inkling_ctrl(&gp.o_proj, 0, &gp.msgs_buf, off, &gp.ctrl_gf, 0, ne);
+            rec.barrier();
         }
-        rec.rms_norm(&gp.cur, 0, &gph.ffn_norm, 0, &gp.x_moe, 0, ne, self.eps);
+        rec.rms_norm(&gp.o_proj, 0, &gph.ffn_norm, 0, &gp.x_moe, 0, ne, self.eps);
+        rec.barrier();
 
-        // 10. 128-expert / 8-active NVFP4 MoE (100% GPU-indexed!)
+        // 10. 128-expert / 8-active batched 2D MoE (4 dispatches total!)
         let (bgi, wtgi) = p.ffn_gate_inp.gpu.as_ref().unwrap();
         rec.qmv(*wtgi, bgi, 0, &gp.x_moe, 0, &gp.router_logits, 0, ne, self.n_expert as u32);
+        rec.barrier();
         let (bias_b, has_b) = match &gph.exp_probs_b {
             Some(b) => (b, true),
             None => (&gp.dummy_bias, false),
         };
-        rec.moe_topk(&gp.router_logits, bias_b, &gp.top_ids, &gp.top_w, self.n_expert as u32, self.n_expert_used as u32, has_b, true, self.exp_w_scale);
-        rec.zero_buf(&gp.moe_out);
+        let n_used = self.n_expert_used as u32;
+        rec.moe_topk(&gp.router_logits, bias_b, &gp.top_ids, &gp.top_w, self.n_expert as u32, n_used, has_b, true, self.exp_w_scale);
+        rec.barrier();
         let (b_gu, wt_gu) = p.exps.gpu_gu.as_ref().unwrap();
         let (b_dn, wt_dn) = p.exps.gpu_dn.as_ref().unwrap();
-        let bgu_tmp = self.gpu_gu.as_ref().unwrap();
-        let bmid_tmp = self.gpu_mid.as_ref().unwrap();
-        let by_tmp = self.gpu_y.as_ref().unwrap();
-        for slot in 0..self.n_expert_used as u32 {
-            rec.qmv_id(*wt_gu, b_gu, &gp.top_ids, slot, &gp.x_moe, 0, bgu_tmp, 0, ne, (2 * self.n_ff_exp) as u32, p.exps.gu_stride as u64);
-            rec.situ_id(bgu_tmp, bmid_tmp, &gp.top_ids, &gph.gu_scale, self.n_ff_exp as u32, slot, self.situ_beta, self.situ_lin_beta);
-            rec.qmv_id(*wt_dn, b_dn, &gp.top_ids, slot, bmid_tmp, 0, by_tmp, 0, self.n_ff_exp as u32, ne, p.exps.dn_stride as u64);
-            rec.add_scaled_exp_id(&gp.moe_out, by_tmp, &gp.top_w, &gp.top_ids, &gph.dn_scale, ne, slot);
-        }
+        rec.qmv_id_batch(*wt_gu, b_gu, &gp.top_ids, 0, n_used, &gp.x_moe, 0, 0, &gp.moe_gu, 0, ne, (2 * self.n_ff_exp) as u32, p.exps.gu_stride as u64);
+        rec.barrier();
+        rec.situ_id_batch(&gp.moe_gu, &gp.moe_mid, &gp.top_ids, &gph.gu_scale, self.n_ff_exp as u32, 0, n_used, self.situ_beta, self.situ_lin_beta);
+        rec.barrier();
+        rec.qmv_id_batch(*wt_dn, b_dn, &gp.top_ids, 0, n_used, &gp.moe_mid, 0, self.n_ff_exp as u32, &gp.moe_tmp, 0, self.n_ff_exp as u32, ne, p.exps.dn_stride as u64);
+        rec.barrier();
+        rec.add_scaled_exp_id_batch(&gp.moe_out, &gp.moe_tmp, &gp.top_w, &gp.top_ids, &gph.dn_scale, ne, 0, n_used, true);
+        rec.barrier();
 
         // 11. FFN post ShortConv + residual add -> cur
-        rec.inkling_conv(&gp.moe_out, 0, &gph.ffn_post_conv, &gp.dummy_dyn, 0, &gp.ffn_post_hist, post_hist_off, &gp.ffn_out, 0, ne, self.n_conv as u32, false, 1);
-        rec.add(&gp.ffn_out, 0, &gp.ffn_inp, 0, ne);
-        rec.copy(&gp.ffn_out, 0, &gp.cur, 0, ne);
+        rec.inkling_conv(&gp.moe_out, 0, &gph.ffn_post_conv, &gp.dummy_dyn, 0, &gp.ffn_post_hist, post_hist_off, &gp.cur, 0, ne, self.n_conv as u32, false, 1);
+        rec.barrier();
+        rec.add(&gp.cur, 0, &gp.ffn_inp, 0, ne);
+        rec.barrier();
     }
 }
 
@@ -1261,7 +1309,9 @@ impl Executor for InklingExec {
             let ne = self.n_embd as u32;
             c.upload(&gp.cur, 0, bytemuck::cast_slice(&emb)).map_err(|e| EngineError::Backend(e.to_string()))?;
             let mut rec = c.begin();
+            rec.set_defer_barriers(true);
             rec.rms_norm(&gp.cur, 0, &gp.tok_norm, 0, &gp.cur, 0, ne, self.eps);
+            rec.barrier();
             let mut blk_count = 0u32;
 
             // Prelude: 0..core_start
@@ -1270,6 +1320,7 @@ impl Executor for InklingExec {
             }
             // Save prelude state
             rec.copy(&gp.cur, 0, &gp.prelude_cur, 0, ne);
+            rec.barrier();
             let prelude_blk_count = blk_count;
 
             // Looped core: n_passes over core_start..core_end
@@ -1282,7 +1333,9 @@ impl Executor for InklingExec {
                         rec.copy(&gp.blocks_norm, (bank_start * ne) as u64, &gp.bank_norm, 0, bank_count * ne);
                     }
                     rec.copy(&gp.cur, 0, &gp.bank_out, 0, ne);
+                    rec.barrier();
                     rec.copy(&gp.prelude_cur, 0, &gp.cur, 0, ne);
+                    rec.barrier();
                     blk_count = prelude_blk_count;
                 }
                 for ip in self.core_start..self.core_end {
@@ -1296,6 +1349,7 @@ impl Executor for InklingExec {
                     } else {
                         let li = ip - self.core_start;
                         rec.inkling_mix(&gp.bank_norm, &gp.bank_out, &gp.loops[li].msg_query, &gp.msgs_buf, ne, 0, bank_count, 4);
+                        rec.barrier();
                         self.record_layer_gpu(&mut rec, gp, il, ip, pos, tau, &mut blk_count, Some(li));
                     }
                 }
@@ -1308,12 +1362,15 @@ impl Executor for InklingExec {
 
             // Output mix + norm + lm_head
             if out.logits || out.hidden {
-                rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gp.output_res_query, &gp.cur, ne, 0, blk_count, 1);
-                rec.rms_norm(&gp.cur, 0, &gp.output_norm, 0, &gp.hidden_buf, 0, ne, self.eps);
+                rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gp.output_res_query, &gp.o_proj, ne, 0, blk_count, 1);
+                rec.barrier();
+                rec.rms_norm(&gp.o_proj, 0, &gp.output_norm, 0, &gp.hidden_buf, 0, ne, self.eps);
+                rec.barrier();
             }
             if out.logits {
                 let (bo, wto) = self.output_w.gpu.as_ref().unwrap();
                 rec.qmv(*wto, bo, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, ne, self.output_w.m as u32);
+                rec.barrier();
             }
             rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
             if out.hidden {

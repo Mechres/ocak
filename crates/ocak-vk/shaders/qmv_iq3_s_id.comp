@@ -7,15 +7,17 @@ layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
 layout(set = 0, binding = 4) readonly buffer Ids { uint ids[]; };
-layout(push_constant) uniform PC { uint slot; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint slice_bytes; } pc;
+layout(push_constant) uniform PC { uint slot; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint slice_bytes; uint x_stride; } pc;
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
     uint row = gl_WorkGroupID.x * 4u + ly;
+    uint s_idx = gl_WorkGroupID.y;
     float acc = 0.0;
     if (row < pc.m) {
-        uint exp_id = ids[pc.slot];
+        uint exp_id = ids[pc.slot + s_idx];
         uint rbase = exp_id * pc.slice_bytes + row * pc.row_bytes;
+        uint xbase = pc.x_off + s_idx * pc.x_stride;
         uint nsub = pc.k / 32u;
         for (uint sb = tid; sb < nsub; sb += 32u) {
             uint blk = sb >> 3;
@@ -27,7 +29,7 @@ void main() {
             uint qh = uint(w[b + 66u + ib32]);
             uint qs = b + 2u + ib32 * 8u;
             uint sg_off = b + 74u + ib32 * 4u;
-            uint xb = pc.x_off + sb * 32u;
+            uint xb = xbase + sb * 32u;
             for (uint l = 0u; l < 4u; l++) {
                 uint i1 = uint(w[qs + 2u * l]) | ((qh << (8u - 2u * l)) & 256u);
                 uint i2 = uint(w[qs + 2u * l + 1u]) | ((qh << (7u - 2u * l)) & 256u);
@@ -45,5 +47,5 @@ void main() {
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);
-    if (tid == 0u && row < pc.m) y[pc.y_off + row] = s_out;
+    if (tid == 0u && row < pc.m) y[pc.y_off + s_idx * pc.m + row] = s_out;
 }

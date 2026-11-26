@@ -13,10 +13,12 @@ layout(push_constant) uniform PC {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n_ff) return;
-    float sc = scales[ids[pc.slot]];
-    float g = gu[i] * sc;
-    float u = gu[pc.n_ff + i] * sc;
+    uint s_idx = gl_WorkGroupID.y;
+    float sc = scales[ids[pc.slot + s_idx]];
+    uint gu_base = s_idx * (2u * pc.n_ff);
+    float g = gu[gu_base + i] * sc;
+    float u = gu[gu_base + pc.n_ff + i] * sc;
     float act = pc.beta * tanh(g / pc.beta) * (1.0 / (1.0 + exp(-g)));
     float lin = (pc.lin_beta > 0.0) ? (pc.lin_beta * tanh(u / pc.lin_beta)) : u;
-    o[i] = act * lin;
+    o[s_idx * pc.n_ff + i] = act * lin;
 }

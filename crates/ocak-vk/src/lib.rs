@@ -380,13 +380,13 @@ impl VkContext {
                 rope_yarn_mla: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), 3, 48)?,
                 mla_attn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 4, 28)?,
                 moe_topk: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), 4, 20)?,
-                qmv_iq3_xxs_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 28)?,
-                qmv_iq3_s_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 28)?,
-                qmv_nvfp4_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 28)?,
-                qmv_q8_0_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 28)?,
+                qmv_iq3_xxs_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 32)?,
+                qmv_iq3_s_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 32)?,
+                qmv_nvfp4_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 32)?,
+                qmv_q8_0_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 32)?,
                 situ_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
-                add_scaled_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 16)?,
-                add_scaled_exp_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 8)?,
+                add_scaled_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 24)?,
+                add_scaled_exp_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 16)?,
                 inkling_mix: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 16)?,
                 inkling_ctrl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), 3, 16)?,
                 inkling_conv: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 32)?,
@@ -612,7 +612,7 @@ impl VkContext {
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             ).unwrap();
         }
-        Recorder { ctx: self, exec }
+        Recorder { ctx: self, exec, defer_barriers: false }
     }
 }
 
@@ -730,9 +730,31 @@ impl Drop for HostBuffer {
 pub struct Recorder<'a> {
     ctx: &'a VkContext,
     exec: std::sync::MutexGuard<'a, ExecState>,
+    defer_barriers: bool,
 }
 
 impl<'a> Recorder<'a> {
+    pub fn set_defer_barriers(&mut self, defer: bool) {
+        self.defer_barriers = defer;
+    }
+
+    pub fn barrier(&mut self) {
+        unsafe {
+            let bar = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(
+                self.exec.cmd_buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+        }
+    }
+
     fn dispatch_raw(
         &mut self,
         pipe: &PipelineBundle,
@@ -742,6 +764,7 @@ impl<'a> Recorder<'a> {
         gy: u32,
         gz: u32,
     ) {
+        debug_assert!(bufs.len() <= 16);
         unsafe {
             let layouts = [pipe.ds_layout];
             let ds = self.ctx.device.allocate_descriptor_sets(
@@ -749,22 +772,19 @@ impl<'a> Recorder<'a> {
                     .descriptor_pool(self.exec.desc_pool)
                     .set_layouts(&layouts),
             ).expect("descriptor set alloc")[0];
-            let infos: Vec<vk::DescriptorBufferInfo> = bufs
-                .iter()
-                .map(|&b| vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE))
-                .collect();
-            let writes: Vec<vk::WriteDescriptorSet> = infos
-                .iter()
-                .enumerate()
-                .map(|(i, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(ds)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(std::slice::from_ref(info))
-                })
-                .collect();
-            self.ctx.device.update_descriptor_sets(&writes, &[]);
+            let mut infos = [vk::DescriptorBufferInfo::default(); 16];
+            for (i, &b) in bufs.iter().enumerate() {
+                infos[i] = vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE);
+            }
+            let mut writes = [vk::WriteDescriptorSet::default(); 16];
+            for i in 0..bufs.len() {
+                writes[i] = vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&infos[i]));
+            }
+            self.ctx.device.update_descriptor_sets(&writes[..bufs.len()], &[]);
             self.ctx.device.cmd_bind_pipeline(self.exec.cmd_buf, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
             self.ctx.device.cmd_bind_descriptor_sets(
                 self.exec.cmd_buf,
@@ -782,18 +802,9 @@ impl<'a> Recorder<'a> {
                 pc,
             );
             self.ctx.device.cmd_dispatch(self.exec.cmd_buf, gx, gy, gz);
-            let bar = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-            self.ctx.device.cmd_pipeline_barrier(
-                self.exec.cmd_buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
-            );
+            if !self.defer_barriers {
+                self.barrier();
+            }
         }
     }
 
@@ -949,34 +960,53 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn qmv_id(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
-        let pc = [slot, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), slice_bytes as u32];
+        self.qmv_id_batch(ty, w, ids, slot, 1, x, x_off, 0, y, y_off, k, m, slice_bytes);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qmv_id_batch(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot_base: u32, count: u32, x: &Buffer, x_off: u64, x_stride: u32, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
+        let pc = [slot_base, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), slice_bytes as u32, x_stride];
         let gx = (m + 3) / 4;
         match ty {
-            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
-            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
-            WType::NVFP4 => self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
-            WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmv_q8_0_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
+            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
+            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
+            WType::NVFP4 => self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
+            WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmv_q8_0_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             _ => panic!("qmv_id: unsupported type {ty:?}"),
         }
     }
 
     pub fn add_scaled_id(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot: u32) {
-        let pc = [a_off as u32, b_off as u32, n, slot];
+        self.add_scaled_id_batch(a, a_off, b, b_off, weights, n, slot, 1, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_scaled_id_batch(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
+        let pc = [a_off as u32, b_off as u32, n, slot_base, count, overwrite as u32];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
     pub fn qmv_nvfp4_id(&mut self, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
-        let pc = [slot, x_off as u32, y_off as u32, k, m, WType::NVFP4.row_bytes(k), slice_bytes as u32];
-        self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), (m + 3) / 4, 1, 1);
+        self.qmv_id_batch(WType::NVFP4, w, ids, slot, 1, x, x_off, 0, y, y_off, k, m, slice_bytes);
     }
 
     pub fn situ_id(&mut self, gu: &Buffer, out: &Buffer, ids: &Buffer, scales: &Buffer, n_ff: u32, slot: u32, beta: f32, lin_beta: f32) {
-        let pc = [n_ff, slot, beta.to_bits(), lin_beta.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.situ_id, &[gu.buf, out.buf, ids.buf, scales.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
+        self.situ_id_batch(gu, out, ids, scales, n_ff, slot, 1, beta, lin_beta);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn situ_id_batch(&mut self, gu: &Buffer, out: &Buffer, ids: &Buffer, scales: &Buffer, n_ff: u32, slot_base: u32, count: u32, beta: f32, lin_beta: f32) {
+        let pc = [n_ff, slot_base, beta.to_bits(), lin_beta.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.situ_id, &[gu.buf, out.buf, ids.buf, scales.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, count, 1);
     }
 
     pub fn add_scaled_exp_id(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot: u32) {
-        let pc = [n, slot];
+        self.add_scaled_exp_id_batch(a, b, weights, ids, dn_scales, n, slot, 1, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_scaled_exp_id_batch(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
+        let pc = [n, slot_base, count, overwrite as u32];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
     }
 
