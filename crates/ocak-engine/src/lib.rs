@@ -1,4 +1,5 @@
 //! Native transformer engine: llama/qwen2 dense GGUF models on Vulkan or CPU.
+pub mod asr;
 pub mod config;
 pub mod cpu_exec;
 pub mod engine;

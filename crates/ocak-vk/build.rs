@@ -12,6 +12,7 @@ fn main() {
         "add_scaled",
         "copy",
         "swiglu",
+        "situ",
         "rope",
         "kv_write",
         "attention",

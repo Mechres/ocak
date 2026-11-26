@@ -384,4 +384,68 @@ impl NativeEngine {
 
         Ok(GenResult { text: full_text, tokens: gen_tokens, finish_reason: finish, timings })
     }
+
+    /// Runs multimodal greedy decode: `prefix_tokens` -> `embds` (audio/vision) -> `suffix_tokens` -> greedy decode.
+    pub fn generate_multimodal_greedy(
+        &mut self,
+        prefix_tokens: &[u32],
+        embds: &[Vec<f32>],
+        suffix_tokens: &[u32],
+        max_tokens: usize,
+    ) -> Result<String, EngineError> {
+        self.exec.reset_recurrent()?;
+        let total_in = prefix_tokens.len() + embds.len() + suffix_tokens.len();
+        if total_in >= self.max_ctx {
+            return Err(EngineError::Context(format!("multimodal prompt {total_in} >= max_ctx {}", self.max_ctx)));
+        }
+        let mut pages = Vec::new();
+        let ensure_page = |pager: &mut RadixPager, pages: &mut Vec<u32>, pos: usize| -> Result<(), EngineError> {
+            let need = pos / PAGE_TOKENS + 1;
+            while pages.len() < need {
+                pages.push(pager.alloc_page().ok_or(EngineError::KvExhausted)?);
+            }
+            Ok(())
+        };
+        let mut pos = 0usize;
+        for &tok in prefix_tokens {
+            ensure_page(&mut self.pager, &mut pages, pos)?;
+            self.exec.forward(tok, pos, &pages, Out { logits: false, hidden: false })?;
+            pos += 1;
+        }
+        for emb in embds {
+            ensure_page(&mut self.pager, &mut pages, pos)?;
+            self.exec.forward_embd(emb, pos, &pages, Out { logits: false, hidden: false })?;
+            pos += 1;
+        }
+        for (i, &tok) in suffix_tokens.iter().enumerate() {
+            ensure_page(&mut self.pager, &mut pages, pos)?;
+            let is_last = i + 1 == suffix_tokens.len();
+            self.exec.forward(tok, pos, &pages, Out { logits: is_last, hidden: false })?;
+            pos += 1;
+        }
+        let mut detok = IncrementalDetokenizer::new();
+        let mut text = String::new();
+        for step in 0..max_tokens {
+            let next_tok = self.exec.logits()
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if self.tokenizer.is_eog(next_tok) {
+                break;
+            }
+            let bytes = self.tokenizer.token_bytes(next_tok);
+            text.push_str(&detok.push(&bytes));
+            if step + 1 == max_tokens || pos >= self.max_ctx {
+                break;
+            }
+            ensure_page(&mut self.pager, &mut pages, pos)?;
+            self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: false })?;
+            pos += 1;
+        }
+        text.push_str(&detok.flush());
+        self.pager.release(&pages);
+        Ok(text)
+    }
 }

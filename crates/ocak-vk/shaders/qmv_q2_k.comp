@@ -1,11 +1,11 @@
 #version 460
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_8bit_storage : require
 layout(local_size_x = 32, local_size_y = 4) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
-shared float sdata[4][32];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
@@ -48,11 +48,6 @@ void main() {
             }
         }
     }
-    sdata[ly][tid] = acc;
-    barrier();
-    for (uint s = 16u; s > 0u; s >>= 1u) {
-        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
-        barrier();
-    }
-    if (tid == 0u && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+    float s_out = subgroupClusteredAdd(acc, 32u);
+    if (tid == 0u && row < pc.m) y[pc.y_off + row] = s_out;
 }

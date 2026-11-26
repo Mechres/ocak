@@ -56,6 +56,17 @@ enum Cmd {
         #[arg(long, default_value = "The capital of France is")]
         prompt: String,
     },
+    /// Transcribe a WAV file natively using Qwen3-ASR (qwen3a mmproj + qwen3vl Vulkan decoder)
+    Asr {
+        #[arg(long, default_value = "/home/mechres/models/Qwen3-ASR-1.7B/Qwen3-ASR-1.7B-Q8_0.gguf")]
+        model: PathBuf,
+        #[arg(long, default_value = "/home/mechres/models/Qwen3-ASR-1.7B/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf")]
+        mmproj: PathBuf,
+        #[arg(long)]
+        wav: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        max_tokens: usize,
+    },
     /// Zero-dependency ANSI live dashboard polling ocakd
     Top {
         #[arg(long, default_value = "127.0.0.1:8090")]
@@ -103,7 +114,7 @@ async fn main() -> Result<()> {
             let entries = scan(&[models_dir, extra_dir]);
             println!("{:<34} {:<10} {:>8} {:<14} {:<10} {}", "MODEL", "ARCH", "SIZE", "BACKEND", "SHA256", "QUANTS");
             for e in entries {
-                let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") { "native-vk" } else { "bridge-llama" };
+                let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "qwen3vl" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") { "native-vk" } else { "bridge-llama" };
                 let sha = e.sha256.as_deref().map(|s| &s[..8]).unwrap_or("none");
                 let has_p = if presets.models.contains_key(&e.id) { "*" } else { " " };
                 println!(
@@ -216,6 +227,16 @@ async fn main() -> Result<()> {
             println!("  Main trunk next token : {next1} ({:?})", eng.tokenizer.token_text(next1).unwrap_or("?"));
             println!("  MTP draft +2 token    : {draft2} ({:?})", eng.tokenizer.token_text(draft2).unwrap_or("?"));
             println!("  Main trunk +2 verify  : {true2} ({:?}) | match={}", eng.tokenizer.token_text(true2).unwrap_or("?"), draft2 == true2);
+        }
+        Cmd::Asr { model, mmproj, wav, max_tokens } => {
+            let t0 = std::time::Instant::now();
+            let mut asr = ocak_engine::asr::Qwen3AsrEngine::load(&model, &mmproj, true)?;
+            eprintln!("Loaded Qwen3-ASR native (qwen3a + {}) in {} ms", asr.decoder.backend_name(), t0.elapsed().as_millis());
+            let bytes = std::fs::read(&wav)?;
+            let t1 = std::time::Instant::now();
+            let text = asr.transcribe_wav(&bytes, max_tokens)?;
+            println!("{text}");
+            eprintln!("Transcribed {} bytes in {} ms", bytes.len(), t1.elapsed().as_millis());
         }
         Cmd::Top { addr } => {
             let clean = addr.trim_start_matches("http://").to_string();

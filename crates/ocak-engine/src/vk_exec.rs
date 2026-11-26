@@ -290,14 +290,32 @@ impl Executor for VkExec {
     }
 
     fn forward(&mut self, token: u32, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        self.forward_inner(Some(token), None, pos, page_table, out)
+    }
+
+    fn forward_embd(&mut self, embd: &[f32], pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        self.forward_inner(None, Some(embd), pos, page_table, out)
+    }
+
+    fn logits(&self) -> &[f32] { &self.logits }
+    fn hidden(&self) -> &[f32] { &self.hidden }
+}
+
+impl VkExec {
+    fn forward_inner(&mut self, token: Option<u32>, embd: Option<&[f32]>, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
         self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        if let Some(e) = embd {
+            self.ctx.upload(&self.x, 0, bytemuck::cast_slice(e)).map_err(|er| EngineError::Backend(er.to_string()))?;
+        }
 
         let c = &self.cfg;
         let mut rec = self.ctx.begin();
-        rec.embed(self.embd.ty, &self.embd.buf, token, &self.x, 0, c.n_embd as u32);
+        if let Some(tok) = token {
+            rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, 0, c.n_embd as u32);
+        }
 
         for l in &self.layers {
             rec.rms_norm(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
@@ -376,7 +394,4 @@ impl Executor for VkExec {
         }
         Ok(())
     }
-
-    fn logits(&self) -> &[f32] { &self.logits }
-    fn hidden(&self) -> &[f32] { &self.hidden }
 }

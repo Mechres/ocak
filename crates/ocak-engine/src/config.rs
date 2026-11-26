@@ -62,10 +62,13 @@ impl ModelConfig {
 
     pub fn from_gguf(g: &GgufFile) -> Result<Self, EngineError> {
         let arch = g.architecture().ok_or_else(|| EngineError::Unsupported("no architecture".into()))?.to_string();
-        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") {
+        if !matches!(arch.as_str(), "llama" | "qwen2" | "qwen3vl" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") {
             return Err(EngineError::Unsupported(format!(
-                "architecture '{arch}' (native engine supports llama, qwen2, lfm2, lfm3, qwen35, xing4_0, inkling2_loop)"
+                "architecture '{arch}' (native engine supports llama, qwen2, qwen3vl, lfm2, lfm3, qwen35, xing4_0, inkling2_loop)"
             )));
+        }
+        if arch == "qwen3vl" && g.arch_u64("n_deepstack_layers").unwrap_or(0) > 0 {
+            return Err(EngineError::Unsupported("qwen3vl with deepstack layers".into()));
         }
         let req = |s: &str| g.arch_u64(s).ok_or_else(|| EngineError::Unsupported(format!("missing {arch}.{s}")));
         let block_count = req("block_count")? as usize;

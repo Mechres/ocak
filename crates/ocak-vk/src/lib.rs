@@ -117,6 +117,7 @@ struct Pipelines {
     add_scaled: PipelineBundle,
     copy: PipelineBundle,
     swiglu: PipelineBundle,
+    situ: PipelineBundle,
     rope: PipelineBundle,
     kv_write: PipelineBundle,
     attention: PipelineBundle,
@@ -155,7 +156,7 @@ struct Pipelines {
 impl Pipelines {
     unsafe fn destroy(&self, dev: &Device) {
         for p in [
-            &self.rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.rope,
+            &self.rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.situ, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_bf16, &self.qmv_q8_0, &self.qmv_q4_0,
             &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k,
@@ -320,6 +321,7 @@ impl VkContext {
                 add_scaled: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
                 copy: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv")), 2, 12)?,
                 swiglu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/swiglu.spv")), 3, 16)?,
+                situ: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/situ.spv")), 2, 24)?,
                 rope: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
                 kv_write: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/kv_write.spv")), 4, 24)?,
                 attention: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 36)?,
@@ -450,6 +452,25 @@ impl VkContext {
             )?
         };
         Ok(Buffer { ctx: Arc::clone(self), buf, mem, size })
+    }
+
+    /// Allocates a GPU-readable GTT (`HOST_VISIBLE | HOST_COHERENT`) storage buffer and copies `data` directly
+    /// from host memory (no staging copy). Ideal for sparse MoE weights that spill beyond 12 GiB VRAM.
+    pub fn create_gtt_buffer_from_slice(self: &Arc<Self>, data: &[u8]) -> Result<Buffer, VkError> {
+        let size = (data.len() as u64).max(16);
+        unsafe {
+            let (buf, mem) = alloc_raw_buffer(
+                &self.device,
+                &self.mem_props,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            self.device.unmap_memory(mem);
+            Ok(Buffer { ctx: Arc::clone(self), buf, mem, size })
+        }
     }
 
     pub fn create_host_buffer(self: &Arc<Self>, bytes: u64) -> Result<HostBuffer, VkError> {
@@ -813,6 +834,11 @@ impl<'a> Recorder<'a> {
     pub fn swiglu(&mut self, gate: &Buffer, g_off: u64, up: &Buffer, u_off: u64, out: &Buffer, o_off: u64, n: u32) {
         let pc = [g_off as u32, u_off as u32, o_off as u32, n];
         self.dispatch_raw(&self.ctx.pipelines.swiglu, &[gate.buf, up.buf, out.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn situ(&mut self, gu: &Buffer, gu_off: u64, out: &Buffer, o_off: u64, n_ff: u32, scale: f32, beta: f32, lin_beta: f32) {
+        let pc = [gu_off as u32, o_off as u32, n_ff, scale.to_bits(), beta.to_bits(), lin_beta.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.situ, &[gu.buf, out.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
     }
 
     pub fn rope(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {

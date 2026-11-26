@@ -831,6 +831,30 @@ async fn audio_transcriptions(
     let Some(entry) = st.find_model("Qwen3-ASR-1.7B").cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "Qwen3-ASR-1.7B not found in model catalog" }))).into_response();
     };
+    // Native path: if a RIFF/WAVE payload is present (raw or inside multipart) and mmproj exists alongside the model, transcribe natively on Vulkan
+    if let Some(riff_pos) = body.windows(12).position(|w| &w[0..4] == b"RIFF" && &w[8..12] == b"WAVE") {
+        let wav_slice = &body[riff_pos..];
+        let mmproj_path = entry.path.parent().and_then(|dir| {
+            std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+                let p = e.path();
+                let n = p.file_name()?.to_str()?;
+                (n.starts_with("mmproj") && n.ends_with(".gguf")).then_some(p)
+            })
+        });
+        if let Some(mmproj) = mmproj_path {
+            let model_path = entry.path.clone();
+            let wav_owned = wav_slice.to_vec();
+            let res = tokio::task::spawn_blocking(move || {
+                let mut asr = ocak_engine::asr::Qwen3AsrEngine::load(&model_path, &mmproj, true)?;
+                asr.transcribe_wav(&wav_owned, 256)
+            })
+            .await;
+            if let Ok(Ok(raw)) = res {
+                let clean = raw.split("<asr_text>").nth(1).unwrap_or(&raw).trim().to_string();
+                return Json(json!({ "text": clean, "raw": raw, "backend": "native-vk-qwen3a" })).into_response();
+            }
+        }
+    }
     let ct = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())

@@ -382,9 +382,9 @@ impl InklingExec {
             let gu_scale = load_f32_vec(&g, &format!("blk.{i}.ffn_gate_up_exps.scale")).unwrap_or_else(|_| vec![1.0; n_expert]);
             let dn_scale = load_f32_vec(&g, &format!("blk.{i}.ffn_down_exps.scale")).unwrap_or_else(|_| vec![1.0; n_expert]);
 
-            let put_gpu = i < gpu_moe_limit;
-            let (gpu_gu, gpu_dn) = if put_gpu {
-                if let (Some(c), Ok(wt_gu), Ok(wt_dn)) = (vk.as_ref(), WType::from_ggml(t_gu.ty), WType::from_ggml(t_dn.ty)) {
+            let put_vram = i < gpu_moe_limit;
+            let (gpu_gu, gpu_dn) = if let (Some(c), Ok(wt_gu), Ok(wt_dn)) = (vk.as_ref(), WType::from_ggml(t_gu.ty), WType::from_ggml(t_dn.ty)) {
+                if put_vram {
                     let b_gu = c.create_device_buffer(t_gu.n_bytes).ok();
                     let b_dn = c.create_device_buffer(t_dn.n_bytes).ok();
                     if let (Some(b_gu), Some(b_dn)) = (b_gu, b_dn) {
@@ -392,10 +392,16 @@ impl InklingExec {
                         c.upload(&b_dn, 0, g.tensor_data(t_dn)).map_err(|e| EngineError::Backend(e.to_string()))?;
                         gpu_moe_count += 1;
                         (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
+                    } else if let (Ok(b_gu), Ok(b_dn)) = (c.create_gtt_buffer_from_slice(g.tensor_data(t_gu)), c.create_gtt_buffer_from_slice(g.tensor_data(t_dn))) {
+                        gpu_moe_count += 1;
+                        (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                     } else {
                         cpu_moe_count += 1;
                         (None, None)
                     }
+                } else if let (Ok(b_gu), Ok(b_dn)) = (c.create_gtt_buffer_from_slice(g.tensor_data(t_gu)), c.create_gtt_buffer_from_slice(g.tensor_data(t_dn))) {
+                    gpu_moe_count += 1;
+                    (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                 } else {
                     cpu_moe_count += 1;
                     (None, None)
@@ -452,10 +458,10 @@ impl InklingExec {
             });
         }
 
-        let max_dim = n_vocab_padded.max(n_embd * 4);
+        let max_dim = n_vocab_padded.max(n_embd * 8);
         let (gpu_x, gpu_y, gpu_gu, gpu_mid, gpu_sum) = if let Some(c) = &vk {
             (
-                Some(c.create_device_buffer((n_embd * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?),
+                Some(c.create_device_buffer((n_embd * 3 * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?),
                 Some(c.create_device_buffer((max_dim * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?),
                 Some(c.create_device_buffer((2 * n_ff_exp * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?),
                 Some(c.create_device_buffer((n_ff_exp * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?),
@@ -562,17 +568,81 @@ impl InklingExec {
             inputs[2] = rms_norm_weighted(&inputs[2], self.phys[ip].attn_v_inp_norm.as_ref().unwrap(), self.eps);
         }
 
-        // 4. Q, K, V, R, Sink, Gate projections + ShortConv on K, V
-        let mut q = self.matvec(&self.phys[ip].wq, &inputs[0])?;
-        let k_raw = self.matvec(&self.phys[ip].wk, &inputs[1])?;
-        let v_raw = self.matvec(&self.phys[ip].wv, &inputs[2])?;
-        let k_dyn = if let Some(ref p) = self.phys[ip].attn_k_conv_proj { Some(self.matvec(p, &inputs[1])?) } else { None };
-        let v_dyn = if let Some(ref p) = self.phys[ip].attn_v_conv_proj { Some(self.matvec(p, &inputs[2])?) } else { None };
+        // 4. Fused Q, K, V, R, Sink, Gate (+ dynamic conv) projections in ONE Vulkan submission
+        let (mut q, k_raw, v_raw, mut r, sinks, gate, k_dyn, v_dyn) = if let (Some(c), Some(bx), Some(by)) = (&self.vk, &self.gpu_x, &self.gpu_y) {
+            let p = &self.phys[ip];
+            if let (Some((bq, wtq)), Some((bk, wtk)), Some((bv, wtv)), Some((br, wtr)), Some((bs, wts)), Some((bg, wtg))) = (
+                &p.wq.gpu, &p.wk.gpu, &p.wv.gpu, &p.attn_rel.gpu, &p.attn_sink_proj.gpu, &p.wqkv_gate.gpu,
+            ) {
+                let mut x_pack = Vec::with_capacity(3 * self.n_embd);
+                x_pack.extend_from_slice(&inputs[0]);
+                x_pack.extend_from_slice(&inputs[1]);
+                x_pack.extend_from_slice(&inputs[2]);
+                c.upload(bx, 0, bytemuck::cast_slice(&x_pack)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                let o_q = 0u64;
+                let o_k = o_q + p.wq.m as u64;
+                let o_v = o_k + p.wk.m as u64;
+                let o_r = o_v + p.wv.m as u64;
+                let o_s = o_r + p.attn_rel.m as u64;
+                let o_g = o_s + p.attn_sink_proj.m as u64;
+                let o_kd = o_g + p.wqkv_gate.m as u64;
+                let mut total = o_kd;
+                let mut rec = c.begin();
+                let ne = self.n_embd as u32;
+                rec.qmv(*wtq, bq, 0, bx, 0, by, o_q, ne, p.wq.m as u32);
+                rec.qmv(*wtk, bk, 0, bx, ne as u64, by, o_k, ne, p.wk.m as u32);
+                rec.qmv(*wtv, bv, 0, bx, (2 * ne) as u64, by, o_v, ne, p.wv.m as u32);
+                rec.qmv(*wtr, br, 0, bx, 0, by, o_r, ne, p.attn_rel.m as u32);
+                rec.qmv(*wts, bs, 0, bx, 0, by, o_s, ne, p.attn_sink_proj.m as u32);
+                rec.qmv(*wtg, bg, 0, bx, 0, by, o_g, ne, p.wqkv_gate.m as u32);
+                let mut o_vd = o_kd;
+                if let (Some(kp), Some(vp)) = (&p.attn_k_conv_proj, &p.attn_v_conv_proj) {
+                    if let (Some((bkd, wtkd)), Some((bvd, wtvd))) = (&kp.gpu, &vp.gpu) {
+                        o_vd = o_kd + kp.m as u64;
+                        total = o_vd + vp.m as u64;
+                        rec.qmv(*wtkd, bkd, 0, bx, ne as u64, by, o_kd, ne, kp.m as u32);
+                        rec.qmv(*wtvd, bvd, 0, bx, (2 * ne) as u64, by, o_vd, ne, vp.m as u32);
+                    }
+                }
+                rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+                let mut y_pack = vec![0f32; total as usize];
+                c.download(by, 0, bytemuck::cast_slice_mut(&mut y_pack)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                let q = y_pack[o_q as usize..o_k as usize].to_vec();
+                let k_raw = y_pack[o_k as usize..o_v as usize].to_vec();
+                let v_raw = y_pack[o_v as usize..o_r as usize].to_vec();
+                let r = y_pack[o_r as usize..o_s as usize].to_vec();
+                let sinks = y_pack[o_s as usize..o_g as usize].to_vec();
+                let gate = y_pack[o_g as usize..o_kd as usize].to_vec();
+                let (k_dyn, v_dyn) = if total > o_kd {
+                    (Some(y_pack[o_kd as usize..o_vd as usize].to_vec()), Some(y_pack[o_vd as usize..total as usize].to_vec()))
+                } else {
+                    (None, None)
+                };
+                (q, k_raw, v_raw, r, sinks, gate, k_dyn, v_dyn)
+            } else {
+                let q = self.matvec(&self.phys[ip].wq, &inputs[0])?;
+                let k_raw = self.matvec(&self.phys[ip].wk, &inputs[1])?;
+                let v_raw = self.matvec(&self.phys[ip].wv, &inputs[2])?;
+                let k_dyn = if let Some(ref p) = self.phys[ip].attn_k_conv_proj { Some(self.matvec(p, &inputs[1])?) } else { None };
+                let v_dyn = if let Some(ref p) = self.phys[ip].attn_v_conv_proj { Some(self.matvec(p, &inputs[2])?) } else { None };
+                let r = self.matvec(&self.phys[ip].attn_rel, &inputs[0])?;
+                let sinks = self.matvec(&self.phys[ip].attn_sink_proj, &inputs[0])?;
+                let gate = self.matvec(&self.phys[ip].wqkv_gate, &inputs[0])?;
+                (q, k_raw, v_raw, r, sinks, gate, k_dyn, v_dyn)
+            }
+        } else {
+            let q = self.matvec(&self.phys[ip].wq, &inputs[0])?;
+            let k_raw = self.matvec(&self.phys[ip].wk, &inputs[1])?;
+            let v_raw = self.matvec(&self.phys[ip].wv, &inputs[2])?;
+            let k_dyn = if let Some(ref p) = self.phys[ip].attn_k_conv_proj { Some(self.matvec(p, &inputs[1])?) } else { None };
+            let v_dyn = if let Some(ref p) = self.phys[ip].attn_v_conv_proj { Some(self.matvec(p, &inputs[2])?) } else { None };
+            let r = self.matvec(&self.phys[ip].attn_rel, &inputs[0])?;
+            let sinks = self.matvec(&self.phys[ip].attn_sink_proj, &inputs[0])?;
+            let gate = self.matvec(&self.phys[ip].wqkv_gate, &inputs[0])?;
+            (q, k_raw, v_raw, r, sinks, gate, k_dyn, v_dyn)
+        };
         let mut k = convolve_step(&k_raw, &self.phys[ip].attn_k_conv, k_dyn.as_deref(), &mut self.slots[il].k_hist, self.n_conv);
         let mut v = convolve_step(&v_raw, &self.phys[ip].attn_v_conv, v_dyn.as_deref(), &mut self.slots[il].v_hist, self.n_conv);
-        let mut r = self.matvec(&self.phys[ip].attn_rel, &inputs[0])?;
-        let sinks = self.matvec(&self.phys[ip].attn_sink_proj, &inputs[0])?;
-        let gate = self.matvec(&self.phys[ip].wqkv_gate, &inputs[0])?;
 
         // 5. Clip Q, K, R; RMSNorm V; apply tau on full-attention layers
         clip_heads(&mut q, Some(&self.phys[ip].attn_q_clip), hd, n_head, self.qk_clip);
@@ -698,33 +768,18 @@ impl InklingExec {
         if let (Some(c), Some((b_gu, wt_gu)), Some((b_dn, wt_dn)), Some(bx), Some(bgu), Some(bmid), Some(by), Some(bsum)) = (
             &self.vk, &exps.gpu_gu, &exps.gpu_dn, &self.gpu_x, &self.gpu_gu, &self.gpu_mid, &self.gpu_y, &self.gpu_sum,
         ) {
+            // Single-command-buffer fused GPU MoE (all 8 active experts: NVFP4 gate_up -> SITU -> NVFP4 down -> add_scaled)
             c.upload(bx, 0, bytemuck::cast_slice(&x_moe)).map_err(|e| EngineError::Backend(e.to_string()))?;
-            let mut gu_cpu = vec![0f32; 2 * n_ff];
-            let mut mid_cpu = vec![0f32; n_ff];
-            let mut dn_cpu = vec![0f32; self.n_embd];
-            // Dispatch each active expert's NVFP4 gate_up & down on GPU (SITU in f32 on host)
+            let mut rec = c.begin();
+            rec.zero_buf(bsum);
             for &(e, ew) in &top_w {
-                let mut rec = c.begin();
                 rec.qmv(*wt_gu, b_gu, (e * exps.gu_stride) as u64, bx, 0, bgu, 0, self.n_embd as u32, (2 * n_ff) as u32);
-                rec.finish_and_wait().map_err(|er| EngineError::Backend(er.to_string()))?;
-                c.download(bgu, 0, bytemuck::cast_slice_mut(&mut gu_cpu)).map_err(|er| EngineError::Backend(er.to_string()))?;
-                let gs = exps.gu_scale[e];
-                for j in 0..n_ff {
-                    let g = gu_cpu[j] * gs;
-                    let u = gu_cpu[n_ff + j] * gs;
-                    let act = beta * (g / beta).tanh() * (1.0 / (1.0 + (-g).exp()));
-                    let lin = if lb > 0.0 { lb * (u / lb).tanh() } else { u };
-                    mid_cpu[j] = act * lin;
-                }
-                c.upload(bmid, 0, bytemuck::cast_slice(&mid_cpu)).map_err(|er| EngineError::Backend(er.to_string()))?;
-                let mut rec = c.begin();
+                rec.situ(bgu, 0, bmid, 0, n_ff as u32, exps.gu_scale[e], beta, lb);
                 rec.qmv(*wt_dn, b_dn, (e * exps.dn_stride) as u64, bmid, 0, by, 0, n_ff as u32, self.n_embd as u32);
-                rec.finish_and_wait().map_err(|er| EngineError::Backend(er.to_string()))?;
-                c.download(by, 0, bytemuck::cast_slice_mut(&mut dn_cpu)).map_err(|er| EngineError::Backend(er.to_string()))?;
-                let ds = ew * exps.dn_scale[e];
-                for j in 0..self.n_embd { moe_out[j] += ds * dn_cpu[j]; }
+                rec.add_scaled(bsum, 0, by, 0, self.n_embd as u32, ew * exps.dn_scale[e]);
             }
-            let _ = bsum;
+            rec.finish_and_wait().map_err(|er| EngineError::Backend(er.to_string()))?;
+            c.download(bsum, 0, bytemuck::cast_slice_mut(&mut moe_out)).map_err(|er| EngineError::Backend(er.to_string()))?;
         } else {
             let t_gu = self.gguf.tensor(&exps.gu_name).unwrap();
             let t_dn = self.gguf.tensor(&exps.dn_name).unwrap();

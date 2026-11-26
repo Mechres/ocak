@@ -1,0 +1,21 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer GU { float gu[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint gu_off;
+    uint o_off;
+    uint n_ff;
+    float scale;
+    float beta;
+    float lin_beta;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_ff) return;
+    float g = gu[pc.gu_off + i] * pc.scale;
+    float u = gu[pc.gu_off + pc.n_ff + i] * pc.scale;
+    float act = pc.beta * tanh(g / pc.beta) * (1.0 / (1.0 + exp(-g)));
+    float lin = (pc.lin_beta > 0.0) ? (pc.lin_beta * tanh(u / pc.lin_beta)) : u;
+    o[pc.o_off + i] = act * lin;
+}

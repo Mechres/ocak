@@ -112,6 +112,17 @@ fn try_upload_mat(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Option
     Some(VkMat { buf, ty, k, m, slice_bytes })
 }
 
+#[cfg(feature = "vulkan")]
+fn try_upload_mat_gtt(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Option<VkMat> {
+    let ty = WType::from_ggml(ti.ty).ok()?;
+    let raw = g.tensor_data(ti);
+    let buf = ctx.create_gtt_buffer_from_slice(raw).ok()?;
+    let k = ti.ne[0] as u32;
+    let m = ti.ne[1] as u32;
+    let slice_bytes = (ti.row_bytes() * m as usize) as u64;
+    Some(VkMat { buf, ty, k, m, slice_bytes })
+}
+
 struct HcWeights {
     fn_w: TensorInfo,
     scale: Vec<f32>,
@@ -280,19 +291,31 @@ impl XingExec {
                             try_upload_mat(c, &g, &up_shexp),
                             try_upload_mat(c, &g, &down_shexp),
                         );
-                        if place_on_gpu {
-                            let ex = (
+                        let ex = if place_on_gpu {
+                            let v = (
                                 try_upload_mat(c, &g, &gate_exps),
                                 try_upload_mat(c, &g, &up_exps),
                                 try_upload_mat(c, &g, &down_exps),
                             );
-                            if ex.0.is_some() && ex.1.is_some() && ex.2.is_some() {
-                                gpu_moe_placed += 1;
-                                (ex.0, ex.1, ex.2, sh.0, sh.1, sh.2)
+                            if v.0.is_some() && v.1.is_some() && v.2.is_some() {
+                                v
                             } else {
-                                cpu_moe_placed += 1;
-                                (None, None, None, sh.0, sh.1, sh.2)
+                                (
+                                    try_upload_mat_gtt(c, &g, &gate_exps),
+                                    try_upload_mat_gtt(c, &g, &up_exps),
+                                    try_upload_mat_gtt(c, &g, &down_exps),
+                                )
                             }
+                        } else {
+                            (
+                                try_upload_mat_gtt(c, &g, &gate_exps),
+                                try_upload_mat_gtt(c, &g, &up_exps),
+                                try_upload_mat_gtt(c, &g, &down_exps),
+                            )
+                        };
+                        if ex.0.is_some() && ex.1.is_some() && ex.2.is_some() {
+                            gpu_moe_placed += 1;
+                            (ex.0, ex.1, ex.2, sh.0, sh.1, sh.2)
                         } else {
                             cpu_moe_placed += 1;
                             (None, None, None, sh.0, sh.1, sh.2)

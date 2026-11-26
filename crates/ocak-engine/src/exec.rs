@@ -27,6 +27,10 @@ pub trait Executor: Send {
     }
     /// Processes `token` at position `pos`; `page_table[p]` maps logical page p to a physical page.
     fn forward(&mut self, token: u32, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError>;
+    /// Processes a precomputed input embedding vector (`[n_embd]`) at position `pos` (for multimodal audio/vision).
+    fn forward_embd(&mut self, _embd: &[f32], _pos: usize, _page_table: &[u32], _out: Out) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("forward_embd not implemented for this executor".into()))
+    }
     fn logits(&self) -> &[f32];
     /// Final-norm hidden state of the last forward (when requested).
     fn hidden(&self) -> &[f32];
