@@ -1,0 +1,45 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+layout(set = 0, binding = 4) readonly buffer Ids { uint ids[]; };
+layout(push_constant) uniform PC { uint slot; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint slice_bytes; } pc;
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint exp_id = ids[pc.slot];
+        uint rbase = exp_id * pc.slice_bytes + row * pc.row_bytes;
+        uint nsub = pc.k / 32u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 3;
+            uint ib32 = sb & 7u;
+            uint b = rbase + blk * 98u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1u]) << 8)).x;
+            uint so = b + 66u + ib32 * 4u;
+            uint aux32 = uint(w[so]) | (uint(w[so+1u]) << 8) | (uint(w[so+2u]) << 16) | (uint(w[so+3u]) << 24);
+            float db = d * (0.5 + float(aux32 >> 28)) * 0.5;
+            uint xb = pc.x_off + sb * 32u;
+            for (uint l = 0u; l < 4u; l++) {
+                uint signs = tbl[1792u + ((aux32 >> (7u * l)) & 127u)];
+                uint g1 = tbl[1024u + uint(w[b + 2u + ib32 * 8u + 2u * l])];
+                uint g2 = tbl[1024u + uint(w[b + 2u + ib32 * 8u + 2u * l + 1u])];
+                uint xo = xb + l * 8u;
+                float s = 0.0;
+                for (uint j = 0u; j < 4u; j++) {
+                    s += float((g1 >> (8u * j)) & 0xFFu) * (((signs & (1u << j)) != 0u) ? -1.0 : 1.0) * x[xo + j];
+                    s += float((g2 >> (8u * j)) & 0xFFu) * (((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0) * x[xo + j + 4u];
+                }
+                acc += db * s;
+            }
+        }
+    }
+    float s_out = subgroupClusteredAdd(acc, 32u);
+    if (tid == 0u && row < pc.m) y[pc.y_off + row] = s_out;
+}

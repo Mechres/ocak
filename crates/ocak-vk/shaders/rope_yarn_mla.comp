@@ -1,0 +1,56 @@
+#version 460
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) buffer QFull { float qf[]; };
+layout(set = 0, binding = 1) buffer KvRaw { float kvr[]; };
+layout(set = 0, binding = 2) writeonly buffer KvCache { float kvc[]; };
+layout(push_constant) uniform PC {
+    uint nh;
+    uint key_dim;
+    uint nope;
+    uint n_rot;
+    uint latent;
+    uint pos;
+    uint kv_layer_off;
+    float rope_base;
+    float factor;
+    float low;
+    float high;
+    float mscale;
+} pc;
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint i = gl_LocalInvocationID.x;
+    uint half_r = pc.n_rot / 2u;
+    if (wg <= pc.nh && i < half_r) {
+        float freq_inv = pow(pc.rope_base, -2.0 * float(i) / float(pc.n_rot));
+        float freq = freq_inv;
+        if (pc.factor > 1.0) {
+            float ramp = (abs(pc.high - pc.low) < 1e-6)
+                ? ((float(i) < pc.low) ? 0.0 : 1.0)
+                : clamp((float(i) - pc.low) / (pc.high - pc.low), 0.0, 1.0);
+            freq = freq_inv * ((1.0 - ramp) + ramp / pc.factor);
+        }
+        float ang = float(pc.pos) * freq;
+        float sc = cos(ang) * pc.mscale;
+        float ss = sin(ang) * pc.mscale;
+        if (wg < pc.nh) {
+            uint base = wg * pc.key_dim + pc.nope;
+            float x0 = qf[base + 2u * i];
+            float x1 = qf[base + 2u * i + 1u];
+            qf[base + 2u * i] = x0 * sc - x1 * ss;
+            qf[base + 2u * i + 1u] = x0 * ss + x1 * sc;
+        } else {
+            uint base = pc.latent;
+            float x0 = kvr[base + 2u * i];
+            float x1 = kvr[base + 2u * i + 1u];
+            float y0 = x0 * sc - x1 * ss;
+            float y1 = x0 * ss + x1 * sc;
+            kvr[base + 2u * i] = y0;
+            kvr[base + 2u * i + 1u] = y1;
+            uint hd = pc.latent + pc.n_rot;
+            uint dst = pc.kv_layer_off + pc.pos * hd + pc.latent;
+            kvc[dst + 2u * i] = y0;
+            kvc[dst + 2u * i + 1u] = y1;
+        }
+    }
+}

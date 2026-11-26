@@ -123,6 +123,57 @@ fn try_upload_mat_gtt(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Op
     Some(VkMat { buf, ty, k, m, slice_bytes })
 }
 
+#[cfg(feature = "vulkan")]
+fn upload_f32_buf(ctx: &Arc<VkContext>, data: &[f32]) -> Option<Buffer> {
+    let bytes = bytemuck::cast_slice(data);
+    let buf = ctx.create_device_buffer(bytes.len() as u64).ok()?;
+    ctx.upload(&buf, 0, bytes).ok()?;
+    Some(buf)
+}
+
+#[cfg(feature = "vulkan")]
+struct XingGpuLayer {
+    hc_attn_fn: VkMat,
+    hc_attn_params: Buffer,
+    hc_ffn_fn: VkMat,
+    hc_ffn_params: Buffer,
+    attn_norm: Buffer,
+    ffn_norm: Buffer,
+    q_a_norm: Buffer,
+    kv_a_norm: Buffer,
+    gate_inp: Option<VkMat>,
+    exp_probs_b: Option<Buffer>,
+}
+
+#[cfg(feature = "vulkan")]
+struct XingGpuState {
+    layers: Vec<XingGpuLayer>,
+    ones: Buffer,
+    streams_a: Buffer,
+    streams_b: Buffer,
+    streams_norm: Buffer,
+    hc_mixes: Buffer,
+    hc_out: Buffer,
+    inp: Buffer,
+    normed: Buffer,
+    block_out: Buffer,
+    q_a: Buffer,
+    q_an: Buffer,
+    kv_raw: Buffer,
+    q_full: Buffer,
+    q_lat: Buffer,
+    attn_lat: Buffer,
+    val_all: Buffer,
+    kv_cache: Buffer,
+    router_logits: Buffer,
+    top_ids: Buffer,
+    top_w: Buffer,
+    dummy_bias: Buffer,
+    out_norm: Buffer,
+    hidden_buf: Buffer,
+    logits_buf: Buffer,
+}
+
 struct HcWeights {
     fn_w: TensorInfo,
     scale: Vec<f32>,
@@ -216,6 +267,8 @@ pub struct XingExec {
     vk_acc: Option<Buffer>,
     #[cfg(feature = "vulkan")]
     vk_output: Option<VkMat>,
+    #[cfg(feature = "vulkan")]
+    gpu_pipe: Option<XingGpuState>,
     /// Compact MLA latent KV cache: [n_layer][max_ctx][kv_rank + n_rot]
     kv_cache: Vec<f32>,
     max_ctx: usize,
@@ -414,6 +467,84 @@ impl XingExec {
         };
 
         let hd = cfg.kv_rank + cfg.n_rot;
+        #[cfg(feature = "vulkan")]
+        let gpu_pipe = if cpu_moe_placed == 0 && vk_output.is_some() {
+            if let Some(c) = &vk {
+                let mut g_layers = Vec::with_capacity(cfg.n_layer);
+                let mut ok = true;
+                for l in &layers {
+                    let mut p_attn = Vec::with_capacity(27);
+                    p_attn.extend_from_slice(&l.hc_attn.scale);
+                    p_attn.extend_from_slice(&l.hc_attn.base);
+                    let mut p_ffn = Vec::with_capacity(27);
+                    p_ffn.extend_from_slice(&l.hc_ffn.scale);
+                    p_ffn.extend_from_slice(&l.hc_ffn.base);
+                    let (gate_inp, exp_probs_b) = match &l.ffn {
+                        XingFfn::Moe { gate_inp, exp_probs_b, .. } => (
+                            try_upload_mat(c, &g, gate_inp).or_else(|| try_upload_mat_gtt(c, &g, gate_inp)),
+                            exp_probs_b.as_ref().and_then(|b| upload_f32_buf(c, b)),
+                        ),
+                        XingFfn::Dense { .. } => (None, None),
+                    };
+                    if let (Some(haf), Some(hap), Some(hff), Some(hfp), Some(an), Some(fn_), Some(qan), Some(kvan)) = (
+                        try_upload_mat(c, &g, &l.hc_attn.fn_w).or_else(|| try_upload_mat_gtt(c, &g, &l.hc_attn.fn_w)),
+                        upload_f32_buf(c, &p_attn),
+                        try_upload_mat(c, &g, &l.hc_ffn.fn_w).or_else(|| try_upload_mat_gtt(c, &g, &l.hc_ffn.fn_w)),
+                        upload_f32_buf(c, &p_ffn),
+                        upload_f32_buf(c, &l.attn_norm),
+                        upload_f32_buf(c, &l.ffn_norm),
+                        upload_f32_buf(c, &l.q_a_norm),
+                        upload_f32_buf(c, &l.kv_a_norm),
+                    ) {
+                        g_layers.push(XingGpuLayer {
+                            hc_attn_fn: haf, hc_attn_params: hap,
+                            hc_ffn_fn: hff, hc_ffn_params: hfp,
+                            attn_norm: an, ffn_norm: fn_, q_a_norm: qan, kv_a_norm: kvan,
+                            gate_inp, exp_probs_b,
+                        });
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                let mk = |n: usize| c.create_device_buffer((n * 4) as u64).ok();
+                let ones_v = vec![1.0f32; 4 * cfg.n_embd];
+                let zero_b = vec![0.0f32; cfg.n_expert];
+                if ok {
+                    match (
+                        upload_f32_buf(c, &ones_v), mk(4 * cfg.n_embd), mk(4 * cfg.n_embd), mk(4 * cfg.n_embd),
+                        mk(24), mk(24), mk(cfg.n_embd), mk(cfg.n_embd), mk(cfg.n_embd),
+                        mk(cfg.q_rank), mk(cfg.q_rank), mk(hd),
+                        mk(cfg.n_head * cfg.key_dim), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.value_dim),
+                        mk(cfg.n_layer * max_ctx * hd),
+                        mk(cfg.n_expert), mk(cfg.n_used), mk(cfg.n_used), upload_f32_buf(c, &zero_b),
+                        upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab),
+                    ) {
+                        (
+                            Some(ones), Some(streams_a), Some(streams_b), Some(streams_norm),
+                            Some(hc_mixes), Some(hc_out), Some(inp), Some(normed), Some(block_out),
+                            Some(q_a), Some(q_an), Some(kv_raw),
+                            Some(q_full), Some(q_lat), Some(attn_lat), Some(val_all),
+                            Some(kv_cache),
+                            Some(router_logits), Some(top_ids), Some(top_w), Some(dummy_bias),
+                            Some(out_norm_b), Some(hidden_buf), Some(logits_buf),
+                        ) => Some(XingGpuState {
+                            layers: g_layers, ones, streams_a, streams_b, streams_norm, hc_mixes, hc_out,
+                            inp, normed, block_out, q_a, q_an, kv_raw, q_full, q_lat, attn_lat, val_all,
+                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf,
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             kv_cache: vec![0f32; cfg.n_layer * max_ctx * hd],
             max_ctx,
@@ -441,6 +572,8 @@ impl XingExec {
             vk_acc,
             #[cfg(feature = "vulkan")]
             vk_output,
+            #[cfg(feature = "vulkan")]
+            gpu_pipe,
             cfg,
             g,
         })
@@ -596,6 +729,135 @@ impl Executor for XingExec {
         let mut streams = vec![0f32; 4 * ne];
         for h in 0..4 {
             streams[h * ne..(h + 1) * ne].copy_from_slice(&emb);
+        }
+
+        // Fast path: ENTIRE 40-layer forward pass in ONE SINGLE Vulkan vkQueueSubmit!
+        #[cfg(feature = "vulkan")]
+        if let (Some(c_vk), Some(gp), Some(bg), Some(bu), Some(ba), Some(bacc), Some(vout)) = (
+            &self.vk, &self.gpu_pipe, &self.vk_g, &self.vk_u, &self.vk_a, &self.vk_acc, &self.vk_output,
+        ) {
+            c_vk.upload(&gp.streams_a, 0, bytemuck::cast_slice(&streams)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let corr_dim = |n_r: f32| -> f32 {
+                (n_rot as f32 * (c.rope_orig_ctx as f32 / (n_r * 2.0 * std::f32::consts::PI)).ln())
+                    / (2.0 * c.rope_base.ln())
+            };
+            let low = corr_dim(c.yarn_beta_fast).floor().max(0.0);
+            let high = corr_dim(c.yarn_beta_slow).ceil().min((n_rot - 1) as f32);
+            let attn_factor = if yarn { 1.0 / (1.0 + 0.1 * c.rope_factor.ln()) } else { 1.0 };
+            let rope_mscale = if yarn { (1.0 + 0.1 * c.rope_factor.ln()) * attn_factor } else { 1.0 };
+
+            let mut rec = c_vk.begin();
+            let mut cur_a = true; // true -> streams_a is active, false -> streams_b is active
+            for li in 0..c.n_layer {
+                let l = &self.layers[li];
+                let gl = &gp.layers[li];
+                let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+
+                // 1. HC pre (attn)
+                rec.rms_norm(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps);
+                rec.qmv(gl.hc_attn_fn.ty, &gl.hc_attn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_attn_fn.k, gl.hc_attn_fn.m);
+                rec.hc_sinkhorn(&gp.hc_mixes, &gl.hc_attn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps);
+                rec.hc_mix(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0);
+
+                // 2. MLA Attention (100% GPU)
+                rec.rms_norm(&gp.inp, 0, &gl.attn_norm, 0, &gp.normed, 0, ne as u32, c.eps);
+                let va = l.vk_wq_a.as_ref().unwrap();
+                let vkva = l.vk_wkv_a.as_ref().unwrap();
+                let vqb = l.vk_wq_b.as_ref().unwrap();
+                let vkb = l.vk_wk_b.as_ref().unwrap();
+                let vvb = l.vk_wv_b.as_ref().unwrap();
+                let vwo = l.vk_wo.as_ref().unwrap();
+                rec.qmv(va.ty, &va.buf, 0, &gp.normed, 0, &gp.q_a, 0, va.k, va.m);
+                rec.qmv(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m);
+                rec.rms_norm(&gp.q_a, 0, &gl.q_a_norm, 0, &gp.q_an, 0, c.q_rank as u32, c.eps);
+                let kv_layer_off = (li * self.max_ctx * hd) as u32;
+                let kv_dst_off = (kv_layer_off as usize + pos * hd) as u64;
+                rec.rms_norm(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_cache, kv_dst_off, latent as u32, c.eps);
+                rec.qmv(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m);
+                rec.rope_yarn_mla(
+                    &gp.q_full, &gp.kv_raw, &gp.kv_cache,
+                    nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                    pos as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale,
+                );
+                for h in 0..nh {
+                    rec.qmv(vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes, &gp.q_full, (h * c.key_dim) as u64, &gp.q_lat, (h * latent) as u64, vkb.k, vkb.m);
+                }
+                rec.mla_attn(
+                    &gp.q_lat, &gp.q_full, &gp.kv_cache, &gp.attn_lat,
+                    nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                    pos as u32, kv_layer_off, kq_scale,
+                );
+                for h in 0..nh {
+                    rec.qmv(vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes, &gp.attn_lat, (h * latent) as u64, &gp.val_all, (h * vdim) as u64, vvb.k, vvb.m);
+                }
+                rec.qmv(vwo.ty, &vwo.buf, 0, &gp.val_all, 0, &gp.block_out, 0, vwo.k, vwo.m);
+                rec.hc_mix(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1);
+                cur_a = !cur_a;
+
+                // 3. HC pre (FFN)
+                let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+                rec.rms_norm(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps);
+                rec.qmv(gl.hc_ffn_fn.ty, &gl.hc_ffn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_ffn_fn.k, gl.hc_ffn_fn.m);
+                rec.hc_sinkhorn(&gp.hc_mixes, &gl.hc_ffn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps);
+                rec.hc_mix(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0);
+                rec.rms_norm(&gp.inp, 0, &gl.ffn_norm, 0, &gp.normed, 0, ne as u32, c.eps);
+
+                // 4. Dense or MoE FFN (100% GPU with GPU-indexed experts!)
+                match &l.ffn {
+                    XingFfn::Dense { vk_gate, vk_up, vk_down, .. } => {
+                        let (vg, vu, vd) = (vk_gate.as_ref().unwrap(), vk_up.as_ref().unwrap(), vk_down.as_ref().unwrap());
+                        rec.qmv(vg.ty, &vg.buf, 0, &gp.normed, 0, bg, 0, vg.k, vg.m);
+                        rec.qmv(vu.ty, &vu.buf, 0, &gp.normed, 0, bu, 0, vu.k, vu.m);
+                        rec.swiglu(bg, 0, bu, 0, ba, 0, c.n_ff_dense as u32);
+                        rec.qmv(vd.ty, &vd.buf, 0, ba, 0, &gp.block_out, 0, vd.k, vd.m);
+                    }
+                    XingFfn::Moe { vk_gate_exps, vk_up_exps, vk_down_exps, vk_gate_sh, vk_up_sh, vk_down_sh, .. } => {
+                        let vgi = gl.gate_inp.as_ref().unwrap();
+                        rec.qmv(vgi.ty, &vgi.buf, 0, &gp.normed, 0, &gp.router_logits, 0, vgi.k, vgi.m);
+                        let (bias_buf, has_bias) = match &gl.exp_probs_b {
+                            Some(b) => (b, true),
+                            None => (&gp.dummy_bias, false),
+                        };
+                        rec.moe_topk(&gp.router_logits, bias_buf, &gp.top_ids, &gp.top_w, c.n_expert as u32, c.n_used as u32, has_bias, c.exp_weights_norm, c.exp_weights_scale);
+                        rec.zero_buf(bacc);
+                        let (vg, vu, vd) = (vk_gate_exps.as_ref().unwrap(), vk_up_exps.as_ref().unwrap(), vk_down_exps.as_ref().unwrap());
+                        for slot in 0..c.n_used as u32 {
+                            rec.qmv_id(vg.ty, &vg.buf, &gp.top_ids, slot, &gp.normed, 0, bg, 0, vg.k, vg.m, vg.slice_bytes);
+                            rec.qmv_id(vu.ty, &vu.buf, &gp.top_ids, slot, &gp.normed, 0, bu, 0, vu.k, vu.m, vu.slice_bytes);
+                            rec.swiglu(bg, 0, bu, 0, ba, 0, c.n_ff_exp as u32);
+                            rec.qmv_id(vd.ty, &vd.buf, &gp.top_ids, slot, ba, 0, &gp.block_out, 0, vd.k, vd.m, vd.slice_bytes);
+                            rec.add_scaled_id(bacc, 0, &gp.block_out, 0, &gp.top_w, ne as u32, slot);
+                        }
+                        let (vgs, vus, vds) = (vk_gate_sh.as_ref().unwrap(), vk_up_sh.as_ref().unwrap(), vk_down_sh.as_ref().unwrap());
+                        rec.qmv(vgs.ty, &vgs.buf, 0, &gp.normed, 0, bg, 0, vgs.k, vgs.m);
+                        rec.qmv(vus.ty, &vus.buf, 0, &gp.normed, 0, bu, 0, vus.k, vus.m);
+                        rec.swiglu(bg, 0, bu, 0, ba, 0, c.n_ff_exp as u32);
+                        rec.qmv(vds.ty, &vds.buf, 0, ba, 0, &gp.block_out, 0, vds.k, vds.m);
+                        rec.add(bacc, 0, &gp.block_out, 0, ne as u32);
+                        rec.copy(bacc, 0, &gp.block_out, 0, ne as u32);
+                    }
+                }
+                rec.hc_mix(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1);
+                cur_a = !cur_a;
+            }
+
+            // Final collapse + output_norm + lm_head
+            let st_final = if cur_a { &gp.streams_a } else { &gp.streams_b };
+            if out.logits || out.hidden {
+                rec.hc_mix(st_final, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 2);
+                rec.rms_norm(&gp.inp, 0, &gp.out_norm, 0, &gp.hidden_buf, 0, ne as u32, c.eps);
+            }
+            if out.logits {
+                rec.qmv(vout.ty, &vout.buf, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, vout.k, vout.m);
+            }
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            if out.hidden {
+                c_vk.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
+            if out.logits {
+                c_vk.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
+            return Ok(());
         }
 
         let mut normed = vec![0f32; ne];

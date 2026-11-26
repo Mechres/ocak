@@ -1,0 +1,70 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Blocks { float blk[]; }; // [n_blocks * ne] (already rms_normed!)
+layout(set = 0, binding = 1) readonly buffer Cur { float cur[]; };    // [ne] (raw, we norm it here)
+layout(set = 0, binding = 2) readonly buffer Query { float q[]; };    // [n_q * ne]
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };     // [n_q * ne]
+layout(push_constant) uniform PC { uint ne; uint blk_start; uint n_blk; uint n_q; } pc;
+shared float sbuf[256];
+shared float cur_norm[4096];
+shared float sc[32];
+void main() {
+    uint q_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    // 1. RMSNorm(cur, 1e-6) into cur_norm
+    float ss = 0.0;
+    for (uint i = tid; i < pc.ne; i += 256u) {
+        float v = cur[i];
+        ss += v * v;
+    }
+    sbuf[tid] = ss;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sbuf[tid] += sbuf[tid + s];
+        barrier();
+    }
+    float inv_rms = inversesqrt(sbuf[0] / float(pc.ne) + 1e-6);
+    barrier();
+    for (uint i = tid; i < pc.ne; i += 256u) cur_norm[i] = cur[i] * inv_rms;
+    barrier();
+
+    // 2. Compute dot scores with blocks[blk_start..blk_start+n_blk] and cur_norm
+    uint n_st = pc.n_blk + 1u;
+    float inv_sqrt = inversesqrt(float(pc.ne));
+    uint q_base = q_idx * pc.ne;
+    for (uint st = 0u; st < n_st; st++) {
+        float dot = 0.0;
+        if (st < pc.n_blk) {
+            uint b_base = (pc.blk_start + st) * pc.ne;
+            for (uint i = tid; i < pc.ne; i += 256u) dot += blk[b_base + i] * q[q_base + i];
+        } else {
+            for (uint i = tid; i < pc.ne; i += 256u) dot += cur_norm[i] * q[q_base + i];
+        }
+        sbuf[tid] = dot;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) sbuf[tid] += sbuf[tid + s];
+            barrier();
+        }
+        if (tid == 0u) sc[st] = sbuf[0] * inv_sqrt;
+        barrier();
+    }
+    // 3. Softmax over sc[0..n_st]
+    if (tid == 0u) {
+        float mx = -1e30;
+        for (uint st = 0u; st < n_st; st++) mx = max(mx, sc[st]);
+        float sum = 0.0;
+        for (uint st = 0u; st < n_st; st++) { sc[st] = exp(sc[st] - mx); sum += sc[st]; }
+        float inv = 1.0 / sum;
+        for (uint st = 0u; st < n_st; st++) sc[st] *= inv;
+    }
+    barrier();
+    // 4. Weighted sum
+    for (uint i = tid; i < pc.ne; i += 256u) {
+        float acc = sc[pc.n_blk] * cur_norm[i];
+        for (uint st = 0u; st < pc.n_blk; st++) {
+            acc += sc[st] * blk[(pc.blk_start + st) * pc.ne + i];
+        }
+        o[q_base + i] = acc;
+    }
+}

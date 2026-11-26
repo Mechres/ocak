@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer GU { float gu[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 2) readonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 3) readonly buffer Scales { float scales[]; };
+layout(push_constant) uniform PC {
+    uint n_ff;
+    uint slot;
+    float beta;
+    float lin_beta;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_ff) return;
+    float sc = scales[ids[pc.slot]];
+    float g = gu[i] * sc;
+    float u = gu[pc.n_ff + i] * sc;
+    float act = pc.beta * tanh(g / pc.beta) * (1.0 / (1.0 + exp(-g)));
+    float lin = (pc.lin_beta > 0.0) ? (pc.lin_beta * tanh(u / pc.lin_beta)) : u;
+    o[i] = act * lin;
+}

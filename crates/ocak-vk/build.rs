@@ -46,6 +46,22 @@ fn main() {
         "qmv_iq4_nl",
         "qmv_iq4_xs",
         "qmv_nvfp4",
+        "hc_sinkhorn",
+        "hc_mix",
+        "rope_yarn_mla",
+        "mla_attn",
+        "moe_topk",
+        "qmv_iq3_xxs_id",
+        "qmv_iq3_s_id",
+        "qmv_nvfp4_id",
+        "qmv_q8_0_id",
+        "situ_id",
+        "add_scaled_id",
+        "add_scaled_exp_id",
+        "inkling_mix",
+        "inkling_ctrl",
+        "inkling_conv",
+        "inkling_attn",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

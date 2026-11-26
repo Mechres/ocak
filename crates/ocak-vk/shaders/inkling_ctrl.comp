@@ -1,0 +1,15 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Cur { float cur[]; };
+layout(set = 0, binding = 1) readonly buffer Msg { float msg[]; };
+layout(set = 0, binding = 2) readonly buffer GF { float gf[]; }; // [gain(ne), forget(ne)]
+layout(push_constant) uniform PC { uint cur_off; uint msg_off; uint gf_off; uint ne; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.ne) return;
+    float c = cur[pc.cur_off + i];
+    float m = msg[pc.msg_off + i];
+    float g = tanh(gf[pc.gf_off + i]);
+    float f = tanh(gf[pc.gf_off + pc.ne + i]);
+    cur[pc.cur_off + i] = c - f * c + g * m;
+}

@@ -1,0 +1,41 @@
+#version 460
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Mixes { float mixes[]; };
+layout(set = 0, binding = 1) readonly buffer Params { float params[]; }; // [scale(3), base(24)]
+layout(set = 0, binding = 2) writeonly buffer Out { float out_hc[]; };    // [pre(4), post(4), comb(16)]
+layout(push_constant) uniform PC { uint iters; float hc_eps; } pc;
+void main() {
+    float s0 = params[0];
+    float s1 = params[1];
+    float s2 = params[2];
+    for (uint h = 0u; h < 4u; h++) {
+        out_hc[h] = 1.0 / (1.0 + exp(-(mixes[h] * s0 + params[3u + h])));
+        out_hc[4u + h] = 2.0 / (1.0 + exp(-(mixes[4u + h] * s1 + params[3u + 4u + h])));
+    }
+    float c[16]; // c[s * 4 + d]
+    for (uint k = 0u; k < 16u; k++) {
+        uint s = k & 3u;
+        uint d = k >> 2;
+        c[s * 4u + d] = clamp(mixes[8u + k] * s2 + params[3u + 8u + k], -30.0, 30.0);
+    }
+    for (uint d = 0u; d < 4u; d++) {
+        float peak = -1e30;
+        for (uint s = 0u; s < 4u; s++) peak = max(peak, c[s * 4u + d]);
+        float sum = 0.0;
+        for (uint s = 0u; s < 4u; s++) { c[s * 4u + d] = exp(c[s * 4u + d] - peak); sum += c[s * 4u + d]; }
+        for (uint s = 0u; s < 4u; s++) c[s * 4u + d] /= sum;
+    }
+    for (uint it = 0u; it < pc.iters; it++) {
+        for (uint s = 0u; s < 4u; s++) {
+            float sum = pc.hc_eps;
+            for (uint d = 0u; d < 4u; d++) sum += c[s * 4u + d];
+            for (uint d = 0u; d < 4u; d++) c[s * 4u + d] /= sum;
+        }
+        for (uint d = 0u; d < 4u; d++) {
+            float sum = pc.hc_eps;
+            for (uint s = 0u; s < 4u; s++) sum += c[s * 4u + d];
+            for (uint s = 0u; s < 4u; s++) c[s * 4u + d] /= sum;
+        }
+    }
+    for (uint i = 0u; i < 16u; i++) out_hc[8u + i] = c[i];
+}

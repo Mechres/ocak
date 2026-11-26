@@ -151,6 +151,22 @@ struct Pipelines {
     qmv_iq4_nl: PipelineBundle,
     qmv_iq4_xs: PipelineBundle,
     qmv_nvfp4: PipelineBundle,
+    hc_sinkhorn: PipelineBundle,
+    hc_mix: PipelineBundle,
+    rope_yarn_mla: PipelineBundle,
+    mla_attn: PipelineBundle,
+    moe_topk: PipelineBundle,
+    qmv_iq3_xxs_id: PipelineBundle,
+    qmv_iq3_s_id: PipelineBundle,
+    qmv_nvfp4_id: PipelineBundle,
+    qmv_q8_0_id: PipelineBundle,
+    situ_id: PipelineBundle,
+    add_scaled_id: PipelineBundle,
+    add_scaled_exp_id: PipelineBundle,
+    inkling_mix: PipelineBundle,
+    inkling_ctrl: PipelineBundle,
+    inkling_conv: PipelineBundle,
+    inkling_attn: PipelineBundle,
 }
 
 impl Pipelines {
@@ -164,6 +180,10 @@ impl Pipelines {
             &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext,
             &self.qmv_iq2_xxs, &self.qmv_iq2_xs, &self.qmv_iq2_s, &self.qmv_iq3_xxs, &self.qmv_iq3_s,
             &self.qmv_iq1_s, &self.qmv_iq1_m, &self.qmv_iq4_nl, &self.qmv_iq4_xs, &self.qmv_nvfp4,
+            &self.hc_sinkhorn, &self.hc_mix, &self.rope_yarn_mla, &self.mla_attn, &self.moe_topk,
+            &self.qmv_iq3_xxs_id, &self.qmv_iq3_s_id, &self.qmv_nvfp4_id, &self.qmv_q8_0_id, &self.situ_id,
+            &self.add_scaled_id, &self.add_scaled_exp_id,
+            &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -202,7 +222,7 @@ pub struct VkContext {
 }
 
 const STAGING_SIZE: u64 = 64 * 1024 * 1024;
-const MAX_DESC_SETS: u32 = 4096;
+const MAX_DESC_SETS: u32 = 16384;
 
 fn build_pipeline(
     dev: &Device,
@@ -355,6 +375,22 @@ impl VkContext {
                 qmv_iq4_nl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_nl.spv")), 4, 24)?,
                 qmv_iq4_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_xs.spv")), 4, 24)?,
                 qmv_nvfp4: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4.spv")), 3, 24)?,
+                hc_sinkhorn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/hc_sinkhorn.spv")), 3, 8)?,
+                hc_mix: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/hc_mix.spv")), 4, 8)?,
+                rope_yarn_mla: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), 3, 48)?,
+                mla_attn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 4, 28)?,
+                moe_topk: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), 4, 20)?,
+                qmv_iq3_xxs_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 28)?,
+                qmv_iq3_s_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 28)?,
+                qmv_nvfp4_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 28)?,
+                qmv_q8_0_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 28)?,
+                situ_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
+                add_scaled_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 16)?,
+                add_scaled_exp_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 8)?,
+                inkling_mix: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 16)?,
+                inkling_ctrl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), 3, 16)?,
+                inkling_conv: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 32)?,
+                inkling_attn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn.spv")), 12, 72)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -371,7 +407,7 @@ impl VkContext {
             )?[0];
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(MAX_DESC_SETS * 7)];
+                .descriptor_count(MAX_DESC_SETS * 12)];
             let desc_pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(MAX_DESC_SETS)
@@ -810,6 +846,18 @@ impl<'a> Recorder<'a> {
 
     pub fn zero_buf(&mut self, dst: &Buffer) {
         unsafe {
+            let pre = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(
+                self.exec.cmd_buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &pre,
+                &[],
+                &[],
+            );
             self.ctx.device.cmd_fill_buffer(self.exec.cmd_buf, dst.buf, 0, vk::WHOLE_SIZE, 0);
             let bar = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -839,6 +887,133 @@ impl<'a> Recorder<'a> {
     pub fn situ(&mut self, gu: &Buffer, gu_off: u64, out: &Buffer, o_off: u64, n_ff: u32, scale: f32, beta: f32, lin_beta: f32) {
         let pc = [gu_off as u32, o_off as u32, n_ff, scale.to_bits(), beta.to_bits(), lin_beta.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.situ, &[gu.buf, out.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
+    }
+
+    pub fn hc_sinkhorn(&mut self, mixes: &Buffer, params: &Buffer, out_hc: &Buffer, iters: u32, hc_eps: f32) {
+        let pc = [iters, hc_eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.hc_sinkhorn, &[mixes.buf, params.buf, out_hc.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+    }
+
+    pub fn hc_mix(&mut self, streams: &Buffer, blk: &Buffer, hc: &Buffer, out: &Buffer, ne: u32, mode: u32) {
+        let pc = [ne, mode];
+        self.dispatch_raw(&self.ctx.pipelines.hc_mix, &[streams.buf, blk.buf, hc.buf, out.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, 1, 1);
+    }
+
+    pub fn rope_yarn_mla(
+        &mut self,
+        q_full: &Buffer,
+        kv_raw: &Buffer,
+        kv_cache: &Buffer,
+        nh: u32,
+        key_dim: u32,
+        nope: u32,
+        n_rot: u32,
+        latent: u32,
+        pos: u32,
+        kv_layer_off: u32,
+        rope_base: f32,
+        factor: f32,
+        low: f32,
+        high: f32,
+        mscale: f32,
+    ) {
+        let pc = [
+            nh, key_dim, nope, n_rot, latent, pos, kv_layer_off,
+            rope_base.to_bits(), factor.to_bits(), low.to_bits(), high.to_bits(), mscale.to_bits(),
+        ];
+        self.dispatch_raw(&self.ctx.pipelines.rope_yarn_mla, &[q_full.buf, kv_raw.buf, kv_cache.buf], bytemuck::cast_slice(&pc), nh + 1, 1, 1);
+    }
+
+    pub fn mla_attn(
+        &mut self,
+        q_lat: &Buffer,
+        q_full: &Buffer,
+        kv_cache: &Buffer,
+        out: &Buffer,
+        nh: u32,
+        key_dim: u32,
+        nope: u32,
+        n_rot: u32,
+        latent: u32,
+        pos: u32,
+        kv_layer_off: u32,
+        kq_scale: f32,
+    ) {
+        let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh, 1, 1);
+    }
+
+    pub fn moe_topk(&mut self, logits: &Buffer, bias: &Buffer, ids: &Buffer, weights: &Buffer, n_exp: u32, n_used: u32, has_bias: bool, norm_w: bool, scale: f32) {
+        let pc = [n_exp, n_used, has_bias as u32, norm_w as u32, scale.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.moe_topk, &[logits.buf, bias.buf, ids.buf, weights.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+    }
+
+    pub fn qmv_id(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
+        let pc = [slot, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), slice_bytes as u32];
+        let gx = (m + 3) / 4;
+        match ty {
+            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
+            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
+            WType::NVFP4 => self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
+            WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmv_q8_0_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, 1, 1),
+            _ => panic!("qmv_id: unsupported type {ty:?}"),
+        }
+    }
+
+    pub fn add_scaled_id(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, weights: &Buffer, n: u32, slot: u32) {
+        let pc = [a_off as u32, b_off as u32, n, slot];
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_id, &[a.buf, b.buf, weights.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn qmv_nvfp4_id(&mut self, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
+        let pc = [slot, x_off as u32, y_off as u32, k, m, WType::NVFP4.row_bytes(k), slice_bytes as u32];
+        self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), (m + 3) / 4, 1, 1);
+    }
+
+    pub fn situ_id(&mut self, gu: &Buffer, out: &Buffer, ids: &Buffer, scales: &Buffer, n_ff: u32, slot: u32, beta: f32, lin_beta: f32) {
+        let pc = [n_ff, slot, beta.to_bits(), lin_beta.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.situ_id, &[gu.buf, out.buf, ids.buf, scales.buf], bytemuck::cast_slice(&pc), (n_ff + 255) / 256, 1, 1);
+    }
+
+    pub fn add_scaled_exp_id(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot: u32) {
+        let pc = [n, slot];
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn inkling_mix(&mut self, blocks: &Buffer, cur: &Buffer, query: &Buffer, out: &Buffer, ne: u32, blk_start: u32, n_blk: u32, n_q: u32) {
+        let pc = [ne, blk_start, n_blk, n_q];
+        self.dispatch_raw(&self.ctx.pipelines.inkling_mix, &[blocks.buf, cur.buf, query.buf, out.buf], bytemuck::cast_slice(&pc), n_q, 1, 1);
+    }
+
+    pub fn inkling_ctrl(&mut self, cur: &Buffer, cur_off: u64, msg: &Buffer, msg_off: u64, gf: &Buffer, gf_off: u64, ne: u32) {
+        let pc = [cur_off as u32, msg_off as u32, gf_off as u32, ne];
+        self.dispatch_raw(&self.ctx.pipelines.inkling_ctrl, &[cur.buf, msg.buf, gf.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, 1, 1);
+    }
+
+    pub fn inkling_conv(&mut self, inp: &Buffer, inp_off: u64, wt: &Buffer, dy: &Buffer, dy_off: u64, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32) {
+        let pc = [inp_off as u32, dy_off as u32, hist_off as u32, out_off as u32, n_ch, n_conv, has_dyn as u32, head_ch];
+        self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), (n_ch + 255) / 256, 1, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn inkling_attn(
+        &mut self,
+        q: &Buffer, k_cur: &Buffer, v_cur: &Buffer, r: &Buffer, sinks: &Buffer, gate: &Buffer,
+        q_clip: &Buffer, r_clip: &Buffer, r_bias: &Buffer, k_cache: &Buffer, v_cache: &Buffer, out: &Buffer,
+        q_off: u32, r_off: u32, s_off: u32, g_off: u32,
+        n_head: u32, n_head_kv: u32, hd: u32, n_rel: u32, n_extent: u32, n_swa: u32, is_swa: bool,
+        cap: u32, pos: u32, kv_slot_off: u32, qk_clip: f32, rel_clip: f32, tau: f32, eps: f32,
+    ) {
+        let pc = [
+            q_off, r_off, s_off, g_off, n_head, n_head_kv, hd, n_rel, n_extent, n_swa, is_swa as u32,
+            cap, pos, kv_slot_off, qk_clip.to_bits(), rel_clip.to_bits(), tau.to_bits(), eps.to_bits(),
+        ];
+        self.dispatch_raw(
+            &self.ctx.pipelines.inkling_attn,
+            &[q.buf, k_cur.buf, v_cur.buf, r.buf, sinks.buf, gate.buf, q_clip.buf, r_clip.buf, r_bias.buf, k_cache.buf, v_cache.buf, out.buf],
+            bytemuck::cast_slice(&pc),
+            n_head, 1, 1,
+        );
     }
 
     pub fn rope(&mut self, q: &Buffer, q_off: u64, k: &Buffer, k_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, n_rot: u32, pos: u32, freq_base: f32, mode: u32) {
@@ -1154,5 +1329,80 @@ mod tests {
             assert!(!tmp.device_name().is_empty());
             drop(tmp);
         }
+    }
+
+    #[test]
+    fn vk_inkling_shaders_match_cpu() {
+        let c = ctx();
+        let mut rng = Lcg(7777);
+        // 1. moe_topk + qmv_nvfp4_id + situ_id + add_scaled_exp_id
+        let (ne, nff, nexp, nused) = (256usize, 128usize, 16usize, 4usize);
+        let logits: Vec<f32> = (0..nexp).map(|_| rng.f() * 3.0).collect();
+        let bias: Vec<f32> = (0..nexp).map(|_| rng.f() * 0.5).collect();
+        let b_lg = c.create_device_buffer((nexp * 4) as u64).unwrap();
+        let b_bi = c.create_device_buffer((nexp * 4) as u64).unwrap();
+        let b_ids = c.create_device_buffer((nused * 4) as u64).unwrap();
+        let b_wts = c.create_device_buffer((nused * 4) as u64).unwrap();
+        c.upload(&b_lg, 0, bytemuck::cast_slice(&logits)).unwrap();
+        c.upload(&b_bi, 0, bytemuck::cast_slice(&bias)).unwrap();
+        let mut rec = c.begin();
+        rec.moe_topk(&b_lg, &b_bi, &b_ids, &b_wts, nexp as u32, nused as u32, true, true, 8.0);
+        rec.finish_and_wait().unwrap();
+        let mut ids_gpu = vec![0u32; nused];
+        let mut wts_gpu = vec![0f32; nused];
+        c.download(&b_ids, 0, bytemuck::cast_slice_mut(&mut ids_gpu)).unwrap();
+        c.download(&b_wts, 0, bytemuck::cast_slice_mut(&mut wts_gpu)).unwrap();
+        // CPU ref
+        let probs: Vec<f32> = logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+        let biased: Vec<f32> = probs.iter().zip(&bias).map(|(p, b)| p + b).collect();
+        let mut idx: Vec<usize> = (0..nexp).collect();
+        idx.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]));
+        idx.truncate(nused);
+        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>() + 1e-20;
+        for k in 0..nused {
+            assert_eq!(ids_gpu[k], idx[k] as u32, "moe_topk id[{k}]");
+            assert!((wts_gpu[k] - probs[idx[k]] / wsum * 8.0).abs() < 1e-4, "moe_topk w[{k}]");
+        }
+
+        // 2. inkling_conv (dynamic + static)
+        let (nch, nconv, nh_d) = (64usize, 4usize, 2usize);
+        let inp: Vec<f32> = (0..nch).map(|_| rng.f()).collect();
+        let wt: Vec<f32> = (0..nch * nconv).map(|_| rng.f()).collect();
+        let dy: Vec<f32> = (0..nh_d * nconv).map(|_| rng.f()).collect();
+        let mut hist_cpu = vec![0f32; nch * (nconv - 1)];
+        let b_in = c.create_device_buffer((nch * 4) as u64).unwrap();
+        let b_wt = c.create_device_buffer((wt.len() * 4) as u64).unwrap();
+        let b_dy = c.create_device_buffer((dy.len() * 4) as u64).unwrap();
+        let b_hi = c.create_device_buffer((hist_cpu.len() * 4) as u64).unwrap();
+        let b_ou = c.create_device_buffer((nch * 4) as u64).unwrap();
+        c.upload(&b_in, 0, bytemuck::cast_slice(&inp)).unwrap();
+        c.upload(&b_wt, 0, bytemuck::cast_slice(&wt)).unwrap();
+        c.upload(&b_dy, 0, bytemuck::cast_slice(&dy)).unwrap();
+        c.zero_buffer(&b_hi).unwrap();
+        let mut out_cpu = vec![0f32; nch];
+        for _ in 0..3 {
+            let nh = nconv - 1;
+            let scale = 1.0 / ((2 * nconv + 1) as f32).sqrt();
+            for ch in 0..nch {
+                let ho = ch * nh;
+                let wo = ch * nconv;
+                let mut acc = 0f32;
+                for k in 0..nh { acc += hist_cpu[ho + k] * wt[wo + k]; }
+                acc += inp[ch] * wt[wo + nh];
+                let h = ch / (nch / nh_d);
+                acc += inp[ch] * dy[h * nconv];
+                for lag in 1..nconv { acc += hist_cpu[ho + nh - lag] * dy[h * nconv + lag]; }
+                for k in 0..nh - 1 { hist_cpu[ho + k] = hist_cpu[ho + k + 1]; }
+                hist_cpu[ho + nh - 1] = inp[ch];
+                out_cpu[ch] = (inp[ch] + acc) * scale;
+            }
+            let mut rec = c.begin();
+            rec.inkling_conv(&b_in, 0, &b_wt, &b_dy, 0, &b_hi, 0, &b_ou, 0, nch as u32, nconv as u32, true, (nch / nh_d) as u32);
+            rec.finish_and_wait().unwrap();
+        }
+        let mut out_gpu = vec![0f32; nch];
+        c.download(&b_ou, 0, bytemuck::cast_slice_mut(&mut out_gpu)).unwrap();
+        for i in 0..nch { assert!((out_cpu[i] - out_gpu[i]).abs() < 1e-4, "conv[{i}]: cpu={} gpu={}", out_cpu[i], out_gpu[i]); }
+        let _ = (ne, nff);
     }
 }

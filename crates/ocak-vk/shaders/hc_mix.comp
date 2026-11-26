@@ -1,0 +1,35 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Streams { float st[]; };
+layout(set = 0, binding = 1) readonly buffer Block { float blk[]; };
+layout(set = 0, binding = 2) readonly buffer Hc { float hc[]; }; // [pre(4), post(4), comb(16)]
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC { uint ne; uint mode; } pc;
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= pc.ne) return;
+    if (pc.mode == 0u) {
+        // hc_pre mix_in: o[e] = sum_h pre[h] * st[h*ne + e]
+        float acc = 0.0;
+        for (uint h = 0u; h < 4u; h++) acc += hc[h] * st[h * pc.ne + e];
+        o[e] = acc;
+    } else if (pc.mode == 1u) {
+        // hc_post: o[d*ne + e] = post[d] * blk[e] + sum_s comb[s*4 + d] * st[s*ne + e]
+        float bv = blk[e];
+        float s0 = st[e];
+        float s1 = st[pc.ne + e];
+        float s2 = st[2u * pc.ne + e];
+        float s3 = st[3u * pc.ne + e];
+        for (uint d = 0u; d < 4u; d++) {
+            float v = hc[4u + d] * bv
+                + hc[8u + d] * s0
+                + hc[8u + 4u + d] * s1
+                + hc[8u + 8u + d] * s2
+                + hc[8u + 12u + d] * s3;
+            o[d * pc.ne + e] = v;
+        }
+    } else {
+        // final mean across 4 streams (mode == 2)
+        o[e] = 0.25 * (st[e] + st[pc.ne + e] + st[2u * pc.ne + e] + st[3u * pc.ne + e]);
+    }
+}

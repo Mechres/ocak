@@ -1,0 +1,154 @@
+#version 460
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KCur { float kc[]; };
+layout(set = 0, binding = 2) readonly buffer VCur { float vc[]; };
+layout(set = 0, binding = 3) readonly buffer R { float r[]; };
+layout(set = 0, binding = 4) readonly buffer Sinks { float sinks[]; };
+layout(set = 0, binding = 5) readonly buffer Gate { float gate[]; };
+layout(set = 0, binding = 6) readonly buffer QClip { float qclip[]; };
+layout(set = 0, binding = 7) readonly buffer RClip { float rclip[]; };
+layout(set = 0, binding = 8) readonly buffer RelBias { float rbias[]; };
+layout(set = 0, binding = 9) buffer KCache { float kcache[]; };
+layout(set = 0, binding = 10) buffer VCache { float vcache[]; };
+layout(set = 0, binding = 11) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint r_off;
+    uint s_off;
+    uint g_off;
+    uint n_head;
+    uint n_head_kv;
+    uint hd;
+    uint n_rel;
+    uint n_extent;
+    uint n_swa;
+    uint is_swa;
+    uint cap;
+    uint pos;
+    uint kv_slot_off;
+    float qk_clip;
+    float rel_clip;
+    float tau;
+    float eps;
+} pc;
+shared float sq[128];
+shared float sr[32];
+shared float sk_cur[128];
+shared float sk_tmp[128];
+shared float smax[128];
+shared float ssum[128];
+shared float scores[2048];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint gqa = pc.n_head / pc.n_head_kv;
+    uint kvh = h / gqa;
+    uint kv_dim = pc.n_head_kv * pc.hd;
+    uint slot_pos = (pc.is_swa != 0u) ? (pc.pos % pc.cap) : pc.pos;
+
+    // 1. Compute clipped K and RMSNormed V for current pos; first head in GQA group stores to cache
+    float k_cur_val;
+    float v_cur_val;
+    {
+        float kv = kc[kvh * pc.hd + tid];
+        sk_tmp[tid] = kv * kv;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sk_tmp[tid] += sk_tmp[tid + s]; barrier(); }
+        float knorm = sqrt(sk_tmp[0]);
+        barrier();
+        k_cur_val = kv * ((knorm > pc.qk_clip) ? (pc.qk_clip / knorm) : 1.0);
+        sk_cur[tid] = k_cur_val;
+
+        float vv = vc[kvh * pc.hd + tid];
+        sk_tmp[tid] = vv * vv;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sk_tmp[tid] += sk_tmp[tid + s]; barrier(); }
+        float v_ss = sk_tmp[0];
+        barrier();
+        v_cur_val = vv * inversesqrt(v_ss / float(pc.hd) + pc.eps);
+        if (h % gqa == 0u) {
+            kcache[pc.kv_slot_off + slot_pos * kv_dim + kvh * pc.hd + tid] = k_cur_val;
+            vcache[pc.kv_slot_off + slot_pos * kv_dim + kvh * pc.hd + tid] = v_cur_val;
+        }
+    }
+
+    // 2. Clip Q (with qclip) and R (with rclip)
+    float qv = q[pc.q_off + h * pc.hd + tid] * qclip[h * pc.hd + tid];
+    sq[tid] = qv * qv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sq[tid] += sq[tid + s]; barrier(); }
+    float qnorm = sqrt(sq[0]);
+    barrier();
+    float qf = ((qnorm > pc.qk_clip) ? (pc.qk_clip / qnorm) : 1.0) * ((pc.is_swa == 0u) ? pc.tau : 1.0);
+    sq[tid] = qv * qf;
+
+    if (tid < pc.n_rel) {
+        float rv = r[pc.r_off + h * pc.n_rel + tid] * rclip[h * pc.n_rel + tid];
+        sr[tid] = rv;
+        sk_tmp[tid] = rv * rv;
+    } else {
+        sk_tmp[tid] = 0.0;
+    }
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sk_tmp[tid] += sk_tmp[tid + s]; barrier(); }
+    float rnorm = sqrt(sk_tmp[0]);
+    barrier();
+    float rf = ((rnorm > pc.rel_clip) ? (pc.rel_clip / rnorm) : 1.0) * ((pc.is_swa == 0u) ? pc.tau : 1.0);
+    if (tid < pc.n_rel) sr[tid] *= rf;
+    barrier();
+
+    // 3. Attention scores over t_start..=pos + zero sink
+    uint t_start = (pc.is_swa != 0u && pc.pos + 1u > pc.n_swa) ? (pc.pos + 1u - pc.n_swa) : 0u;
+    uint t_len = pc.pos - t_start + 1u;
+    float scale = inversesqrt(float(pc.hd));
+    float sink_t = sinks[pc.s_off + h];
+
+    float lmax = 0.0; // zero sink logit = 0.0
+    for (uint idx = tid; idx < t_len; idx += 128u) {
+        uint t = t_start + idx;
+        uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+        float dot = 0.0;
+        if (t == pc.pos) {
+            for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * sk_cur[d];
+        } else {
+            uint kb = pc.kv_slot_off + sp * kv_dim + kvh * pc.hd;
+            for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * kcache[kb + d];
+        }
+        uint dist = pc.pos - t;
+        float rb = 0.0;
+        if (dist < pc.n_extent) {
+            uint rbo = dist * pc.n_rel;
+            for (uint j = 0u; j < pc.n_rel; j++) rb += rbias[rbo + j] * sr[j];
+        }
+        float sc = dot * scale + rb - sink_t;
+        scores[idx] = sc;
+        lmax = max(lmax, sc);
+    }
+    smax[tid] = lmax;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]); barrier(); }
+    float mx = smax[0];
+
+    float lsum = (tid == 0u) ? exp(-mx) : 0.0; // zero sink
+    for (uint idx = tid; idx < t_len; idx += 128u) {
+        float e = exp(scores[idx] - mx);
+        scores[idx] = e;
+        lsum += e;
+    }
+    ssum[tid] = lsum;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) ssum[tid] += ssum[tid + s]; barrier(); }
+    float inv = 1.0 / ssum[0];
+
+    // 4. Weighted V sum + sigmoid gate
+    float acc = 0.0;
+    for (uint idx = 0u; idx < t_len; idx++) {
+        uint t = t_start + idx;
+        uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+        float vv = (t == pc.pos) ? v_cur_val : vcache[pc.kv_slot_off + sp * kv_dim + kvh * pc.hd + tid];
+        acc += (scores[idx] * inv) * vv;
+    }
+    float gv = 1.0 / (1.0 + exp(-gate[pc.g_off + h * pc.hd + tid]));
+    o[h * pc.hd + tid] = acc * gv;
+}

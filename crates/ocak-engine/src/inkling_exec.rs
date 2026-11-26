@@ -87,6 +87,101 @@ struct SlotState {
     ffn_post_hist: Vec<f32>,
 }
 
+struct InklingGpuPhys {
+    attn_q_clip: Buffer,
+    attn_rel_bias: Buffer,
+    attn_rel_clip: Buffer,
+    attn_k_conv: Buffer,
+    attn_v_conv: Buffer,
+    attn_post_conv: Buffer,
+    ffn_post_conv: Buffer,
+    attn_norm: Option<Buffer>,
+    attn_q_inp_norm: Option<Buffer>,
+    attn_k_inp_norm: Option<Buffer>,
+    attn_v_inp_norm: Option<Buffer>,
+    attn_res_query: Option<Buffer>,
+    ffn_res_query: Buffer,
+    ffn_norm: Buffer,
+    exp_probs_b: Option<Buffer>,
+    gu_scale: Buffer,
+    dn_scale: Buffer,
+}
+
+struct InklingGpuLoop {
+    msg_query: Buffer,
+    ctrl_down: [(Buffer, WType, u32, u32); 4],
+    ctrl_gain: [(Buffer, WType, u32, u32); 4],
+    ctrl_forget: [(Buffer, WType, u32, u32); 4],
+}
+
+struct InklingGpuState {
+    phys: Vec<InklingGpuPhys>,
+    loops: Vec<InklingGpuLoop>,
+    slot_kv_offsets: Vec<u32>,
+    slot_caps: Vec<u32>,
+    ones: Buffer,
+    tok_norm: Buffer,
+    output_norm: Buffer,
+    output_res_query: Buffer,
+    dummy_bias: Buffer,
+    dummy_dyn: Buffer,
+    // Activations & ping-pong
+    cur: Buffer,
+    inp_sa: Buffer,
+    prelude_cur: Buffer,
+    bank_out: Buffer,
+    ffn_inp: Buffer,
+    blocks_norm: Buffer,
+    bank_norm: Buffer,
+    inputs_buf: Buffer,   // 3 * ne
+    in_norm_buf: Buffer,  // 3 * ne
+    msgs_buf: Buffer,     // 4 * ne
+    ctrl_cat: Buffer,     // 2 * ne
+    ctrl_gate: Buffer,    // rank
+    ctrl_gf: Buffer,      // 2 * ne
+    proj_buf: Buffer,     // q + k + v + r + sinks + gate + k_dyn + v_dyn
+    k_conv_buf: Buffer,   // kv_dim
+    v_conv_buf: Buffer,   // kv_dim
+    attn_cat: Buffer,     // n_head * hd
+    o_proj: Buffer,       // ne
+    x_moe: Buffer,        // ne
+    router_logits: Buffer, // n_expert
+    top_ids: Buffer,      // n_expert_used
+    top_w: Buffer,        // n_expert_used
+    moe_out: Buffer,      // ne
+    ffn_out: Buffer,      // ne
+    hidden_buf: Buffer,   // ne
+    logits_buf: Buffer,   // n_vocab_padded
+    // Persistent slot states (KV + ShortConv histories)
+    k_cache: Buffer,
+    v_cache: Buffer,
+    k_hist: Buffer,
+    v_hist: Buffer,
+    attn_post_hist: Buffer,
+    ffn_post_hist: Buffer,
+    kv_dim: usize,
+}
+
+fn upload_f32(c: &Arc<VkContext>, v: &[f32]) -> Result<Buffer, EngineError> {
+    let bytes = bytemuck::cast_slice(v);
+    let b = c.create_device_buffer(bytes.len() as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
+    c.upload(&b, 0, bytes).map_err(|e| EngineError::Backend(e.to_string()))?;
+    Ok(b)
+}
+
+fn upload_mat_gtt_or_vram(g: &GgufFile, c: &Arc<VkContext>, name: &str) -> Result<(Buffer, WType, u32, u32), EngineError> {
+    let t = g.tensor(name).ok_or_else(|| EngineError::Unsupported(format!("missing {name}")))?;
+    let wt = WType::from_ggml(t.ty).map_err(|e| EngineError::Backend(e.to_string()))?;
+    let data = g.tensor_data(t);
+    let buf = if let Ok(b) = c.create_device_buffer(data.len() as u64) {
+        c.upload(&b, 0, data).map_err(|e| EngineError::Backend(e.to_string()))?;
+        b
+    } else {
+        c.create_gtt_buffer_from_slice(data).map_err(|e| EngineError::Backend(e.to_string()))?
+    };
+    Ok((buf, wt, t.n_cols() as u32, t.n_rows() as u32))
+}
+
 pub struct InklingExec {
     gguf: Arc<GgufFile>,
     vk: Option<Arc<VkContext>>,
@@ -131,6 +226,7 @@ pub struct InklingExec {
     gpu_sum: Option<Buffer>,
     gpu_moe_count: usize,
     cpu_moe_count: usize,
+    gpu_pipe: Option<InklingGpuState>,
     hidden: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -471,6 +567,123 @@ impl InklingExec {
             (None, None, None, None, None)
         };
 
+        let gpu_pipe = if let Some(c) = &vk {
+            if cpu_moe_count == 0 && output_w.gpu.is_some() {
+                let mut g_phys = Vec::with_capacity(n_phys);
+                for p in &phys {
+                    g_phys.push(InklingGpuPhys {
+                        attn_q_clip: upload_f32(c, &p.attn_q_clip)?,
+                        attn_rel_bias: upload_f32(c, &p.attn_rel_bias)?,
+                        attn_rel_clip: upload_f32(c, &p.attn_rel_clip)?,
+                        attn_k_conv: upload_f32(c, &p.attn_k_conv)?,
+                        attn_v_conv: upload_f32(c, &p.attn_v_conv)?,
+                        attn_post_conv: upload_f32(c, &p.attn_post_conv)?,
+                        ffn_post_conv: upload_f32(c, &p.ffn_post_conv)?,
+                        attn_norm: p.attn_norm.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        attn_q_inp_norm: p.attn_q_inp_norm.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        attn_k_inp_norm: p.attn_k_inp_norm.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        attn_v_inp_norm: p.attn_v_inp_norm.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        attn_res_query: p.attn_res_query.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        ffn_res_query: upload_f32(c, &p.ffn_res_query)?,
+                        ffn_norm: upload_f32(c, &p.ffn_norm)?,
+                        exp_probs_b: p.exp_probs_b.as_ref().map(|v| upload_f32(c, v)).transpose()?,
+                        gu_scale: upload_f32(c, &p.exps.gu_scale)?,
+                        dn_scale: upload_f32(c, &p.exps.dn_scale)?,
+                    });
+                }
+                let mut g_loops = Vec::with_capacity(core_end - core_start);
+                for (idx_l, ip) in (core_start..core_end).enumerate() {
+                    let mq = upload_f32(c, &loop_layers[idx_l].msg_query)?;
+                    let names = ["q", "k", "v", "ffn"];
+                    let mut dn = Vec::with_capacity(4);
+                    let mut gn = Vec::with_capacity(4);
+                    let mut fg = Vec::with_capacity(4);
+                    for nm in names {
+                        dn.push(upload_mat_gtt_or_vram(&g, c, &format!("blk.{ip}.loop_{nm}_ctrl_down.weight"))?);
+                        gn.push(upload_mat_gtt_or_vram(&g, c, &format!("blk.{ip}.loop_{nm}_ctrl_gain.weight"))?);
+                        fg.push(upload_mat_gtt_or_vram(&g, c, &format!("blk.{ip}.loop_{nm}_ctrl_forget.weight"))?);
+                    }
+                    g_loops.push(InklingGpuLoop {
+                        msg_query: mq,
+                        ctrl_down: dn.try_into().ok().unwrap(),
+                        ctrl_gain: gn.try_into().ok().unwrap(),
+                        ctrl_forget: fg.try_into().ok().unwrap(),
+                    });
+                }
+                let kv_dim = phys[0].n_head_kv * head_dim;
+                let mut slot_kv_offsets = Vec::with_capacity(n_slot);
+                let mut slot_caps = Vec::with_capacity(n_slot);
+                let mut total_kv_elems = 0usize;
+                for il in 0..n_slot {
+                    let ip = if il < n_phys { il } else { core_start + (il - n_phys) % (core_end - core_start) };
+                    let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16) } else { max_ctx };
+                    slot_kv_offsets.push(total_kv_elems as u32);
+                    slot_caps.push(cap as u32);
+                    total_kv_elems += cap * kv_dim;
+                }
+                let mk = |n: usize| c.create_device_buffer((n * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()));
+                let k_hist = mk(n_slot * kv_dim * (n_conv - 1))?;
+                let v_hist = mk(n_slot * kv_dim * (n_conv - 1))?;
+                let attn_post_hist = mk(n_slot * n_embd * (n_conv - 1))?;
+                let ffn_post_hist = mk(n_slot * n_embd * (n_conv - 1))?;
+                c.zero_buffer(&k_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+                c.zero_buffer(&v_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+                c.zero_buffer(&attn_post_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+                c.zero_buffer(&ffn_post_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+                let rank = g_loops.first().map(|l| l.ctrl_down[0].3 as usize).unwrap_or(64);
+                let n_head_max = phys[0].n_head;
+                Some(InklingGpuState {
+                    phys: g_phys,
+                    loops: g_loops,
+                    slot_kv_offsets,
+                    slot_caps,
+                    ones: upload_f32(c, &vec![1.0f32; n_embd])?,
+                    tok_norm: upload_f32(c, &tok_norm)?,
+                    output_norm: upload_f32(c, &output_norm)?,
+                    output_res_query: upload_f32(c, &output_res_query)?,
+                    dummy_bias: upload_f32(c, &vec![0.0f32; n_expert])?,
+                    dummy_dyn: upload_f32(c, &[0.0f32; 4])?,
+                    cur: mk(n_embd)?,
+                    inp_sa: mk(n_embd)?,
+                    prelude_cur: mk(n_embd)?,
+                    bank_out: mk(n_embd)?,
+                    ffn_inp: mk(n_embd)?,
+                    blocks_norm: mk(16 * n_embd)?,
+                    bank_norm: mk(16 * n_embd)?,
+                    inputs_buf: mk(3 * n_embd)?,
+                    in_norm_buf: mk(3 * n_embd)?,
+                    msgs_buf: mk(4 * n_embd)?,
+                    ctrl_cat: mk(2 * n_embd)?,
+                    ctrl_gate: mk(rank)?,
+                    ctrl_gf: mk(2 * n_embd)?,
+                    proj_buf: mk(n_embd * 8)?,
+                    k_conv_buf: mk(kv_dim)?,
+                    v_conv_buf: mk(kv_dim)?,
+                    attn_cat: mk(n_head_max * head_dim)?,
+                    o_proj: mk(n_embd)?,
+                    x_moe: mk(n_embd)?,
+                    router_logits: mk(n_expert)?,
+                    top_ids: mk(n_expert_used)?,
+                    top_w: mk(n_expert_used)?,
+                    moe_out: mk(n_embd)?,
+                    ffn_out: mk(n_embd)?,
+                    hidden_buf: mk(n_embd)?,
+                    logits_buf: mk(n_vocab_padded)?,
+                    k_cache: mk(total_kv_elems)?,
+                    v_cache: mk(total_kv_elems)?,
+                    k_hist,
+                    v_hist,
+                    attn_post_hist,
+                    ffn_post_hist,
+                    kv_dim,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             gguf: g, vk, n_phys, core_start, core_end, n_passes,
             n_embd, n_ff_exp, head_dim, n_expert, n_expert_used, n_rel, n_swa, n_conv, block_size,
@@ -478,7 +691,7 @@ impl InklingExec {
             exp_w_scale, situ_beta, situ_lin_beta, softcap, max_ctx,
             tok_embd_name: "token_embd.weight".into(), tok_embd_ty,
             tok_norm, output_norm, output_res_query, output_w, phys, loop_layers, slots,
-            gpu_x, gpu_y, gpu_gu, gpu_mid, gpu_sum, gpu_moe_count, cpu_moe_count,
+            gpu_x, gpu_y, gpu_gu, gpu_mid, gpu_sum, gpu_moe_count, cpu_moe_count, gpu_pipe,
             hidden: vec![0f32; n_embd],
             logits: vec![0f32; n_vocab_unpadded],
         })
@@ -827,12 +1040,188 @@ impl InklingExec {
         for i in 0..self.n_embd { out[i] = ffn_inp[i] + ffn_out[i]; }
         Ok(out)
     }
+    fn record_layer_gpu(
+        &self,
+        rec: &mut ocak_vk::Recorder<'_>,
+        gp: &InklingGpuState,
+        il: usize,
+        ip: usize,
+        pos: usize,
+        tau: f32,
+        blk_count: &mut u32,
+        loop_idx: Option<usize>,
+    ) {
+        let p = &self.phys[ip];
+        let gph = &gp.phys[ip];
+        let ne = self.n_embd as u32;
+        let hd = self.head_dim as u32;
+        let kv_dim = gp.kv_dim as u32;
+        let nh_hist = (self.n_conv - 1) as u32;
+
+        // Save inp_sa
+        rec.copy(&gp.cur, 0, &gp.inp_sa, 0, ne);
+
+        // 1. Attention residual mix -> inputs_buf[3 * ne]
+        if let Some(ref rq) = gph.attn_res_query {
+            let n_q = if p.is_swa { 1u32 } else { 3u32 };
+            rec.inkling_mix(&gp.blocks_norm, &gp.inp_sa, rq, &gp.inputs_buf, ne, 0, *blk_count, n_q);
+            if p.is_swa {
+                rec.copy(&gp.inputs_buf, 0, &gp.inputs_buf, ne as u64, ne);
+                rec.copy(&gp.inputs_buf, 0, &gp.inputs_buf, (2 * ne) as u64, ne);
+            }
+        } else {
+            rec.copy(&gp.cur, 0, &gp.inputs_buf, 0, ne);
+            rec.copy(&gp.cur, 0, &gp.inputs_buf, ne as u64, ne);
+            rec.copy(&gp.cur, 0, &gp.inputs_buf, (2 * ne) as u64, ne);
+        }
+
+        // 2. Cross-pass loop controllers for Q, K, V
+        if let Some(li) = loop_idx {
+            let gl = &gp.loops[li];
+            for j in 0..3 {
+                let off = (j as u32 * ne) as u64;
+                rec.rms_norm(&gp.inputs_buf, off, &gp.ones, 0, &gp.ctrl_cat, 0, ne, 1e-6);
+                rec.rms_norm(&gp.msgs_buf, off, &gp.ones, 0, &gp.ctrl_cat, ne as u64, ne, 1e-6);
+                let (ref bd, wtd, kd, md) = gl.ctrl_down[j];
+                let (ref bg, wtg, kg, mg) = gl.ctrl_gain[j];
+                let (ref bf, wtf, kf, mf) = gl.ctrl_forget[j];
+                rec.qmv(wtd, bd, 0, &gp.ctrl_cat, 0, &gp.ctrl_gate, 0, kd, md);
+                rec.qmv(wtg, bg, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, 0, kg, mg);
+                rec.qmv(wtf, bf, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, ne as u64, kf, mf);
+                rec.inkling_ctrl(&gp.inputs_buf, off, &gp.msgs_buf, off, &gp.ctrl_gf, 0, ne);
+            }
+        }
+
+        // 3. Input RMSNorm -> in_norm_buf[3 * ne]
+        if p.is_swa {
+            let nw = gph.attn_norm.as_ref().unwrap();
+            if loop_idx.is_some() {
+                for j in 0..3 {
+                    let off = (j as u32 * ne) as u64;
+                    rec.rms_norm(&gp.inputs_buf, off, nw, 0, &gp.in_norm_buf, off, ne, self.eps);
+                }
+            } else {
+                rec.rms_norm(&gp.inputs_buf, 0, nw, 0, &gp.in_norm_buf, 0, ne, self.eps);
+                rec.copy(&gp.in_norm_buf, 0, &gp.in_norm_buf, ne as u64, ne);
+                rec.copy(&gp.in_norm_buf, 0, &gp.in_norm_buf, (2 * ne) as u64, ne);
+            }
+        } else {
+            rec.rms_norm(&gp.inputs_buf, 0, gph.attn_q_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, 0, ne, self.eps);
+            rec.rms_norm(&gp.inputs_buf, ne as u64, gph.attn_k_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, ne as u64, ne, self.eps);
+            rec.rms_norm(&gp.inputs_buf, (2 * ne) as u64, gph.attn_v_inp_norm.as_ref().unwrap(), 0, &gp.in_norm_buf, (2 * ne) as u64, ne, self.eps);
+        }
+
+        // 4. Q, K, V, R, Sink, Gate (+ k_dyn, v_dyn) -> proj_buf
+        let o_q = 0u64;
+        let o_k = o_q + p.wq.m as u64;
+        let o_v = o_k + p.wk.m as u64;
+        let o_r = o_v + p.wv.m as u64;
+        let o_s = o_r + p.attn_rel.m as u64;
+        let o_g = o_s + p.attn_sink_proj.m as u64;
+        let o_kd = o_g + p.wqkv_gate.m as u64;
+        let (bq, wtq) = p.wq.gpu.as_ref().unwrap();
+        let (bk, wtk) = p.wk.gpu.as_ref().unwrap();
+        let (bv, wtv) = p.wv.gpu.as_ref().unwrap();
+        let (br, wtr) = p.attn_rel.gpu.as_ref().unwrap();
+        let (bs, wts) = p.attn_sink_proj.gpu.as_ref().unwrap();
+        let (bg, wtg) = p.wqkv_gate.gpu.as_ref().unwrap();
+        rec.qmv(*wtq, bq, 0, &gp.in_norm_buf, 0, &gp.proj_buf, o_q, ne, p.wq.m as u32);
+        rec.qmv(*wtk, bk, 0, &gp.in_norm_buf, ne as u64, &gp.proj_buf, o_k, ne, p.wk.m as u32);
+        rec.qmv(*wtv, bv, 0, &gp.in_norm_buf, (2 * ne) as u64, &gp.proj_buf, o_v, ne, p.wv.m as u32);
+        rec.qmv(*wtr, br, 0, &gp.in_norm_buf, 0, &gp.proj_buf, o_r, ne, p.attn_rel.m as u32);
+        rec.qmv(*wts, bs, 0, &gp.in_norm_buf, 0, &gp.proj_buf, o_s, ne, p.attn_sink_proj.m as u32);
+        rec.qmv(*wtg, bg, 0, &gp.in_norm_buf, 0, &gp.proj_buf, o_g, ne, p.wqkv_gate.m as u32);
+
+        let mut has_dyn = false;
+        let mut o_vd = o_kd;
+        if let (Some(kp), Some(vp)) = (&p.attn_k_conv_proj, &p.attn_v_conv_proj) {
+            let (bkd, wtkd) = kp.gpu.as_ref().unwrap();
+            let (bvd, wtvd) = vp.gpu.as_ref().unwrap();
+            o_vd = o_kd + kp.m as u64;
+            rec.qmv(*wtkd, bkd, 0, &gp.in_norm_buf, ne as u64, &gp.proj_buf, o_kd, ne, kp.m as u32);
+            rec.qmv(*wtvd, bvd, 0, &gp.in_norm_buf, (2 * ne) as u64, &gp.proj_buf, o_vd, ne, vp.m as u32);
+            has_dyn = true;
+        }
+
+        // 5. ShortConv on K and V
+        let kv_hist_off = (il as u32 * kv_dim * nh_hist) as u64;
+        let (dy_buf, kd_off, vd_off) = if has_dyn { (&gp.proj_buf, o_kd, o_vd) } else { (&gp.dummy_dyn, 0, 0) };
+        rec.inkling_conv(&gp.proj_buf, o_k, &gph.attn_k_conv, dy_buf, kd_off, &gp.k_hist, kv_hist_off, &gp.k_conv_buf, 0, kv_dim, self.n_conv as u32, has_dyn, hd);
+        rec.inkling_conv(&gp.proj_buf, o_v, &gph.attn_v_conv, dy_buf, vd_off, &gp.v_hist, kv_hist_off, &gp.v_conv_buf, 0, kv_dim, self.n_conv as u32, has_dyn, hd);
+
+        // 6. Attention (clip Q/K/R, norm V, KV store, relative bias + zero sink + sigmoid gate) -> attn_cat
+        rec.inkling_attn(
+            &gp.proj_buf, &gp.k_conv_buf, &gp.v_conv_buf, &gp.proj_buf, &gp.proj_buf, &gp.proj_buf,
+            &gph.attn_q_clip, &gph.attn_rel_clip, &gph.attn_rel_bias, &gp.k_cache, &gp.v_cache, &gp.attn_cat,
+            o_q as u32, o_r as u32, o_s as u32, o_g as u32,
+            p.n_head as u32, p.n_head_kv as u32, hd, self.n_rel as u32, p.n_extent as u32, self.n_swa as u32, p.is_swa,
+            gp.slot_caps[il], pos as u32, gp.slot_kv_offsets[il], self.qk_clip, self.rel_clip, tau, self.eps,
+        );
+
+        // 7. wo + attn_post_conv -> cur
+        let (bwo, wtwo) = p.wo.gpu.as_ref().unwrap();
+        rec.qmv(*wtwo, bwo, 0, &gp.attn_cat, 0, &gp.o_proj, 0, p.wo.k as u32, ne);
+        let post_hist_off = (il as u32 * ne * nh_hist) as u64;
+        rec.inkling_conv(&gp.o_proj, 0, &gph.attn_post_conv, &gp.dummy_dyn, 0, &gp.attn_post_hist, post_hist_off, &gp.cur, 0, ne, self.n_conv as u32, false, 1);
+
+        // 8. Block boundary vs residual add
+        if ip % self.block_size == 0 {
+            rec.rms_norm(&gp.inp_sa, 0, &gp.ones, 0, &gp.blocks_norm, (*blk_count * ne) as u64, ne, 1e-6);
+            *blk_count += 1;
+        } else {
+            rec.add(&gp.cur, 0, &gp.inp_sa, 0, ne);
+        }
+        rec.copy(&gp.cur, 0, &gp.ffn_inp, 0, ne);
+
+        // 9. FFN mix + loop controller 3 + ffn_norm -> x_moe
+        rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gph.ffn_res_query, &gp.cur, ne, 0, *blk_count, 1);
+        if let Some(li) = loop_idx {
+            let gl = &gp.loops[li];
+            let off = (3 * ne) as u64;
+            rec.rms_norm(&gp.cur, 0, &gp.ones, 0, &gp.ctrl_cat, 0, ne, 1e-6);
+            rec.rms_norm(&gp.msgs_buf, off, &gp.ones, 0, &gp.ctrl_cat, ne as u64, ne, 1e-6);
+            let (ref bd, wtd, kd, md) = gl.ctrl_down[3];
+            let (ref bg, wtg, kg, mg) = gl.ctrl_gain[3];
+            let (ref bf, wtf, kf, mf) = gl.ctrl_forget[3];
+            rec.qmv(wtd, bd, 0, &gp.ctrl_cat, 0, &gp.ctrl_gate, 0, kd, md);
+            rec.qmv(wtg, bg, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, 0, kg, mg);
+            rec.qmv(wtf, bf, 0, &gp.ctrl_gate, 0, &gp.ctrl_gf, ne as u64, kf, mf);
+            rec.inkling_ctrl(&gp.cur, 0, &gp.msgs_buf, off, &gp.ctrl_gf, 0, ne);
+        }
+        rec.rms_norm(&gp.cur, 0, &gph.ffn_norm, 0, &gp.x_moe, 0, ne, self.eps);
+
+        // 10. 128-expert / 8-active NVFP4 MoE (100% GPU-indexed!)
+        let (bgi, wtgi) = p.ffn_gate_inp.gpu.as_ref().unwrap();
+        rec.qmv(*wtgi, bgi, 0, &gp.x_moe, 0, &gp.router_logits, 0, ne, self.n_expert as u32);
+        let (bias_b, has_b) = match &gph.exp_probs_b {
+            Some(b) => (b, true),
+            None => (&gp.dummy_bias, false),
+        };
+        rec.moe_topk(&gp.router_logits, bias_b, &gp.top_ids, &gp.top_w, self.n_expert as u32, self.n_expert_used as u32, has_b, true, self.exp_w_scale);
+        rec.zero_buf(&gp.moe_out);
+        let (b_gu, wt_gu) = p.exps.gpu_gu.as_ref().unwrap();
+        let (b_dn, wt_dn) = p.exps.gpu_dn.as_ref().unwrap();
+        let bgu_tmp = self.gpu_gu.as_ref().unwrap();
+        let bmid_tmp = self.gpu_mid.as_ref().unwrap();
+        let by_tmp = self.gpu_y.as_ref().unwrap();
+        for slot in 0..self.n_expert_used as u32 {
+            rec.qmv_id(*wt_gu, b_gu, &gp.top_ids, slot, &gp.x_moe, 0, bgu_tmp, 0, ne, (2 * self.n_ff_exp) as u32, p.exps.gu_stride as u64);
+            rec.situ_id(bgu_tmp, bmid_tmp, &gp.top_ids, &gph.gu_scale, self.n_ff_exp as u32, slot, self.situ_beta, self.situ_lin_beta);
+            rec.qmv_id(*wt_dn, b_dn, &gp.top_ids, slot, bmid_tmp, 0, by_tmp, 0, self.n_ff_exp as u32, ne, p.exps.dn_stride as u64);
+            rec.add_scaled_exp_id(&gp.moe_out, by_tmp, &gp.top_w, &gp.top_ids, &gph.dn_scale, ne, slot);
+        }
+
+        // 11. FFN post ShortConv + residual add -> cur
+        rec.inkling_conv(&gp.moe_out, 0, &gph.ffn_post_conv, &gp.dummy_dyn, 0, &gp.ffn_post_hist, post_hist_off, &gp.ffn_out, 0, ne, self.n_conv as u32, false, 1);
+        rec.add(&gp.ffn_out, 0, &gp.ffn_inp, 0, ne);
+        rec.copy(&gp.ffn_out, 0, &gp.cur, 0, ne);
+    }
 }
 
 impl Executor for InklingExec {
     fn name(&self) -> String {
         if let Some(c) = &self.vk {
-            format!("vulkan-inkling-hybrid ({}, gpu_moe={}, cpu_moe={})", c.device_name(), self.gpu_moe_count, self.cpu_moe_count)
+            format!("vulkan-inkling-1sub ({}, gpu_moe={}, cpu_moe={})", c.device_name(), self.gpu_moe_count, self.cpu_moe_count)
         } else {
             format!("cpu-inkling (cpu_moe={})", self.cpu_moe_count)
         }
@@ -845,6 +1234,12 @@ impl Executor for InklingExec {
             s.attn_post_hist.fill(0.0);
             s.ffn_post_hist.fill(0.0);
         }
+        if let (Some(c), Some(gp)) = (&self.vk, &self.gpu_pipe) {
+            c.zero_buffer(&gp.k_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+            c.zero_buffer(&gp.v_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+            c.zero_buffer(&gp.attn_post_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+            c.zero_buffer(&gp.ffn_post_hist).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -854,12 +1249,87 @@ impl Executor for InklingExec {
         }
         let tau = 1.0 + self.log_scale_alpha * (((pos as f32 + 1.0) / self.log_scale_floor).max(1.0)).ln();
 
-        // Token embedding + token_embd_norm
+        // Token embedding
         let te = self.gguf.tensor(&self.tok_embd_name).unwrap();
         let rb = self.tok_embd_ty.row_bytes(self.n_embd).unwrap();
         let row = &self.gguf.tensor_data(te)[token as usize * rb..(token as usize + 1) * rb];
         let mut emb = vec![0f32; self.n_embd];
         dequantize_row(self.tok_embd_ty, row, &mut emb, self.n_embd);
+
+        // Fast path: ENTIRE 48-layer looped forward pass in ONE SINGLE Vulkan vkQueueSubmit!
+        if let (Some(c), Some(gp)) = (&self.vk, &self.gpu_pipe) {
+            let ne = self.n_embd as u32;
+            c.upload(&gp.cur, 0, bytemuck::cast_slice(&emb)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut rec = c.begin();
+            rec.rms_norm(&gp.cur, 0, &gp.tok_norm, 0, &gp.cur, 0, ne, self.eps);
+            let mut blk_count = 0u32;
+
+            // Prelude: 0..core_start
+            for il in 0..self.core_start {
+                self.record_layer_gpu(&mut rec, gp, il, il, pos, tau, &mut blk_count, None);
+            }
+            // Save prelude state
+            rec.copy(&gp.cur, 0, &gp.prelude_cur, 0, ne);
+            let prelude_blk_count = blk_count;
+
+            // Looped core: n_passes over core_start..core_end
+            for pass in 0..self.n_passes {
+                let mut bank_count = 0u32;
+                if pass > 0 {
+                    let bank_start = prelude_blk_count + 1;
+                    bank_count = blk_count.saturating_sub(bank_start);
+                    if bank_count > 0 {
+                        rec.copy(&gp.blocks_norm, (bank_start * ne) as u64, &gp.bank_norm, 0, bank_count * ne);
+                    }
+                    rec.copy(&gp.cur, 0, &gp.bank_out, 0, ne);
+                    rec.copy(&gp.prelude_cur, 0, &gp.cur, 0, ne);
+                    blk_count = prelude_blk_count;
+                }
+                for ip in self.core_start..self.core_end {
+                    let il = if pass == 0 {
+                        ip
+                    } else {
+                        self.n_phys + (pass - 1) * (self.core_end - self.core_start) + (ip - self.core_start)
+                    };
+                    if pass == 0 {
+                        self.record_layer_gpu(&mut rec, gp, il, ip, pos, tau, &mut blk_count, None);
+                    } else {
+                        let li = ip - self.core_start;
+                        rec.inkling_mix(&gp.bank_norm, &gp.bank_out, &gp.loops[li].msg_query, &gp.msgs_buf, ne, 0, bank_count, 4);
+                        self.record_layer_gpu(&mut rec, gp, il, ip, pos, tau, &mut blk_count, Some(li));
+                    }
+                }
+            }
+
+            // Postlude: core_end..n_phys
+            for il in self.core_end..self.n_phys {
+                self.record_layer_gpu(&mut rec, gp, il, il, pos, tau, &mut blk_count, None);
+            }
+
+            // Output mix + norm + lm_head
+            if out.logits || out.hidden {
+                rec.inkling_mix(&gp.blocks_norm, &gp.cur, &gp.output_res_query, &gp.cur, ne, 0, blk_count, 1);
+                rec.rms_norm(&gp.cur, 0, &gp.output_norm, 0, &gp.hidden_buf, 0, ne, self.eps);
+            }
+            if out.logits {
+                let (bo, wto) = self.output_w.gpu.as_ref().unwrap();
+                rec.qmv(*wto, bo, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, ne, self.output_w.m as u32);
+            }
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            if out.hidden {
+                c.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
+            if out.logits {
+                let mut full = vec![0f32; self.n_vocab_unpadded];
+                c.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut full)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                for i in 0..self.n_vocab_unpadded {
+                    let v = full[i];
+                    self.logits[i] = if self.softcap > 0.0 { self.softcap * (v / self.softcap).tanh() } else { v };
+                }
+            }
+            return Ok(());
+        }
+
         let mut cur = rms_norm_weighted(&emb, &self.tok_norm, self.eps);
 
         let mut blocks: Vec<Vec<f32>> = Vec::new();

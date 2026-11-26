@@ -1,0 +1,40 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Inp { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer Dyn { float dy[]; };
+layout(set = 0, binding = 3) buffer Hist { float hist[]; };
+layout(set = 0, binding = 4) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint inp_off;
+    uint dy_off;
+    uint hist_off;
+    uint out_off;
+    uint n_ch;
+    uint n_conv;
+    uint has_dyn;
+    uint head_ch;
+} pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.n_ch) return;
+    uint nh = pc.n_conv - 1u;
+    uint ho = pc.hist_off + c * nh;
+    uint wo = c * pc.n_conv;
+    float cur_v = inp[pc.inp_off + c];
+    float acc = 0.0;
+    for (uint k = 0u; k < nh; k++) acc += hist[ho + k] * wt[wo + k];
+    acc += cur_v * wt[wo + nh];
+    if (pc.has_dyn != 0u) {
+        uint h = c / pc.head_ch;
+        uint d_off = pc.dy_off + h * pc.n_conv;
+        acc += cur_v * dy[d_off];
+        for (uint lag = 1u; lag < pc.n_conv; lag++) {
+            acc += hist[ho + (nh - lag)] * dy[d_off + lag];
+        }
+    }
+    for (uint k = 0u; k + 1u < nh; k++) hist[ho + k] = hist[ho + k + 1u];
+    hist[ho + nh - 1u] = cur_v;
+    float denom = sqrt(float(((pc.has_dyn != 0u) ? 2u : 1u) * pc.n_conv + 1u));
+    o[pc.out_off + c] = (cur_v + acc) / denom;
+}

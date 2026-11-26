@@ -1,0 +1,43 @@
+#version 460
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 1) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 2) writeonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 3) writeonly buffer Weights { float weights[]; };
+layout(push_constant) uniform PC {
+    uint n_exp;
+    uint n_used;
+    uint has_bias;
+    uint norm_w;
+    float scale;
+} pc;
+void main() {
+    float probs[128];
+    float biased[128];
+    uint used_mask[128];
+    for (uint e = 0u; e < pc.n_exp; e++) {
+        float p = 1.0 / (1.0 + exp(-logits[e]));
+        probs[e] = p;
+        biased[e] = p + ((pc.has_bias != 0u) ? bias[e] : 0.0);
+        used_mask[e] = 0u;
+    }
+    float wsum = 0.0;
+    for (uint k = 0u; k < pc.n_used; k++) {
+        uint best = 0u;
+        float best_v = -1e30;
+        for (uint e = 0u; e < pc.n_exp; e++) {
+            if (used_mask[e] == 0u && biased[e] > best_v) {
+                best_v = biased[e];
+                best = e;
+            }
+        }
+        used_mask[best] = 1u;
+        ids[k] = best;
+        weights[k] = probs[best];
+        wsum += probs[best];
+    }
+    float mult = (pc.norm_w != 0u) ? (pc.scale / (wsum + 1e-20)) : pc.scale;
+    for (uint k = 0u; k < pc.n_used; k++) {
+        weights[k] *= mult;
+    }
+}

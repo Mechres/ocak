@@ -1,0 +1,67 @@
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
+layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
+layout(set = 0, binding = 2) readonly buffer KvCache { float kvc[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint key_dim;
+    uint nope;
+    uint n_rot;
+    uint latent;
+    uint pos;
+    uint kv_layer_off;
+    float kq_scale;
+} pc;
+shared float smax[256];
+shared float ssum[256];
+shared float w_shared[4096];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = pc.latent + pc.n_rot;
+    uint n_t = pc.pos + 1u;
+    uint ql_base = h * pc.latent;
+    uint qp_base = h * pc.key_dim + pc.nope;
+
+    float local_max = -1e30;
+    for (uint t = tid; t < n_t; t += 256u) {
+        uint kb = pc.kv_layer_off + t * hd;
+        float dot = 0.0;
+        for (uint i = 0u; i < pc.latent; i++) dot += ql[ql_base + i] * kvc[kb + i];
+        for (uint i = 0u; i < pc.n_rot; i++) dot += qf[qp_base + i] * kvc[kb + pc.latent + i];
+        float s = dot * pc.kq_scale;
+        w_shared[t] = s;
+        local_max = max(local_max, s);
+    }
+    smax[tid] = local_max;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]);
+        barrier();
+    }
+    float mx = smax[0];
+
+    float local_sum = 0.0;
+    for (uint t = tid; t < n_t; t += 256u) {
+        float e = exp(w_shared[t] - mx);
+        w_shared[t] = e;
+        local_sum += e;
+    }
+    ssum[tid] = local_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / ssum[0];
+
+    uint out_base = h * pc.latent;
+    for (uint i = tid; i < pc.latent; i += 256u) {
+        float acc = 0.0;
+        for (uint t = 0u; t < n_t; t++) {
+            acc += (w_shared[t] * inv) * kvc[pc.kv_layer_off + t * hd + i];
+        }
+        o[out_base + i] = acc;
+    }
+}
