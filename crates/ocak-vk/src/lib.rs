@@ -228,6 +228,7 @@ pub struct VkContext {
     instance: Instance,
     _phys: vk::PhysicalDevice,
     device: Device,
+    push_desc: Option<ash::khr::push_descriptor::Device>,
     queue: vk::Queue,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
@@ -247,6 +248,7 @@ fn build_pipeline(
     spv_bytes: &[u8],
     n_bindings: u32,
     push_size: u32,
+    use_push_desc: bool,
 ) -> Result<PipelineBundle, VkError> {
     assert_eq!(spv_bytes.len() % 4, 0);
     let code: Vec<u32> = spv_bytes
@@ -264,8 +266,15 @@ fn build_pipeline(
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
             })
             .collect();
+        let ds_flags = if use_push_desc {
+            vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+        } else {
+            vk::DescriptorSetLayoutCreateFlags::empty()
+        };
         let ds_layout = dev.create_descriptor_set_layout(
-            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            &vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(ds_flags)
+                .bindings(&bindings),
             None,
         )?;
         let pc_range = [vk::PushConstantRange::default()
@@ -341,6 +350,23 @@ impl VkContext {
             let (phys, qf, device_name, subgroup_size, vram_bytes, _) = best.ok_or(VkError::NoDevice)?;
             let mem_props = instance.get_physical_device_memory_properties(phys);
 
+            let exts = instance.enumerate_device_extension_properties(phys)?;
+            let has_push_desc_ext = exts.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
+            });
+            let use_push_desc = if has_push_desc_ext {
+                let mut pd_props = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+                let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut pd_props);
+                instance.get_physical_device_properties2(phys, &mut props2);
+                pd_props.max_push_descriptors >= 16
+            } else {
+                false
+            };
+            let mut dev_exts: Vec<*const std::ffi::c_char> = Vec::new();
+            if use_push_desc {
+                dev_exts.push(ash::khr::push_descriptor::NAME.as_ptr());
+            }
+
             let prio = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
             let mut feat12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -349,81 +375,88 @@ impl VkContext {
             let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feat12);
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qci)
+                .enabled_extension_names(&dev_exts)
                 .push_next(&mut feat2);
             let device = instance.create_device(phys, &dci, None)?;
+            let push_desc = if use_push_desc {
+                Some(ash::khr::push_descriptor::Device::new(&instance, &device))
+            } else {
+                None
+            };
             let queue = device.get_device_queue(qf, 0);
 
+            let bp = |spv: &[u8], nb: u32, pc: u32| build_pipeline(&device, spv, nb, pc, use_push_desc);
             let pipelines = Pipelines {
-                rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 20)?,
-                add_rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_rms_norm.spv")), 4, 24)?,
-                add: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
-                add_scaled: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
-                copy: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv")), 2, 12)?,
-                swiglu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/swiglu.spv")), 3, 16)?,
-                situ: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/situ.spv")), 2, 24)?,
-                rope: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
-                kv_write: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/kv_write.spv")), 4, 24)?,
-                attention: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 36)?,
-                embed: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 3, 20)?,
-                qmv_f32: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f32.spv")), 3, 24)?,
-                qmv_f16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f16.spv")), 3, 24)?,
-                qmv_bf16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_bf16.spv")), 3, 24)?,
-                qmv_q8_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0.spv")), 3, 24)?,
-                qmv_q4_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_0.spv")), 3, 24)?,
-                qmv_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k.spv")), 3, 24)?,
-                qmv_q5_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q5_k.spv")), 3, 24)?,
-                qmv_q6_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q6_k.spv")), 3, 24)?,
-                qmv_q2_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q2_k.spv")), 3, 24)?,
-                qmv_q3_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q3_k.spv")), 3, 24)?,
-                rms_norm_heads: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_heads.spv")), 2, 16)?,
-                shortconv_step: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_step.spv")), 4, 12)?,
-                ssm_conv_silu: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), 4, 12)?,
-                deltanet_step: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step.spv")), 7, 20)?,
-                gated_rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), 4, 12)?,
-                split_qg: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), 3, 8)?,
-                mul_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), 2, 4)?,
-                mul_head_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_head_sigmoid.spv")), 2, 8)?,
-                rope_ext: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_ext.spv")), 3, 40)?,
-                qmv_iq2_xxs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xxs.spv")), 4, 24)?,
-                qmv_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xs.spv")), 4, 24)?,
-                qmv_iq2_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_s.spv")), 4, 24)?,
-                qmv_iq3_xxs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs.spv")), 4, 24)?,
-                qmv_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s.spv")), 4, 24)?,
-                qmv_iq1_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_s.spv")), 4, 24)?,
-                qmv_iq1_m: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_m.spv")), 4, 24)?,
-                qmv_iq4_nl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_nl.spv")), 4, 24)?,
-                qmv_iq4_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_xs.spv")), 4, 24)?,
-                qmv_nvfp4: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4.spv")), 3, 24)?,
-                hc_sinkhorn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/hc_sinkhorn.spv")), 3, 8)?,
-                hc_mix: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/hc_mix.spv")), 4, 8)?,
-                rope_yarn_mla: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), 3, 48)?,
-                mla_attn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 4, 28)?,
-                moe_topk: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), 4, 20)?,
-                qmv_iq3_xxs_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 32)?,
-                qmv_iq3_s_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 32)?,
-                qmv_nvfp4_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 32)?,
-                qmv_q8_0_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 32)?,
-                situ_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
-                add_scaled_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 24)?,
-                add_scaled_exp_id: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 16)?,
-                inkling_mix: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 16)?,
-                inkling_ctrl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), 3, 16)?,
-                inkling_conv: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 32)?,
-                inkling_attn: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn.spv")), 12, 72)?,
-                qmm_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_k.spv")), 3, 28)?,
-                qmm_q6_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q6_k.spv")), 3, 28)?,
-                qmm_q5_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q5_k.spv")), 3, 28)?,
-                qmm_q4_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_0.spv")), 3, 28)?,
-                qmm_q8_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q8_0.spv")), 3, 28)?,
-                qmm_f16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f16.spv")), 3, 28)?,
-                qmm_f32: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f32.spv")), 3, 28)?,
-                qmm_iq2_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_s.spv")), 4, 28)?,
-                qmm_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), 4, 28)?,
-                qmm_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), 4, 28)?,
-                qmm2_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq2_xs.spv")), 4, 28)?,
-                qmm2_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
-                qmm2_q5_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), 3, 28)?,
-                qmm2_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), 4, 28)?,
+                rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 20)?,
+                add_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_rms_norm.spv")), 4, 24)?,
+                add: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
+                add_scaled: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
+                copy: bp(include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv")), 2, 12)?,
+                swiglu: bp(include_bytes!(concat!(env!("OUT_DIR"), "/swiglu.spv")), 3, 16)?,
+                situ: bp(include_bytes!(concat!(env!("OUT_DIR"), "/situ.spv")), 2, 24)?,
+                rope: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
+                kv_write: bp(include_bytes!(concat!(env!("OUT_DIR"), "/kv_write.spv")), 4, 24)?,
+                attention: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 36)?,
+                embed: bp(include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 3, 20)?,
+                qmv_f32: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f32.spv")), 3, 24)?,
+                qmv_f16: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f16.spv")), 3, 24)?,
+                qmv_bf16: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_bf16.spv")), 3, 24)?,
+                qmv_q8_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0.spv")), 3, 24)?,
+                qmv_q4_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_0.spv")), 3, 24)?,
+                qmv_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k.spv")), 3, 24)?,
+                qmv_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q5_k.spv")), 3, 24)?,
+                qmv_q6_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q6_k.spv")), 3, 24)?,
+                qmv_q2_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q2_k.spv")), 3, 24)?,
+                qmv_q3_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q3_k.spv")), 3, 24)?,
+                rms_norm_heads: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_heads.spv")), 2, 16)?,
+                shortconv_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_step.spv")), 4, 12)?,
+                ssm_conv_silu: bp(include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), 4, 12)?,
+                deltanet_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step.spv")), 7, 20)?,
+                gated_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), 4, 12)?,
+                split_qg: bp(include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), 3, 8)?,
+                mul_sigmoid: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), 2, 4)?,
+                mul_head_sigmoid: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mul_head_sigmoid.spv")), 2, 8)?,
+                rope_ext: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope_ext.spv")), 3, 40)?,
+                qmv_iq2_xxs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xxs.spv")), 4, 24)?,
+                qmv_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xs.spv")), 4, 24)?,
+                qmv_iq2_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_s.spv")), 4, 24)?,
+                qmv_iq3_xxs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs.spv")), 4, 24)?,
+                qmv_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s.spv")), 4, 24)?,
+                qmv_iq1_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_s.spv")), 4, 24)?,
+                qmv_iq1_m: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_m.spv")), 4, 24)?,
+                qmv_iq4_nl: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_nl.spv")), 4, 24)?,
+                qmv_iq4_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_xs.spv")), 4, 24)?,
+                qmv_nvfp4: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4.spv")), 3, 24)?,
+                hc_sinkhorn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/hc_sinkhorn.spv")), 3, 8)?,
+                hc_mix: bp(include_bytes!(concat!(env!("OUT_DIR"), "/hc_mix.spv")), 4, 8)?,
+                rope_yarn_mla: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), 3, 48)?,
+                mla_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 4, 28)?,
+                moe_topk: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), 4, 20)?,
+                qmv_iq3_xxs_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 32)?,
+                qmv_iq3_s_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 32)?,
+                qmv_nvfp4_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 32)?,
+                qmv_q8_0_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 32)?,
+                situ_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
+                add_scaled_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 24)?,
+                add_scaled_exp_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 16)?,
+                inkling_mix: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 16)?,
+                inkling_ctrl: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), 3, 16)?,
+                inkling_conv: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 32)?,
+                inkling_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn.spv")), 12, 72)?,
+                qmm_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_k.spv")), 3, 28)?,
+                qmm_q6_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q6_k.spv")), 3, 28)?,
+                qmm_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q5_k.spv")), 3, 28)?,
+                qmm_q4_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_0.spv")), 3, 28)?,
+                qmm_q8_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q8_0.spv")), 3, 28)?,
+                qmm_f16: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f16.spv")), 3, 28)?,
+                qmm_f32: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f32.spv")), 3, 28)?,
+                qmm_iq2_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_s.spv")), 4, 28)?,
+                qmm_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), 4, 28)?,
+                qmm_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), 4, 28)?,
+                qmm2_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq2_xs.spv")), 4, 28)?,
+                qmm2_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
+                qmm2_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), 3, 28)?,
+                qmm2_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), 4, 28)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -481,6 +514,7 @@ impl VkContext {
                 instance,
                 _phys: phys,
                 device,
+                push_desc,
                 queue,
                 mem_props,
                 device_name,
@@ -638,7 +672,9 @@ impl VkContext {
     pub fn begin(&self) -> Recorder<'_> {
         let exec = self.exec.lock().unwrap();
         unsafe {
-            self.device.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
+            if self.push_desc.is_none() {
+                self.device.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
+            }
             self.device.reset_command_buffer(exec.cmd_buf, vk::CommandBufferResetFlags::empty()).unwrap();
             self.device.begin_command_buffer(
                 exec.cmd_buf,
@@ -799,34 +835,51 @@ impl<'a> Recorder<'a> {
     ) {
         debug_assert!(bufs.len() <= 16);
         unsafe {
-            let layouts = [pipe.ds_layout];
-            let ds = self.ctx.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.exec.desc_pool)
-                    .set_layouts(&layouts),
-            ).expect("descriptor set alloc")[0];
             let mut infos = [vk::DescriptorBufferInfo::default(); 16];
             for (i, &b) in bufs.iter().enumerate() {
                 infos[i] = vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE);
             }
-            let mut writes = [vk::WriteDescriptorSet::default(); 16];
-            for i in 0..bufs.len() {
-                writes[i] = vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(&infos[i]));
-            }
-            self.ctx.device.update_descriptor_sets(&writes[..bufs.len()], &[]);
             self.ctx.device.cmd_bind_pipeline(self.exec.cmd_buf, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
-            self.ctx.device.cmd_bind_descriptor_sets(
-                self.exec.cmd_buf,
-                vk::PipelineBindPoint::COMPUTE,
-                pipe.layout,
-                0,
-                &[ds],
-                &[],
-            );
+            if let Some(ref pd) = self.ctx.push_desc {
+                let mut writes = [vk::WriteDescriptorSet::default(); 16];
+                for i in 0..bufs.len() {
+                    writes[i] = vk::WriteDescriptorSet::default()
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&infos[i]));
+                }
+                pd.cmd_push_descriptor_set(
+                    self.exec.cmd_buf,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipe.layout,
+                    0,
+                    &writes[..bufs.len()],
+                );
+            } else {
+                let layouts = [pipe.ds_layout];
+                let ds = self.ctx.device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.exec.desc_pool)
+                        .set_layouts(&layouts),
+                ).expect("descriptor set alloc")[0];
+                let mut writes = [vk::WriteDescriptorSet::default(); 16];
+                for i in 0..bufs.len() {
+                    writes[i] = vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&infos[i]));
+                }
+                self.ctx.device.update_descriptor_sets(&writes[..bufs.len()], &[]);
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    self.exec.cmd_buf,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipe.layout,
+                    0,
+                    &[ds],
+                    &[],
+                );
+            }
             self.ctx.device.cmd_push_constants(
                 self.exec.cmd_buf,
                 pipe.layout,
@@ -910,16 +963,17 @@ impl<'a> Recorder<'a> {
             }
         }
         let gy = (batch + 7) / 8;
+        let gx8 = (m + 7) / 8;
         match ty {
-            WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
-            WType::Q6K => self.dispatch_raw(&self.ctx.pipelines.qmm_q6_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
+            WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
+            WType::Q6K => self.dispatch_raw(&self.ctx.pipelines.qmm_q6_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             WType::Q5K => self.dispatch_raw(&self.ctx.pipelines.qmm_q5_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::Q4_0 => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_0, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmm_q8_0, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::F16 => self.dispatch_raw(&self.ctx.pipelines.qmm_f16, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::F32 => self.dispatch_raw(&self.ctx.pipelines.qmm_f32, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::IQ2S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
-            WType::IQ2XS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
+            WType::IQ2XS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             _ => {
                 for b in 0..batch {

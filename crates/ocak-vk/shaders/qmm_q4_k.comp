@@ -1,11 +1,12 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_8bit_storage : require
-layout(local_size_x = 32, local_size_y = 4) in;
+layout(local_size_x = 32, local_size_y = 8) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+shared float sx[8][256];
 void get_scale_min_k4(uint j, uint sb, out uint sc, out uint mn) {
     if (j < 4u) {
         sc = uint(w[sb + j]) & 63u;
@@ -18,7 +19,8 @@ void get_scale_min_k4(uint j, uint sb, out uint sc, out uint mn) {
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
-    uint row = gl_WorkGroupID.x * 4u + ly;
+    uint lid = ly * 32u + tid;
+    uint row = gl_WorkGroupID.x * 8u + ly;
     uint b0 = gl_WorkGroupID.y * 8u;
     uint bm = pc.batch - 1u;
     uint o0 = pc.x_off + b0 * pc.k;
@@ -30,36 +32,41 @@ void main() {
     uint o6 = pc.x_off + min(b0 + 6u, bm) * pc.k;
     uint o7 = pc.x_off + min(b0 + 7u, bm) * pc.k;
     vec4 acc0 = vec4(0.0), acc1 = vec4(0.0);
-    if (row < pc.m) {
-        uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nsub = pc.k / 32u;
-        for (uint sb = tid; sb < nsub; sb += 32u) {
-            uint blk = sb >> 3;
-            uint j = sb & 7u;
+    uint rbase = pc.w_off + row * pc.row_bytes;
+    uint nb = pc.k / 256u;
+    for (uint blk = 0u; blk < nb; blk++) {
+        uint xidx = blk * 256u + lid;
+        sx[0][lid] = x[o0 + xidx];
+        sx[1][lid] = x[o1 + xidx];
+        sx[2][lid] = x[o2 + xidx];
+        sx[3][lid] = x[o3 + xidx];
+        sx[4][lid] = x[o4 + xidx];
+        sx[5][lid] = x[o5 + xidx];
+        sx[6][lid] = x[o6 + xidx];
+        sx[7][lid] = x[o7 + xidx];
+        barrier();
+        if (row < pc.m) {
             uint b = rbase + blk * 144u;
             float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
             float dmin = unpackHalf2x16(uint(w[b + 2u]) | (uint(w[b + 3u]) << 8)).x;
-            uint sc, mn;
-            get_scale_min_k4(j, b + 4u, sc, mn);
-            uint qoff = b + 16u + (j >> 1) * 32u;
-            uint shift = (j & 1u) * 4u;
-            uint xbase = sb * 32u;
-            vec4 s0 = vec4(0.0), s1 = vec4(0.0), sx0 = vec4(0.0), sx1 = vec4(0.0);
-            for (uint l = 0u; l < 32u; l++) {
-                float qv = float((uint(w[qoff + l]) >> shift) & 0xFu);
-                uint xr = xbase + l;
-                vec4 x0 = vec4(x[o0 + xr], x[o1 + xr], x[o2 + xr], x[o3 + xr]);
-                vec4 x1 = vec4(x[o4 + xr], x[o5 + xr], x[o6 + xr], x[o7 + xr]);
-                s0 += qv * x0;
-                s1 += qv * x1;
-                sx0 += x0;
-                sx1 += x1;
+            for (uint pair = 0u; pair < 4u; pair++) {
+                uint j0 = pair * 2u;
+                uint j1 = j0 + 1u;
+                uint sc0, mn0, sc1, mn1;
+                get_scale_min_k4(j0, b + 4u, sc0, mn0);
+                get_scale_min_k4(j1, b + 4u, sc1, mn1);
+                uint qb = uint(w[b + 16u + pair * 32u + tid]);
+                float w0 = d * float(sc0) * float(qb & 0xFu) - dmin * float(mn0);
+                float w1 = d * float(sc1) * float(qb >> 4) - dmin * float(mn1);
+                uint i0 = j0 * 32u + tid;
+                acc0 += w0 * vec4(sx[0][i0], sx[1][i0], sx[2][i0], sx[3][i0]);
+                acc1 += w0 * vec4(sx[4][i0], sx[5][i0], sx[6][i0], sx[7][i0]);
+                uint i1 = j1 * 32u + tid;
+                acc0 += w1 * vec4(sx[0][i1], sx[1][i1], sx[2][i1], sx[3][i1]);
+                acc1 += w1 * vec4(sx[4][i1], sx[5][i1], sx[6][i1], sx[7][i1]);
             }
-            float ds = d * float(sc);
-            float dm = dmin * float(mn);
-            acc0 += ds * s0 - dm * sx0;
-            acc1 += ds * s1 - dm * sx1;
         }
+        barrier();
     }
     vec4 r0 = subgroupClusteredAdd(acc0, 32u);
     vec4 r1 = subgroupClusteredAdd(acc1, 32u);
