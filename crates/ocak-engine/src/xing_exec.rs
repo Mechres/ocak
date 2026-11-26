@@ -50,7 +50,12 @@ impl XingConfig {
         let u = |k: &str, d: u64| g.arch_u64(k).unwrap_or(d) as usize;
         let f = |k: &str, d: f64| g.arch_f64(k).unwrap_or(d) as f32;
         let block_count = u("block_count", 40);
-        let nextn = u("nextn_predict_layers", 0);
+        let nextn_meta = u("nextn_predict_layers", 0);
+        // Some GGUFs strip the NextN/MTP block but keep `nextn_predict_layers`; only treat the
+        // trailing blocks as MTP if they actually carry `nextn.*` tensors.
+        let nextn = (0..nextn_meta.min(block_count))
+            .take_while(|i| g.tensor(&format!("blk.{}.nextn.eh_proj.weight", block_count - 1 - i)).is_some())
+            .count();
         let embd = g.tensor("token_embd.weight").ok_or_else(|| EngineError::Unsupported("missing token_embd".into()))?;
         Ok(Self {
             n_layer: block_count.saturating_sub(nextn),
@@ -76,7 +81,9 @@ impl XingConfig {
             rope_orig_ctx: u("rope.scaling.original_context_length", 4096),
             yarn_beta_fast: f("rope.scaling.yarn_beta_fast", 32.0),
             yarn_beta_slow: f("rope.scaling.yarn_beta_slow", 1.0),
-            yarn_log_mul: f("rope.scaling.yarn_log_multiplier", 0.1),
+            // The HF->GGUF converter stores yarn_log_multiplier pre-multiplied by 0.1; cancel it
+            // (matches llama.cpp TAG_DEEPSEEK2_YARN_LOG_MUL_FIX), otherwise kq_scale is ~1.85x too small.
+            yarn_log_mul: f("rope.scaling.yarn_log_multiplier", 0.1) / 0.1,
             n_vocab: embd.n_rows(),
             n_ctx_train: u("context_length", 262144),
         })
