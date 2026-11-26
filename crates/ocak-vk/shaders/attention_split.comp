@@ -1,0 +1,111 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Split-K ("flash-decoding") pass 1 for long contexts.
+// Grid = (n_heads, n_splits). Workgroup (h, s) attends query head h over context chunk s and
+// writes an UNNORMALIZED partial softmax state to scratch: [m, l, acc[head_dim]].
+// attention_merge.comp combines the n_splits partials per head.
+#define NG 8u
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KV { uint kv[]; };
+layout(set = 0, binding = 2) readonly buffer PT { uint pt[]; };
+layout(set = 0, binding = 3) writeonly buffer S { float scratch[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint layer_kv_off;
+    uint pt_off;
+    uint scratch_off;   // in floats
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint pos;
+    uint t_start;
+    uint chunk;         // tokens per split
+} pc;
+
+shared float sm_m[NG];
+shared float sm_l[NG];
+shared vec2 sm_acc[NG][128];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint s = gl_WorkGroupID.y;
+    uint n_splits = gl_NumWorkGroups.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint g = tid >> 5;
+    uint lane = tid & 31u;
+    uint group = pc.n_heads / pc.n_kv_heads;
+    uint kvh = h / group;
+    uint half_hd = pc.head_dim >> 1;
+    uint half_kv_dim = pc.n_kv_heads * half_hd;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    vec2 qreg[4];
+    vec2 acc[4];
+    for (uint j = 0u; j < 4u; j++) {
+        uint d2 = lane + j * 32u;
+        if (d2 < half_hd) {
+            uint qb = pc.q_off + h * pc.head_dim + 2u * d2;
+            qreg[j] = vec2(q[qb], q[qb + 1u]);
+        } else {
+            qreg[j] = vec2(0.0);
+        }
+        acc[j] = vec2(0.0);
+    }
+
+    float m = -3.402823466e38;
+    float l = 0.0;
+    uint c0 = pc.t_start + s * pc.chunk;
+    uint c1 = min(c0 + pc.chunk, pc.pos + 1u);
+    for (uint t = c0 + g; t < c1; t += NG) {
+        uint page = pt[pc.pt_off + (t >> 4)];
+        uint slot = t & 15u;
+        uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * half_kv_dim + kvh * half_hd;
+        uint vo = pc.layer_kv_off + ((page * 2u + 1u) * 16u + slot) * half_kv_dim + kvh * half_hd;
+        float part = 0.0;
+        for (uint j = 0u; j < 4u; j++) {
+            uint d2 = lane + j * 32u;
+            if (d2 < half_hd) part += dot(qreg[j], unpackHalf2x16(kv[ko + d2]));
+        }
+        float score = subgroupClusteredAdd(part, 32u) * scale;
+        float m_new = max(m, score);
+        float alpha = exp(m - m_new);
+        float p = exp(score - m_new);
+        l = l * alpha + p;
+        for (uint j = 0u; j < 4u; j++) {
+            uint d2 = lane + j * 32u;
+            if (d2 < half_hd) acc[j] = acc[j] * alpha + p * unpackHalf2x16(kv[vo + d2]);
+        }
+        m = m_new;
+    }
+
+    if (lane == 0u) {
+        sm_m[g] = m;
+        sm_l[g] = l;
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint d2 = lane + j * 32u;
+        if (d2 < half_hd) sm_acc[g][d2] = acc[j];
+    }
+    barrier();
+
+    float gm = -3.402823466e38;
+    for (uint k = 0u; k < NG; k++) if (sm_l[k] > 0.0) gm = max(gm, sm_m[k]);
+    float wk[NG];
+    float L = 0.0;
+    for (uint k = 0u; k < NG; k++) {
+        wk[k] = (sm_l[k] > 0.0) ? exp(sm_m[k] - gm) : 0.0;
+        L += sm_l[k] * wk[k];
+    }
+    uint base = pc.scratch_off + (h * n_splits + s) * (pc.head_dim + 2u);
+    if (tid == 0u) {
+        scratch[base] = gm;
+        scratch[base + 1u] = L;   // L == 0 marks an empty split
+    }
+    for (uint d2 = tid; d2 < half_hd; d2 += 256u) {
+        vec2 r = vec2(0.0);
+        for (uint k = 0u; k < NG; k++) r += sm_acc[k][d2] * wk[k];
+        scratch[base + 2u + 2u * d2] = r.x;
+        scratch[base + 3u + 2u * d2] = r.y;
+    }
+}

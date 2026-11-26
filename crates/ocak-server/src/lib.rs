@@ -63,7 +63,7 @@ impl Default for ServerConfig {
             presets_path,
             sleep_idle_seconds: 120,
             backend: BackendKind::Vulkan,
-            max_ctx: 2048,
+            max_ctx: 16384,
             api_key: std::env::var("OCAK_API_KEY").ok().filter(|s| !s.is_empty()),
             allow_remote_host: std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1"),
         }
@@ -301,11 +301,9 @@ impl AppState {
             .set_state(&entry.id, est, ModelResidencyState::Loading, Instant::now());
 
         let path = entry.path.clone();
-        let kv_pages = if entry.size_bytes > 8 * 1024 * 1024 * 1024 {
-            (self.cfg.max_ctx / 16 * 2).max(256)
-        } else {
-            (self.cfg.max_ctx / 16 * 8).max(1024)
-        };
+        // Room for two full-length contexts (prefix cache + concurrent slots share the pool).
+        // NativeEngine::load clamps this, and max_ctx itself, to the VRAM actually free.
+        let kv_pages = (self.cfg.max_ctx / 16 * 2).max(1024);
         let opts = EngineOptions {
             backend: self.cfg.backend,
             max_ctx: self.cfg.max_ctx,

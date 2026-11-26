@@ -38,7 +38,7 @@ shared float sk_cur[128];
 shared float sk_tmp[128];
 shared float smax[128];
 shared float ssum[128];
-shared float scores[2048];
+shared float tile_p[128];   // softmax numerators for the current 128-token tile
 void main() {
     uint h = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
@@ -109,62 +109,66 @@ void main() {
     float scale = inversesqrt(float(pc.hd));
     float sink_t = sinks[pc.s_off + h];
 
-    float lmax = 0.0; // zero sink logit = 0.0
-    for (uint idx = tid; idx < t_len; idx += 128u) {
-        uint t = t_start + idx;
-        uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-        float dot = 0.0;
-        if (t == pc.pos) {
-            for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * sk_cur[d];
-        } else {
-            uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd;
-            for (uint d2 = 0u; d2 < half_hd; d2++) {
-                vec2 kv = unpackHalf2x16(kcache[kb + d2]);
-                dot += sq[2u * d2] * kv.x + sq[2u * d2 + 1u] * kv.y;
-            }
-        }
-        uint dist = pc.pos - t;
-        float rb = 0.0;
-        if (dist < pc.n_extent) {
-            uint rbo = dist * pc.n_rel;
-            for (uint j = 0u; j < pc.n_rel; j++) rb += rbias[rbo + j] * sr[j];
-        }
-        float sc = dot * scale + rb - sink_t;
-        scores[idx] = sc;
-        lmax = max(lmax, sc);
-    }
-    smax[tid] = lmax;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]); barrier(); }
-    float mx = smax[0];
-
-    float lsum = (tid == 0u) ? exp(-mx) : 0.0; // zero sink
-    for (uint idx = tid; idx < t_len; idx += 128u) {
-        float e = exp(scores[idx] - mx);
-        scores[idx] = e;
-        lsum += e;
-    }
-    ssum[tid] = lsum;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) ssum[tid] += ssum[tid + s]; barrier(); }
-    float inv = 1.0 / ssum[0];
-
-    // 4. Weighted V sum + sigmoid gate
+    // Online softmax over 128-token tiles (no context-length cap). The zero-logit sink is the
+    // initial state: m = 0, l = exp(0 - 0) = 1, contributing to the normalizer but not to V.
     uint d2 = tid >> 1;
     uint lane = tid & 1u;
+    float m_run = 0.0;
+    float l_run = 1.0;
     float acc = 0.0;
-    for (uint idx = 0u; idx < t_len; idx++) {
-        uint t = t_start + idx;
-        uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-        float vv;
-        if (t == pc.pos) {
-            vv = v_cur_val;
-        } else {
-            vec2 vp = unpackHalf2x16(vcache[pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd + d2]);
-            vv = (lane == 0u) ? vp.x : vp.y;
+    for (uint base = 0u; base < t_len; base += 128u) {
+        uint tile_len = min(128u, t_len - base);
+        uint idx = base + tid;
+        float sc = -3.402823466e38;
+        if (tid < tile_len) {
+            uint t = t_start + idx;
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+            float dot = 0.0;
+            if (t == pc.pos) {
+                for (uint d = 0u; d < pc.hd; d++) dot += sq[d] * sk_cur[d];
+            } else {
+                uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd;
+                for (uint e2 = 0u; e2 < half_hd; e2++) {
+                    vec2 kv = unpackHalf2x16(kcache[kb + e2]);
+                    dot += sq[2u * e2] * kv.x + sq[2u * e2 + 1u] * kv.y;
+                }
+            }
+            uint dist = pc.pos - t;
+            float rb = 0.0;
+            if (dist < pc.n_extent) {
+                uint rbo = dist * pc.n_rel;
+                for (uint j = 0u; j < pc.n_rel; j++) rb += rbias[rbo + j] * sr[j];
+            }
+            sc = dot * scale + rb - sink_t;
         }
-        acc += (scores[idx] * inv) * vv;
+        smax[tid] = sc;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]); barrier(); }
+        float m_new = max(m_run, smax[0]);
+        float p = (tid < tile_len) ? exp(sc - m_new) : 0.0;
+        tile_p[tid] = p;
+        ssum[tid] = p;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) ssum[tid] += ssum[tid + s]; barrier(); }
+        float alpha = exp(m_run - m_new);
+        l_run = l_run * alpha + ssum[0];
+        m_run = m_new;
+        acc *= alpha;
+        for (uint j = 0u; j < tile_len; j++) {
+            uint t = t_start + base + j;
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+            float vv;
+            if (t == pc.pos) {
+                vv = v_cur_val;
+            } else {
+                vec2 vp = unpackHalf2x16(vcache[pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd + d2]);
+                vv = (lane == 0u) ? vp.x : vp.y;
+            }
+            acc += tile_p[j] * vv;
+        }
+        barrier(); // smax/ssum/tile_p are reused by the next tile
     }
+    acc /= l_run;
     float gv = 1.0 / (1.0 + exp(-gate[pc.g_off + h * pc.hd + tid]));
     o[h * pc.hd + tid] = acc * gv;
 }

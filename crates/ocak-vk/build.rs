@@ -17,6 +17,8 @@ fn main() {
         "rope",
         "kv_write",
         "attention",
+        "attention_split",
+        "attention_merge",
         "embed",
         "qmv_f32",
         "qmv_f16",

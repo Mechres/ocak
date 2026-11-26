@@ -122,6 +122,8 @@ struct Pipelines {
     rope: PipelineBundle,
     kv_write: PipelineBundle,
     attention: PipelineBundle,
+    attention_split: PipelineBundle,
+    attention_merge: PipelineBundle,
     embed: PipelineBundle,
     qmv_f32: PipelineBundle,
     qmv_f16: PipelineBundle,
@@ -191,7 +193,7 @@ impl Pipelines {
     unsafe fn destroy(&self, dev: &Device) {
         for p in [
             &self.rms_norm, &self.add_rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.situ, &self.rope,
-            &self.kv_write, &self.attention, &self.embed,
+            &self.kv_write, &self.attention, &self.attention_split, &self.attention_merge, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_bf16, &self.qmv_q8_0, &self.qmv_q4_0,
             &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k,
             &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step,
@@ -241,10 +243,23 @@ pub struct VkContext {
     pipelines: Pipelines,
     iq_buf: vk::Buffer,
     iq_mem: vk::DeviceMemory,
+    /// Device-local scratch for split-K attention partials (bump-allocated per recording).
+    attn_scratch: vk::Buffer,
+    attn_scratch_mem: vk::DeviceMemory,
     exec: Mutex<ExecState>,
 }
 
 const STAGING_SIZE: u64 = 64 * 1024 * 1024;
+/// Split-K attention scratch (partial softmax states); wraps with a barrier when exhausted.
+const ATTN_SCRATCH_BYTES: u64 = 32 * 1024 * 1024;
+/// Contexts at or below this many attended tokens use the single-pass attention kernel
+/// (override with `OCAK_ATTN_SPLIT_MIN` for tuning / A-B testing).
+fn attn_split_min_tokens() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OCAK_ATTN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512))
+}
+/// Tokens per split-K chunk.
+const ATTN_SPLIT_CHUNK: u32 = 256;
 const MAX_DESC_SETS: u32 = 65536;
 
 fn build_pipeline(
@@ -410,6 +425,8 @@ impl VkContext {
                 rope: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv")), 2, 36)?,
                 kv_write: bp(include_bytes!(concat!(env!("OUT_DIR"), "/kv_write.spv")), 4, 24)?,
                 attention: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv")), 4, 36)?,
+                attention_split: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_split.spv")), 4, 40)?,
+                attention_merge: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_merge.spv")), 2, 16)?,
                 embed: bp(include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 3, 20)?,
                 qmv_f32: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f32.spv")), 3, 24)?,
                 qmv_f16: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f16.spv")), 3, 24)?,
@@ -443,7 +460,7 @@ impl VkContext {
                 hc_sinkhorn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/hc_sinkhorn.spv")), 3, 8)?,
                 hc_mix: bp(include_bytes!(concat!(env!("OUT_DIR"), "/hc_mix.spv")), 4, 8)?,
                 rope_yarn_mla: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), 3, 48)?,
-                mla_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 4, 28)?,
+                mla_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), 5, 36)?,
                 moe_topk: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), 4, 20)?,
                 qmv_iq3_xxs_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), 5, 32)?,
                 qmv_iq3_s_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 32)?,
@@ -524,6 +541,13 @@ impl VkContext {
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&bufs)], fence)?;
             device.wait_for_fences(&[fence], true, u64::MAX)?;
             device.reset_fences(&[fence])?;
+            let (attn_scratch, attn_scratch_mem) = alloc_raw_buffer(
+                &device,
+                &mem_props,
+                ATTN_SCRATCH_BYTES,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
 
             Ok(Arc::new(Self {
                 _entry: entry,
@@ -539,6 +563,8 @@ impl VkContext {
                 pipelines,
                 iq_buf,
                 iq_mem,
+                attn_scratch,
+                attn_scratch_mem,
                 exec: Mutex::new(ExecState {
                     cmd_pool,
                     cmd_buf,
@@ -735,7 +761,7 @@ impl VkContext {
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             ).unwrap();
         }
-        Recorder { ctx: self, exec, defer_barriers: false }
+        Recorder { ctx: self, exec, defer_barriers: false, scratch_cursor: 0, attn_split: true }
     }
 }
 
@@ -753,6 +779,8 @@ impl Drop for VkContext {
             }
             self.device.destroy_buffer(self.iq_buf, None);
             self.device.free_memory(self.iq_mem, None);
+            self.device.destroy_buffer(self.attn_scratch, None);
+            self.device.free_memory(self.attn_scratch_mem, None);
             self.pipelines.destroy(&self.device);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -851,6 +879,8 @@ pub struct Recorder<'a> {
     ctx: &'a VkContext,
     exec: std::sync::MutexGuard<'a, ExecState>,
     defer_barriers: bool,
+    scratch_cursor: u64,
+    attn_split: bool,
 }
 
 #[inline]
@@ -861,6 +891,13 @@ fn off_u32(v: u64) -> u32 {
 impl<'a> Recorder<'a> {
     pub fn set_defer_barriers(&mut self, defer: bool) {
         self.defer_barriers = defer;
+    }
+
+    /// Allow split-K attention for long contexts (default). Batched prefill turns this off:
+    /// it already runs many tokens' attention in parallel, and the split/merge barrier would
+    /// serialize them.
+    pub fn set_attn_split(&mut self, enable: bool) {
+        self.attn_split = enable;
     }
 
     pub fn barrier(&mut self) {
@@ -1245,8 +1282,38 @@ impl<'a> Recorder<'a> {
         kq_scale: f32,
         batch: u32,
     ) {
-        let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh, batch, 1);
+        assert!(latent <= 512 && n_rot <= 128, "mla_attn supports latent <= 512, n_rot <= 128");
+        assert!(nh.is_multiple_of(8), "mla_attn processes heads in groups of 8 (n_heads = {nh})");
+        let max_nt = pos + batch; // longest context in the batch (token b attends pos + b + 1)
+        // Smaller chunks for short contexts keep enough workgroups in flight (each covers 8 heads).
+        let mla_chunk: u32 = if max_nt <= 1024 { 16 } else { 64 };
+        let scratch = self.ctx.attn_scratch;
+        let gx = nh / 8;
+        if max_nt <= mla_chunk {
+            let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits(), max_nt, 0];
+            self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf, scratch], bytemuck::cast_slice(&pc), gx, batch, 1);
+            return;
+        }
+        // Split-K over context chunks (each workgroup: 8 heads x one chunk), then merge per (token, head).
+        let per_split = nh as u64 * batch as u64 * (latent as u64 + 2) * 4;
+        let mut n_splits = max_nt.div_ceil(mla_chunk);
+        while n_splits > 1 && per_split * n_splits as u64 > ATTN_SCRATCH_BYTES / 2 {
+            n_splits = n_splits.div_ceil(2);
+        }
+        let chunk = max_nt.div_ceil(n_splits);
+        let bytes = per_split * n_splits as u64;
+        if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+            self.barrier();
+            self.scratch_cursor = 0;
+        }
+        let scratch_off = off_u32(self.scratch_cursor / 4);
+        self.scratch_cursor += bytes;
+        let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits(), chunk, scratch_off];
+        self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf, scratch], bytemuck::cast_slice(&pc), gx, batch, n_splits);
+        self.barrier();
+        assert!(n_splits <= 1024, "attention_merge supports <= 1024 splits");
+        let pc2 = [scratch_off, 0, latent, n_splits];
+        self.dispatch_raw(&self.ctx.pipelines.attention_merge, &[scratch, out.buf], bytemuck::cast_slice(&pc2), nh * batch, latent.div_ceil(128), 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1362,8 +1429,31 @@ impl<'a> Recorder<'a> {
         self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
     }
     pub fn attention_swa(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32) {
-        let pc = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), off_u32(out_off), n_heads, n_kv_heads, head_dim, pos, sliding_window];
-        self.dispatch_raw(&self.ctx.pipelines.attention, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
+        let t_start = if sliding_window > 0 && pos >= sliding_window { pos + 1 - sliding_window } else { 0 };
+        let n_t = pos + 1 - t_start;
+        if !self.attn_split || n_t <= attn_split_min_tokens() {
+            let pc = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), off_u32(out_off), n_heads, n_kv_heads, head_dim, pos, sliding_window];
+            self.dispatch_raw(&self.ctx.pipelines.attention, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_heads, 1, 1);
+            return;
+        }
+        // Split-K: (n_heads x n_splits) partial passes, then a per-head merge.
+        let n_splits = n_t.div_ceil(ATTN_SPLIT_CHUNK);
+        let bytes = n_heads as u64 * n_splits as u64 * (head_dim as u64 + 2) * 4;
+        assert!(bytes <= ATTN_SCRATCH_BYTES, "attention scratch too small: need {bytes} bytes");
+        if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+            // Reusing scratch: make sure every earlier split/merge in this recording has finished.
+            self.barrier();
+            self.scratch_cursor = 0;
+        }
+        let scratch_off = off_u32(self.scratch_cursor / 4);
+        self.scratch_cursor += bytes;
+        let scratch = self.ctx.attn_scratch;
+        let pc1 = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), scratch_off, n_heads, n_kv_heads, head_dim, pos, t_start, ATTN_SPLIT_CHUNK];
+        self.dispatch_raw(&self.ctx.pipelines.attention_split, &[q.buf, kv.buf, page_table.buf, scratch], bytemuck::cast_slice(&pc1), n_heads, n_splits, 1);
+        self.barrier();
+        assert!(n_splits <= 1024, "attention_merge supports <= 1024 splits");
+        let pc2 = [scratch_off, off_u32(out_off), head_dim, n_splits];
+        self.dispatch_raw(&self.ctx.pipelines.attention_merge, &[scratch, out.buf], bytemuck::cast_slice(&pc2), n_heads, head_dim.div_ceil(128), 1);
     }
 
     pub fn embed(&mut self, ty: WType, table: &Buffer, token: u32, out: &Buffer, out_off: u64, k: u32) {

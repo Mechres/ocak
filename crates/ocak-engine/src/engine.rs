@@ -92,9 +92,28 @@ impl NativeEngine {
         let g = Arc::new(GgufFile::open(path).map_err(|e| EngineError::Gguf(e.to_string()))?);
         let cfg = ModelConfig::from_gguf(&g)?;
         let tokenizer = Tokenizer::from_gguf(&g).map_err(|e| EngineError::Gguf(e.to_string()))?;
-        let max_ctx = opts.max_ctx.min(cfg.n_ctx_train.max(2048));
-        let n_pages = opts.kv_pages.max(max_ctx.div_ceil(PAGE_TOKENS) + 16);
-        let kv_bytes = (cfg.n_kv_layers * n_pages * 2 * PAGE_TOKENS * cfg.kv_dim() * 2) as u64;
+        let mut max_ctx = opts.max_ctx.min(cfg.n_ctx_train.max(2048));
+        let page_bytes = (cfg.n_kv_layers * 2 * PAGE_TOKENS * cfg.kv_dim() * 2) as u64;
+        let mut n_pages = opts.kv_pages.max(max_ctx.div_ceil(PAGE_TOKENS) + 16);
+        // Size the paged KV cache to the VRAM that is actually free (dense / hybrid VkExec models;
+        // Xing and Inkling manage their own placement). Shrinks the context rather than overcommit.
+        if opts.backend == BackendKind::Vulkan && cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && page_bytes > 0 {
+            if let Some(budget) = vram_kv_budget(g.file_len()) {
+                let fit_pages = (budget / page_bytes) as usize;
+                let min_pages = max_ctx.div_ceil(PAGE_TOKENS) + 16;
+                if fit_pages < min_pages {
+                    let fit_ctx = (fit_pages.saturating_sub(16) * PAGE_TOKENS) / 256 * 256;
+                    let new_ctx = fit_ctx.max(2048).min(max_ctx);
+                    if new_ctx < max_ctx {
+                        eprintln!("ocak: requested max_ctx {max_ctx} does not fit in free VRAM; using {new_ctx}");
+                        max_ctx = new_ctx;
+                    }
+                }
+                let min_pages = max_ctx.div_ceil(PAGE_TOKENS) + 16;
+                n_pages = n_pages.min(fit_pages).max(min_pages);
+            }
+        }
+        let kv_bytes = n_pages as u64 * page_bytes;
         let vram_bytes = g.file_len() + kv_bytes + 32 * 1024 * 1024;
         let exec: Box<dyn Executor> = if cfg.arch == "xing4_0" {
             let n_cpu_moe = if g.file_len() > 11 * (1u64 << 30) { 12 } else { 8 };
@@ -775,4 +794,17 @@ pub struct ActiveSlot {
     prompt_ms: f64,
     t_dec: Instant,
     done: bool,
+}
+
+/// Free VRAM (bytes) left for the KV cache after loading `weight_bytes` of weights, from the
+/// amdgpu sysfs counters. Keeps a margin for activations, staging, scratch and other apps.
+/// Returns None when no AMD GPU telemetry is available (no clamping is applied then).
+fn vram_kv_budget(weight_bytes: u64) -> Option<u64> {
+    const MARGIN: u64 = 768 * 1024 * 1024;
+    let tel = ocak_sysfs::amdgpu::discover_amd_gpu()?.telemetry();
+    if tel.vram_total_bytes == 0 {
+        return None;
+    }
+    let free = tel.vram_total_bytes.saturating_sub(tel.vram_used_bytes);
+    Some(free.saturating_sub(weight_bytes).saturating_sub(MARGIN))
 }

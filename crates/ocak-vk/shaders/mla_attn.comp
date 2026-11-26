@@ -1,9 +1,23 @@
 #version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// MLA (absorbed) attention over the contiguous FP16 latent KV cache.
+// All query heads share one latent KV head, so a workgroup handles HG = 8 heads at once:
+// lane-group g (32 lanes) owns head h = 8 * wg.x + g, and all 8 groups walk the SAME tokens of
+// context chunk s in lockstep. Each latent row is therefore fetched from memory once per
+// workgroup and reused by 8 heads through the CU cache (vs. 8 independent streams).
+// Grid = (n_heads / 8, batch, n_splits).
+// n_splits == 1: writes the normalized output directly.
+// n_splits  > 1: writes unnormalized [m, l, acc[latent]] partials to scratch for
+//                attention_merge.comp (flattened head index b * n_heads + h).
+#define HG 8u
+#define MAXJ 8u    // latent / 64 per lane: supports latent <= 512
+#define MAXR 2u    // n_rot / 64 per lane: supports n_rot <= 128
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
 layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
 layout(set = 0, binding = 2) readonly buffer KvCache { uint kvc[]; };
 layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+layout(set = 0, binding = 4) writeonly buffer Scratch { float scratch[]; };
 layout(push_constant) uniform PC {
     uint key_dim;
     uint nope;
@@ -12,67 +26,88 @@ layout(push_constant) uniform PC {
     uint pos;
     uint kv_layer_off;
     float kq_scale;
+    uint chunk;
+    uint scratch_off;
 } pc;
-shared float smax[256];
-shared float ssum[256];
-shared float w_shared[4096];
+
 void main() {
-    uint h = gl_WorkGroupID.x;
-    uint b = gl_WorkGroupID.y;
-    uint nh = gl_NumWorkGroups.x;
     uint tid = gl_LocalInvocationID.x;
+    uint g = tid >> 5;
+    uint lane = tid & 31u;
+    uint nh = gl_NumWorkGroups.x * HG;
+    uint h = gl_WorkGroupID.x * HG + g;
+    uint b = gl_WorkGroupID.y;
+    uint s = gl_WorkGroupID.z;
+    uint n_splits = gl_NumWorkGroups.z;
     uint half_lat = pc.latent >> 1;
     uint half_rot = pc.n_rot >> 1;
     uint half_hd = half_lat + half_rot;
     uint n_t = pc.pos + b + 1u;
-    uint ql_base = (b * nh + h) * pc.latent;
-    uint qp_base = (b * nh + h) * pc.key_dim + pc.nope;
+    uint qh = b * nh + h;
+    uint ql_base = qh * pc.latent;
+    uint qp_base = qh * pc.key_dim + pc.nope;
 
-    float local_max = -1e30;
-    for (uint t = tid; t < n_t; t += 256u) {
+    vec2 qlat[MAXJ];
+    vec2 acc[MAXJ];
+    for (uint j = 0u; j < MAXJ; j++) {
+        uint i = lane + 32u * j;
+        qlat[j] = (i < half_lat) ? vec2(ql[ql_base + 2u * i], ql[ql_base + 2u * i + 1u]) : vec2(0.0);
+        acc[j] = vec2(0.0);
+    }
+    vec2 qrot[MAXR];
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        qrot[r] = (i < half_rot) ? vec2(qf[qp_base + 2u * i], qf[qp_base + 2u * i + 1u]) : vec2(0.0);
+    }
+
+    float m = -3.402823466e38;
+    float l = 0.0;
+    uint c0 = s * pc.chunk;
+    uint c1 = min(c0 + pc.chunk, n_t);
+    for (uint t = c0; t < c1; t++) {
         uint kb = pc.kv_layer_off + t * half_hd;
-        float dot = 0.0;
-        for (uint i = 0u; i < half_lat; i++) {
-            vec2 kv = unpackHalf2x16(kvc[kb + i]);
-            dot += ql[ql_base + 2u * i] * kv.x + ql[ql_base + 2u * i + 1u] * kv.y;
+        vec2 kvv[MAXJ];
+        float part = 0.0;
+        for (uint j = 0u; j < MAXJ; j++) {
+            uint i = lane + 32u * j;
+            kvv[j] = (i < half_lat) ? unpackHalf2x16(kvc[kb + i]) : vec2(0.0);
+            part += dot(qlat[j], kvv[j]);
         }
-        for (uint i = 0u; i < half_rot; i++) {
-            vec2 kv = unpackHalf2x16(kvc[kb + half_lat + i]);
-            dot += qf[qp_base + 2u * i] * kv.x + qf[qp_base + 2u * i + 1u] * kv.y;
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            if (i < half_rot) part += dot(qrot[r], unpackHalf2x16(kvc[kb + half_lat + i]));
         }
-        float s = dot * pc.kq_scale;
-        w_shared[t] = s;
-        local_max = max(local_max, s);
+        float score = subgroupClusteredAdd(part, 32u) * pc.kq_scale;
+        float m_new = max(m, score);
+        float alpha = exp(m - m_new);
+        float p = exp(score - m_new);
+        l = l * alpha + p;
+        for (uint j = 0u; j < MAXJ; j++) acc[j] = acc[j] * alpha + p * kvv[j];
+        m = m_new;
     }
-    smax[tid] = local_max;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]);
-        barrier();
-    }
-    float mx = smax[0];
 
-    float local_sum = 0.0;
-    for (uint t = tid; t < n_t; t += 256u) {
-        float e = exp(w_shared[t] - mx);
-        w_shared[t] = e;
-        local_sum += e;
-    }
-    ssum[tid] = local_sum;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) ssum[tid] += ssum[tid + s];
-        barrier();
-    }
-    float inv = 1.0 / ssum[0];
-
-    uint out_base = (b * nh + h) * pc.latent;
-    for (uint i = tid; i < half_lat; i += 256u) {
-        vec2 acc = vec2(0.0);
-        for (uint t = 0u; t < n_t; t++) {
-            acc += (w_shared[t] * inv) * unpackHalf2x16(kvc[pc.kv_layer_off + t * half_hd + i]);
+    if (n_splits == 1u) {
+        float inv = 1.0 / l;
+        uint out_base = qh * pc.latent;
+        for (uint j = 0u; j < MAXJ; j++) {
+            uint i = lane + 32u * j;
+            if (i < half_lat) {
+                o[out_base + 2u * i] = acc[j].x * inv;
+                o[out_base + 2u * i + 1u] = acc[j].y * inv;
+            }
         }
-        o[out_base + 2u * i] = acc.x;
-        o[out_base + 2u * i + 1u] = acc.y;
+    } else {
+        uint base = pc.scratch_off + (qh * n_splits + s) * (pc.latent + 2u);
+        if (lane == 0u) {
+            scratch[base] = m;
+            scratch[base + 1u] = l;   // l == 0 marks an empty split
+        }
+        for (uint j = 0u; j < MAXJ; j++) {
+            uint i = lane + 32u * j;
+            if (i < half_lat) {
+                scratch[base + 2u + 2u * i] = acc[j].x;
+                scratch[base + 3u + 2u * i] = acc[j].y;
+            }
+        }
     }
 }

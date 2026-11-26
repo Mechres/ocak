@@ -21,7 +21,8 @@ struct Args {
     presets: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
     sleep_idle_seconds: u64,
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 16384)]
+    /// Context window per request; clamped per model to the VRAM actually free at load time
     max_ctx: usize,
     #[arg(long, default_value = "vk")]
     backend: String,

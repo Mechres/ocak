@@ -291,12 +291,6 @@ pub struct XingExec {
 
 impl XingExec {
     pub fn new(g: Arc<GgufFile>, use_vulkan: bool, max_ctx: usize, n_cpu_moe: usize) -> Result<Self, EngineError> {
-        const MAX_MLA_CTX: usize = 4096;
-        if use_vulkan && max_ctx > MAX_MLA_CTX {
-            return Err(EngineError::Context(format!(
-                "xing4_0 Vulkan mla_attn shader supports max_ctx <= {MAX_MLA_CTX} (got {max_ctx})"
-            )));
-        }
         let cfg = XingConfig::from_gguf(&g)?;
         #[cfg(feature = "vulkan")]
         let vk = if use_vulkan { VkContext::new().ok() } else { None };
@@ -564,8 +558,14 @@ impl XingExec {
             None
         };
 
+        // Host-side MLA KV cache is only used by the hybrid CPU/GPU path; the full-GPU pipeline
+        // keeps its cache in VRAM (skipping this saves n_layer * max_ctx * 576 * 4 bytes of RAM).
+        #[cfg(feature = "vulkan")]
+        let need_host_kv = gpu_pipe.is_none();
+        #[cfg(not(feature = "vulkan"))]
+        let need_host_kv = true;
         Ok(Self {
-            kv_cache: vec![0f32; cfg.n_layer * max_ctx * hd],
+            kv_cache: if need_host_kv { vec![0f32; cfg.n_layer * max_ctx * hd] } else { Vec::new() },
             max_ctx,
             gpu_moe_layers: gpu_moe_placed,
             cpu_moe_layers: cpu_moe_placed,

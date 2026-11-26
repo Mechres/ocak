@@ -12,6 +12,7 @@ ocak-gguf.workspace = true
 ocak-tok = { path = "../ocak-tok" }
 ocak-kv = { path = "../ocak-kv" }
 ocak-cpu = { path = "../ocak-cpu" }
+ocak-sysfs.workspace = true
 ocak-vk = { path = "../ocak-vk", optional = true }
 half.workspace = true
 rayon.workspace = true

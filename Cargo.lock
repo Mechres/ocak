@@ -679,6 +679,7 @@ dependencies = [
  "ocak-cpu",
  "ocak-gguf",
  "ocak-kv",
+ "ocak-sysfs",
  "ocak-tok",
  "ocak-vk",
  "rayon",

@@ -50,6 +50,9 @@ enum Cmd {
         backend: String,
         #[arg(long, default_value_t = 0.0)]
         temp: f32,
+        /// Context window in tokens (KV cache is sized to fit it)
+        #[arg(long, default_value_t = 2048)]
+        max_ctx: usize,
     },
     /// Compare native Vulkan & CPU AVX2 logits against libllama.so C oracle
     ParityTest {
@@ -165,10 +168,10 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Run { model, prompt, max_tokens, backend, temp } => {
+        Cmd::Run { model, prompt, max_tokens, backend, temp, max_ctx } => {
             let bk = if backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
             let t0 = Instant::now();
-            let mut eng = NativeEngine::load(&model, EngineOptions { backend: bk, max_ctx: 2048, kv_pages: 128 })?;
+            let mut eng = NativeEngine::load(&model, EngineOptions { backend: bk, max_ctx, kv_pages: 128 })?;
             eprintln!("Loaded {} on {} in {:.0} ms", model.display(), eng.backend_name(), t0.elapsed().as_secs_f64() * 1000.0);
             let req = GenRequest {
                 prompt,

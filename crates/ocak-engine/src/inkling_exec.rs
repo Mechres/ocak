@@ -383,12 +383,6 @@ fn convolve_step(
 
 impl InklingExec {
     pub fn new(g: Arc<GgufFile>, use_vulkan: bool, max_ctx: usize, n_cpu_moe: usize) -> Result<Self, EngineError> {
-        const MAX_INKLING_CTX: usize = 2048;
-        if use_vulkan && max_ctx > MAX_INKLING_CTX {
-            return Err(EngineError::Context(format!(
-                "inkling2_loop Vulkan inkling_attn shader supports max_ctx <= {MAX_INKLING_CTX} (got {max_ctx})"
-            )));
-        }
         let vk = if use_vulkan { Some(VkContext::new().map_err(|e| EngineError::Backend(e.to_string()))?) } else { None };
         let req = |s: &str| g.arch_u64(s).ok_or_else(|| EngineError::Unsupported(format!("missing inkling2_loop.{s}")));
         let n_phys = req("block_count")? as usize;

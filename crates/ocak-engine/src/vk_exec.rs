@@ -813,6 +813,7 @@ impl VkExec {
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
         rec.set_defer_barriers(true);
+        rec.set_attn_split(false);
         self.record_batch_layers(&mut rec, chunk, pos0, false);
 
         let last_off = ((chunk.len() - 1) * c.n_embd) as u64;

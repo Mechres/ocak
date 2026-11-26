@@ -1,0 +1,67 @@
+#version 460
+// Split-K ("flash-decoding") pass 2: merge n_splits partial softmax states per head.
+// Grid = (n_heads, ceil(head_dim / 128)). Scratch layout per (head, split):
+// [m, l, acc[head_dim]] (acc unnormalized; l == 0 marks an empty split).
+// Per-split weights exp(m_s - M) are computed once into shared memory, then each thread
+// reduces one output dimension across splits.
+#define MAX_SPLITS 1024u
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer S { float scratch[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint scratch_off;
+    uint out_off;
+    uint head_dim;
+    uint n_splits;
+} pc;
+
+shared float sw[MAX_SPLITS];
+shared float sred[128];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint stride = pc.head_dim + 2u;
+    uint hbase = pc.scratch_off + h * pc.n_splits * stride;
+
+    // Global max over non-empty splits.
+    float lm = -3.402823466e38;
+    for (uint s = tid; s < pc.n_splits; s += 128u) {
+        uint b = hbase + s * stride;
+        if (scratch[b + 1u] > 0.0) lm = max(lm, scratch[b]);
+    }
+    sred[tid] = lm;
+    barrier();
+    for (uint r = 64u; r > 0u; r >>= 1u) {
+        if (tid < r) sred[tid] = max(sred[tid], sred[tid + r]);
+        barrier();
+    }
+    float gm = sred[0];
+    barrier();
+
+    // Per-split weights and total normalizer.
+    float ll = 0.0;
+    for (uint s = tid; s < pc.n_splits; s += 128u) {
+        uint b = hbase + s * stride;
+        float ls = scratch[b + 1u];
+        float w = (ls > 0.0) ? exp(scratch[b] - gm) : 0.0;
+        sw[s] = w;
+        ll += ls * w;
+    }
+    sred[tid] = ll;
+    barrier();
+    for (uint r = 64u; r > 0u; r >>= 1u) {
+        if (tid < r) sred[tid] += sred[tid + r];
+        barrier();
+    }
+    float inv_L = 1.0 / sred[0];
+
+    uint d = gl_WorkGroupID.y * 128u + tid;
+    if (d < pc.head_dim) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.n_splits; s++) {
+            acc += scratch[hbase + s * stride + 2u + d] * sw[s];
+        }
+        o[pc.out_off + h * pc.head_dim + d] = acc * inv_L;
+    }
+}

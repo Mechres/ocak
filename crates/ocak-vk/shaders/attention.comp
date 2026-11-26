@@ -1,6 +1,13 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
-layout(local_size_x = 32) in;
+// Single-token decode attention over the paged FP16 KV cache.
+// One workgroup per query head; NG lane-groups of 32 each run an independent online softmax
+// over a strided subset of the context (t = t_start + g, g + NG, ...), then the NG partial
+// (m, l, acc) states are merged in shared memory. This keeps NG independent KV streams in
+// flight per head instead of one serial token loop, so decode speed no longer collapses as
+// context grows.
+#define NG 8u
+layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
 layout(set = 0, binding = 1) readonly buffer KV { uint kv[]; };
 layout(set = 0, binding = 2) readonly buffer PT { uint pt[]; };
@@ -16,10 +23,17 @@ layout(push_constant) uniform PC {
     uint pos;
     uint sliding_window;
 } pc;
+
+shared float sm_m[NG];
+shared float sm_l[NG];
+shared vec2 sm_acc[NG][128];
+
 void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
     uint tid = gl_LocalInvocationID.x;
+    uint g = tid >> 5;      // lane-group 0..NG-1
+    uint lane = tid & 31u;  // lane within group
     uint group = pc.n_heads / pc.n_kv_heads;
     uint kvh = h / group;
     uint half_hd = pc.head_dim >> 1;
@@ -29,7 +43,7 @@ void main() {
     vec2 qreg[4];
     vec2 acc[4];
     for (uint j = 0u; j < 4u; j++) {
-        uint d2 = tid + j * 32u;
+        uint d2 = lane + j * 32u;
         if (d2 < half_hd) {
             uint qb = pc.q_off + h * pc.head_dim + 2u * d2;
             qreg[j] = vec2(q[qb], q[qb + 1u]);
@@ -43,7 +57,7 @@ void main() {
     float l = 0.0;
 
     uint t_start = (pc.sliding_window > 0u && pc.pos >= pc.sliding_window) ? (pc.pos + 1u - pc.sliding_window) : 0u;
-    for (uint t = t_start; t <= pc.pos; t++) {
+    for (uint t = t_start + g; t <= pc.pos; t += NG) {
         uint page = pt[pc.pt_off + (t >> 4)];
         uint slot = t & 15u;
         uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * half_kv_dim + kvh * half_hd;
@@ -51,7 +65,7 @@ void main() {
 
         float part = 0.0;
         for (uint j = 0u; j < 4u; j++) {
-            uint d2 = tid + j * 32u;
+            uint d2 = lane + j * 32u;
             if (d2 < half_hd) {
                 part += dot(qreg[j], unpackHalf2x16(kv[ko + d2]));
             }
@@ -62,7 +76,7 @@ void main() {
         float p = exp(score - m_new);
         l = l * alpha + p;
         for (uint j = 0u; j < 4u; j++) {
-            uint d2 = tid + j * 32u;
+            uint d2 = lane + j * 32u;
             if (d2 < half_hd) {
                 acc[j] = acc[j] * alpha + p * unpackHalf2x16(kv[vo + d2]);
             }
@@ -70,14 +84,33 @@ void main() {
         m = m_new;
     }
 
-    float inv_l = 1.0 / l;
+    // Publish each lane-group's partial state.
+    if (lane == 0u) {
+        sm_m[g] = m;
+        sm_l[g] = l;
+    }
     for (uint j = 0u; j < 4u; j++) {
-        uint d2 = tid + j * 32u;
-        if (d2 < half_hd) {
-            uint ob = pc.out_off + h * pc.head_dim + 2u * d2;
-            vec2 res = acc[j] * inv_l;
-            o[ob] = res.x;
-            o[ob + 1u] = res.y;
-        }
+        uint d2 = lane + j * 32u;
+        if (d2 < half_hd) sm_acc[g][d2] = acc[j];
+    }
+    barrier();
+
+    // Merge NG partial softmax states (groups that saw no tokens have l = 0 and drop out).
+    float gm = sm_m[0];
+    for (uint k = 1u; k < NG; k++) gm = max(gm, sm_m[k]);
+    float wk[NG];
+    float L = 0.0;
+    for (uint k = 0u; k < NG; k++) {
+        wk[k] = (sm_l[k] > 0.0) ? exp(sm_m[k] - gm) : 0.0;
+        L += sm_l[k] * wk[k];
+    }
+    float inv_L = 1.0 / L;
+    for (uint d2 = tid; d2 < half_hd; d2 += 256u) {
+        vec2 res = vec2(0.0);
+        for (uint k = 0u; k < NG; k++) res += sm_acc[k][d2] * wk[k];
+        res *= inv_L;
+        uint ob = pc.out_off + h * pc.head_dim + 2u * d2;
+        o[ob] = res.x;
+        o[ob + 1u] = res.y;
     }
 }
