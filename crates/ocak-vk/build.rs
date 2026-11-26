@@ -142,10 +142,15 @@ fn main() {
     ];
     let src = "shaders/qmm_tiled.comp";
     println!("cargo:rerun-if-changed={src}");
-    for (name, def, grouped) in tiled.iter().flat_map(|&(n, d)| [(n, d, false), (n, d, true)]) {
-        let dst = out_dir.join(format!("{}_{name}.spv", if grouped { "qmmg" } else { "qmmt" }));
+    println!("cargo:rerun-if-changed=shaders/dequant8.glsl");
+    println!("cargo:rerun-if-changed=shaders/qmv_multi.comp");
+    // kind 0 = tiled, 1 = grouped tiled, 2 = small-batch matvec
+    for (name, def, kind) in tiled.iter().flat_map(|&(n, d)| [(n, d, 0), (n, d, 1), (n, d, 2)]) {
+        let prefix = ["qmmt", "qmmg", "qmvm"][kind];
+        let src = if kind == 2 { "shaders/qmv_multi.comp" } else { src };
+        let dst = out_dir.join(format!("{prefix}_{name}.spv"));
         let define = format!("-D{def}");
-        let gdef = if grouped { "-DGROUPED" } else { "-DUNGROUPED" };
+        let gdef = if kind == 1 { "-DGROUPED" } else { "-DUNGROUPED" };
         let status = if has_glslc || has_usr_glslc {
             let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
             Command::new(bin)

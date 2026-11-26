@@ -190,6 +190,8 @@ struct Pipelines {
     qmmt: Vec<PipelineBundle>,
     /// Grouped (MoE expert / per-head) variant of `qmmt`, same indexing.
     qmmg: Vec<PipelineBundle>,
+    /// Small-batch (2..8 token) matvec, same indexing as `qmmt`.
+    qmvm: Vec<PipelineBundle>,
     moe_group: PipelineBundle,
     inkling_kv_store: PipelineBundle,
     inkling_attn_batch: PipelineBundle,
@@ -199,8 +201,8 @@ struct Pipelines {
 }
 
 /// Weight formats with a tiled prefill matmul (`qmm_tiled.comp`), in `Pipelines::qmmt` order.
-fn qmmt_index(ty: WType) -> Option<usize> {
-    Some(match ty {
+fn qmmt_index(ty: WType) -> usize {
+    match ty {
         WType::Q4K => 0,
         WType::Q5K => 1,
         WType::Q6K => 2,
@@ -221,13 +223,14 @@ fn qmmt_index(ty: WType) -> Option<usize> {
         WType::IQ4NL => 17,
         WType::BF16 => 18,
         WType::NVFP4 => 19,
-    })
+    }
 }
 
 /// Whether batched (prefill) matmuls of this weight format use a tiled kernel. Formats without
 /// one fall back to a per-token matvec loop, so callers should keep prefill chunks small.
 pub fn has_tiled_qmm(ty: WType) -> bool {
-    qmmt_index(ty).is_some()
+    let _ = qmmt_index(ty); // every format has one
+    true
 }
 
 /// Tile shape of qmm_tiled.comp (16*TM rows x 16*TN tokens); keep in sync with the shader defaults.
@@ -235,6 +238,14 @@ const QMMT_BM: u32 = 64;
 const QMMT_BN: u32 = 128;
 /// Column tile of the grouped variant (16 * TN with -DGROUPED).
 const QMMG_BN: u32 = 32;
+
+/// Whether the generic multi-token matvec (qmv_multi.comp) is faster than the hand-written
+/// single-token qmv shader for this format at batch 1. Measured on RX 6700 XT end to end
+/// (decode tok/s): big wins for Q8_0 / F16 / IQ3 / IQ1-2 / Q2_K / Q3_K / IQ4 (Qwen3.8-27B Q2_K
+/// 9.3 -> 16.7 tok/s), small losses for Q4_K / Q5_K / Q6_K / NVFP4 / IQ2_XS.
+fn qmvm_beats_qmv(ty: WType) -> bool {
+    !matches!(ty, WType::Q4K | WType::Q5K | WType::Q6K | WType::NVFP4 | WType::IQ2XS)
+}
 
 /// Smallest batch that uses the tiled prefill matmul (env `OCAK_QMMT_MIN`, default 32).
 fn qmmt_min_batch() -> u32 {
@@ -265,6 +276,7 @@ impl Pipelines {
         .into_iter()
         .chain(self.qmmt.iter())
         .chain(self.qmmg.iter())
+        .chain(self.qmvm.iter())
         .chain([&self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.attention_prefill_128, &self.attention_prefill_256])
         {
             dev.destroy_pipeline(p.pipeline, None);
@@ -591,6 +603,28 @@ impl VkContext {
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq4_nl.spv")), 5, 52)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_bf16.spv")), 5, 52)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_nvfp4.spv")), 5, 52)?,
+                ],
+                qmvm: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q4_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q5_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q6_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q2_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q3_k.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q8_0.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_q4_0.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_f16.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_f32.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq3_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq3_xxs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq2_xs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq2_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq2_xxs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq1_s.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq1_m.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq4_xs.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_iq4_nl.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_bf16.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvm_nvfp4.spv")), 4, 28)?,
                 ],
                 moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), 2, 12)?,
                 inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), 4, 44)?,
@@ -1096,6 +1130,17 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
+        if qmvm_beats_qmv(ty) && k.is_multiple_of(32) {
+            let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), 1];
+            let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
+            self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(4), 1, 1);
+            return;
+        }
+        self.qmv_classic(ty, w, w_off, x, x_off, y, y_off, k, m);
+    }
+
+    /// The hand-written per-format single-token matvec shaders (reference implementation).
+    pub fn qmv_classic(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
         let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k)];
         let gx = match ty {
             WType::IQ2XS => m.div_ceil(16),
@@ -1138,6 +1183,12 @@ impl<'a> Recorder<'a> {
         }
         let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), batch];
         let gx = m.div_ceil(4);
+        if batch <= 8 && k.is_multiple_of(32) {
+            // Small batch: one weight read for all tokens.
+            let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
+            self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+            return;
+        }
         if batch == 2 {
             match ty {
                 WType::IQ2XS => {
@@ -1164,8 +1215,8 @@ impl<'a> Recorder<'a> {
             }
         }
         if batch >= qmmt_min_batch() && k.is_multiple_of(32) {
-            if let Some(i) = qmmt_index(ty) {
-                let p = &self.ctx.pipelines.qmmt[i];
+            {
+                let p = &self.ctx.pipelines.qmmt[qmmt_index(ty)];
                 self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
                 return;
             }
@@ -1500,7 +1551,7 @@ impl<'a> Recorder<'a> {
     /// Entry e reads X row `(e / x_div) * x_stride` (in floats from x_off) and writes Y row
     /// `e * m`. Returns false (nothing recorded) when the weight format has no tiled kernel.
     pub fn qmm_grouped(&mut self, ty: WType, w: &Buffer, w_off: u64, slice_bytes: u64, x: &Buffer, x_off: u64, x_stride: u32, x_div: u32, y: &Buffer, y_off: u64, k: u32, m: u32, n_groups: u32, list: Option<&Buffer>, cols: u32) -> bool {
-        let Some(i) = qmmt_index(ty) else { return false };
+        let i = qmmt_index(ty);
         if !k.is_multiple_of(32) {
             return false;
         }
@@ -2227,6 +2278,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark"]
+    fn vk_small_batch_bench() {
+        let c = VkContext::new().expect("vulkan init");
+        let (k, m) = (4096usize, 12288usize);
+        let x: Vec<f32> = (0..8 * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let by = c.create_device_buffer((8 * m * 4) as u64).unwrap();
+        for wt in [WType::Q6K, WType::Q4K, WType::Q8_0, WType::IQ3S, WType::Q2K] {
+            let rb = wt.row_bytes(k as u32) as usize;
+            let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            for batch in [1u32, 2, 4, 8] {
+                let run = |n: usize| {
+                    let mut rec = c.begin();
+                    for _ in 0..n {
+                        rec.qmm(wt, &bw, 0, &bx, 0, &by, 0, k as u32, m as u32, batch);
+                    }
+                    rec.finish_and_wait().unwrap();
+                };
+                run(100);
+                let mut dt = f64::MAX;
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    run(100);
+                    dt = dt.min(t.elapsed().as_secs_f64() / 100.0);
+                }
+                eprintln!("{wt:?} batch={batch}: {:.3} ms  ({:.0} GB/s weights)", dt * 1e3, raw.len() as f64 / dt / 1e9);
+            }
+        }
+    }
+
+    #[test]
     fn vk_qmm_grouped_matches_qmv() {
         let c = VkContext::new().expect("vulkan init");
         let (k, m, n_exp, n_used, batch) = (512usize, 70usize, 6usize, 2usize, 45usize);
@@ -2265,7 +2350,7 @@ mod tests {
             rec.barrier();
             assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, n_used as u32, &by_g, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32));
             for (e, &ex) in ids.iter().enumerate() {
-                rec.qmv(wt, &bw, ex as u64 * slice as u64, &bx, ((e / n_used) * k) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
+                rec.qmv_classic(wt, &bw, ex as u64 * slice as u64, &bx, ((e / n_used) * k) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
             }
             rec.finish_and_wait().unwrap();
             let mut yg = vec![0f32; n_ent * m];
@@ -2287,7 +2372,7 @@ mod tests {
             for t in 0..cols {
                 for h in 0..nh {
                     let e = t * nh + h;
-                    rec.qmv(wt, &bw, (h * slice) as u64, &bxh, (e * stride) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
+                    rec.qmv_classic(wt, &bw, (h * slice) as u64, &bxh, (e * stride) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
                 }
             }
             rec.finish_and_wait().unwrap();
@@ -2297,6 +2382,53 @@ mod tests {
             let scale = yr[..n].iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
             for i in 0..n {
                 assert!((yg[i] - yr[i]).abs() <= 3e-3 * scale, "grouped(heads) {wt:?} idx={i}: {} vs {}", yg[i], yr[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn vk_qmv_multi_matches_classic() {
+        let c = VkContext::new().expect("vulkan init");
+        let (k, m) = (512usize, 37usize);
+        let mut s = 0xBADC_0FFEu64;
+        let mut next_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 32) as u8
+        };
+        let x: Vec<f32> = (0..8 * k).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let by_a = c.create_device_buffer((8 * m * 4) as u64).unwrap();
+        let by_b = c.create_device_buffer((8 * m * 4) as u64).unwrap();
+        for wt in [
+            WType::Q4K, WType::Q5K, WType::Q6K, WType::Q2K, WType::Q3K, WType::Q8_0, WType::Q4_0, WType::F16, WType::F32, WType::BF16,
+            WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS, WType::IQ4NL, WType::NVFP4,
+        ] {
+            let rb = wt.row_bytes(k as u32) as usize;
+            let raw: Vec<u8> = if wt == WType::F32 {
+                let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
+                bytemuck::cast_slice(&f).to_vec()
+            } else {
+                (0..m * rb).map(|_| next_u8() & 0x3F).collect()
+            };
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            for batch in 1..=8u32 {
+                let mut rec = c.begin();
+                rec.qmm(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch);
+                for b in 0..batch as usize {
+                    rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_b, (b * m) as u64, k as u32, m as u32);
+                }
+                rec.finish_and_wait().unwrap();
+                let n = batch as usize * m;
+                let mut ya = vec![0f32; n];
+                let mut yb = vec![0f32; n];
+                c.download(&by_a, 0, bytemuck::cast_slice_mut(&mut ya)).unwrap();
+                c.download(&by_b, 0, bytemuck::cast_slice_mut(&mut yb)).unwrap();
+                for i in 0..n {
+                    let tol = 1e-3 + 1e-4 * yb[i].abs();
+                    assert!((ya[i] - yb[i]).abs() <= tol, "qmv_multi {wt:?} batch={batch} idx={i}: {} vs {}", ya[i], yb[i]);
+                }
             }
         }
     }
@@ -2321,7 +2453,6 @@ mod tests {
             WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS,
             WType::IQ4NL, WType::BF16, WType::NVFP4,
         ] {
-            assert!(qmmt_index(wt).is_some());
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = if wt == WType::F32 {
                 let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
@@ -2334,7 +2465,7 @@ mod tests {
             let mut rec = c.begin();
             rec.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, batch as u32);
             for b in 0..batch {
-                rec.qmv(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
+                rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
             }
             rec.finish_and_wait().unwrap();
             let mut y_qmm = vec![0f32; batch * m];
@@ -2386,7 +2517,7 @@ mod tests {
             let mut rec = c.begin();
             rec.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, batch as u32);
             for b in 0..batch {
-                rec.qmv(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
+                rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
             }
             rec.finish_and_wait().unwrap();
             let mut y_qmm = vec![0f32; batch * m];

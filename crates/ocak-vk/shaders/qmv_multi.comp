@@ -1,0 +1,43 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_GOOGLE_include_directive : require
+// Small-batch (2..8 tokens) quantized matvec: Y[t, m] = X[t, k] * W[m, k]^T for t < batch.
+// 32 lanes per row; each step a lane dequantizes 8 consecutive weights once (dequant8.glsl)
+// and applies them to every token, so weights are read once for the whole batch.
+#define MAXB 8u
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+
+#include "dequant8.glsl"
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    float acc[MAXB];
+    for (uint t = 0u; t < MAXB; t++) acc[t] = 0.0;
+    if (row < pc.m) {
+        uint rb = pc.w_off + row * pc.row_bytes;
+        for (uint k0 = tid * 8u; k0 < pc.k; k0 += 256u) {
+            float v[8];
+            dq8(rb, k0, v);
+            for (uint t = 0u; t < MAXB; t++) {
+                if (t < pc.batch) {
+                    uint xo = pc.x_off + t * pc.k + k0;
+                    float s = 0.0;
+                    for (uint i = 0u; i < 8u; i++) s += v[i] * x[xo + i];
+                    acc[t] += s;
+                }
+            }
+        }
+    }
+    for (uint t = 0u; t < MAXB; t++) {
+        float r = subgroupClusteredAdd(acc[t], 32u);
+        if (tid == 0u && row < pc.m && t < pc.batch) y[pc.y_off + t * pc.m + row] = r;
+    }
+}
