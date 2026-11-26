@@ -1,0 +1,73 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    uint b0 = gl_WorkGroupID.y * 8u;
+    uint bm = pc.batch - 1u;
+    uint o0 = pc.x_off + b0 * pc.k;
+    uint o1 = pc.x_off + min(b0 + 1u, bm) * pc.k;
+    uint o2 = pc.x_off + min(b0 + 2u, bm) * pc.k;
+    uint o3 = pc.x_off + min(b0 + 3u, bm) * pc.k;
+    uint o4 = pc.x_off + min(b0 + 4u, bm) * pc.k;
+    uint o5 = pc.x_off + min(b0 + 5u, bm) * pc.k;
+    uint o6 = pc.x_off + min(b0 + 6u, bm) * pc.k;
+    uint o7 = pc.x_off + min(b0 + 7u, bm) * pc.k;
+    vec4 acc0 = vec4(0.0), acc1 = vec4(0.0);
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nsub = pc.k / 32u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 3;
+            uint j = sb & 7u;
+            uint b = rbase + blk * 210u;
+            float d = unpackHalf2x16(uint(w[b + 208u]) | (uint(w[b + 209u]) << 8)).x;
+            uint half_i = j >> 2;
+            uint q_idx = j & 3u;
+            uint ql = b + half_i * 64u + (q_idx & 1u) * 32u;
+            uint ql_shift = (q_idx >> 1) * 4u;
+            uint qh = b + 128u + half_i * 32u;
+            uint qh_shift = q_idx * 2u;
+            uint sc_base = b + 192u + half_i * 8u + q_idx * 2u;
+            float sc0 = d * float(bitfieldExtract(int(w[sc_base]), 0, 8));
+            float sc1 = d * float(bitfieldExtract(int(w[sc_base + 1u]), 0, 8));
+            uint xbase = sb * 32u;
+            vec4 s0a = vec4(0.0), s1a = vec4(0.0), s0b = vec4(0.0), s1b = vec4(0.0);
+            for (uint l = 0u; l < 16u; l++) {
+                uint q1 = ((uint(w[ql + l]) >> ql_shift) & 0xFu) | (((uint(w[qh + l]) >> qh_shift) & 3u) << 4);
+                float fq1 = float(int(q1) - 32);
+                uint xr1 = xbase + l;
+                s0a += fq1 * vec4(x[o0 + xr1], x[o1 + xr1], x[o2 + xr1], x[o3 + xr1]);
+                s1a += fq1 * vec4(x[o4 + xr1], x[o5 + xr1], x[o6 + xr1], x[o7 + xr1]);
+
+                uint l2 = l + 16u;
+                uint q2 = ((uint(w[ql + l2]) >> ql_shift) & 0xFu) | (((uint(w[qh + l2]) >> qh_shift) & 3u) << 4);
+                float fq2 = float(int(q2) - 32);
+                uint xr2 = xbase + l2;
+                s0b += fq2 * vec4(x[o0 + xr2], x[o1 + xr2], x[o2 + xr2], x[o3 + xr2]);
+                s1b += fq2 * vec4(x[o4 + xr2], x[o5 + xr2], x[o6 + xr2], x[o7 + xr2]);
+            }
+            acc0 += sc0 * s0a + sc1 * s0b;
+            acc1 += sc0 * s1a + sc1 * s1b;
+        }
+    }
+    vec4 r0 = subgroupClusteredAdd(acc0, 32u);
+    vec4 r1 = subgroupClusteredAdd(acc1, 32u);
+    if (tid == 0u && row < pc.m) {
+        y[pc.y_off + b0 * pc.m + row] = r0.x;
+        if (b0 + 1u < pc.batch) y[pc.y_off + (b0 + 1u) * pc.m + row] = r0.y;
+        if (b0 + 2u < pc.batch) y[pc.y_off + (b0 + 2u) * pc.m + row] = r0.z;
+        if (b0 + 3u < pc.batch) y[pc.y_off + (b0 + 3u) * pc.m + row] = r0.w;
+        if (b0 + 4u < pc.batch) y[pc.y_off + (b0 + 4u) * pc.m + row] = r1.x;
+        if (b0 + 5u < pc.batch) y[pc.y_off + (b0 + 5u) * pc.m + row] = r1.y;
+        if (b0 + 6u < pc.batch) y[pc.y_off + (b0 + 6u) * pc.m + row] = r1.z;
+        if (b0 + 7u < pc.batch) y[pc.y_off + (b0 + 7u) * pc.m + row] = r1.w;
+    }
+}

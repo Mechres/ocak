@@ -7,6 +7,7 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint total = pc.n_heads * pc.head_dim;
     if (idx >= total) return;
+    uint b = gl_WorkGroupID.y;
     uint h = idx / pc.head_dim;
-    x[idx] *= 1.0 / (1.0 + exp(-g[h]));
+    x[b * total + idx] *= 1.0 / (1.0 + exp(-g[b * pc.n_heads + h]));
 }

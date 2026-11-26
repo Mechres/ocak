@@ -9,8 +9,9 @@ shared float ssum[128];
 void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
+    uint b = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
-    uint base = h * pc.head_dim;
+    uint base = (b * pc.n_heads + h) * pc.head_dim;
     float acc = 0.0;
     for (uint d = tid; d < pc.head_dim; d += 128u) {
         float v = x[base + d];

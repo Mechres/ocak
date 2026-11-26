@@ -163,14 +163,7 @@ impl NativeEngine {
         for _ in 0..need_pages {
             pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
         }
-        let mut res = Ok(());
-        for (pos, &tok) in tokens.iter().enumerate() {
-            let is_last = pos + 1 == tokens.len();
-            if let Err(e) = self.exec.forward(tok, pos, &pages, Out { logits: is_last, hidden: false }) {
-                res = Err(e);
-                break;
-            }
-        }
+        let res = self.exec.forward_batch(tokens, 0, &pages, Out { logits: true, hidden: false });
         let logits = self.exec.logits().to_vec();
         self.pager.release(&pages);
         res?;
@@ -251,10 +244,16 @@ impl NativeEngine {
         }
         let t_prefill = Instant::now();
         let prompt_len = tokens.len();
-        for pos in cache_n..prompt_len {
-            ensure_page(&mut self.pager, &mut pages, pos)?;
-            let is_last = pos + 1 == prompt_len;
-            if let Err(e) = self.exec.forward(tokens[pos], pos, &pages, Out { logits: is_last, hidden: is_last && use_mtp }) {
+        if prompt_len > 0 {
+            ensure_page(&mut self.pager, &mut pages, prompt_len - 1)?;
+        }
+        if cache_n < prompt_len {
+            if let Err(e) = self.exec.forward_batch(
+                &tokens[cache_n..prompt_len],
+                cache_n,
+                &pages,
+                Out { logits: true, hidden: use_mtp },
+            ) {
                 self.pager.release(&pages);
                 return Err(e);
             }

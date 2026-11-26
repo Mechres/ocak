@@ -62,6 +62,14 @@ fn main() {
         "inkling_ctrl",
         "inkling_conv",
         "inkling_attn",
+        "qmm_q4_k",
+        "qmm_q6_k",
+        "qmm_q5_k",
+        "qmm_q4_0",
+        "qmm_q8_0",
+        "qmm_f16",
+        "qmm_f32",
+        "qmm_iq2_s",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

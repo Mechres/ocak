@@ -8,8 +8,9 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint total = pc.n_heads * pc.head_dim;
     if (idx >= total) return;
+    uint b = gl_WorkGroupID.y;
     uint h = idx / pc.head_dim;
     uint d = idx % pc.head_dim;
-    q[idx] = qg[h * 2u * pc.head_dim + d];
-    g[idx] = qg[(h * 2u + 1u) * pc.head_dim + d];
+    q[b * total + idx] = qg[b * 2u * total + h * 2u * pc.head_dim + d];
+    g[b * total + idx] = qg[b * 2u * total + (h * 2u + 1u) * pc.head_dim + d];
 }

@@ -4,6 +4,8 @@ use ocak_gguf::{GgufFile, TensorInfo};
 use ocak_vk::{Buffer, VkContext, WType};
 use std::sync::Arc;
 
+const PREFILL_BATCH: usize = 16;
+
 struct WeightBuf {
     buf: Buffer,
     ty: WType,
@@ -224,7 +226,7 @@ impl VkExec {
         } else {
             mk(cfg.head_dim / 2)?
         };
-        let head_gate_buf = mk(cfg.n_head)?;
+        let head_gate_buf = mk(PREFILL_BATCH * cfg.n_head)?;
         let output = if cfg.tied_output { None } else { Some(upload_weight(&ctx, &g, req_tensor(&g, "output.weight")?)?) };
 
         let layer_stride = (n_pages * 2 * 16 * cfg.kv_dim()) as u64;
@@ -234,26 +236,26 @@ impl VkExec {
             layer_stride,
             pt_buf: mk(n_pages.max(16))?,
             max_pages: n_pages.max(16),
-            x: mk(cfg.n_embd)?,
-            xn: mk(cfg.n_embd)?,
-            qg: mk(2 * qd)?,
-            q: mk(qd)?,
-            q_gate: mk(qd)?,
-            k: mk(cfg.kv_dim())?,
-            v: mk(cfg.kv_dim())?,
-            attn: mk(qd)?,
-            o: mk(cfg.n_embd)?,
-            bcx: mk(3 * cfg.n_embd)?,
-            qkv_raw: mk(max_conv_ch)?,
-            qkv_conv: mk(max_conv_ch)?,
-            z_buf: mk(max_v_dim)?,
-            alpha_buf: mk(max_v_heads)?,
-            beta_buf: mk(max_v_heads)?,
-            dn_out: mk(max_v_dim)?,
-            dn_norm: mk(max_v_dim)?,
-            gate: mk(cfg.n_ff)?,
-            up: mk(cfg.n_ff)?,
-            act: mk(cfg.n_ff)?,
+            x: mk(PREFILL_BATCH * cfg.n_embd)?,
+            xn: mk(PREFILL_BATCH * cfg.n_embd)?,
+            qg: mk(PREFILL_BATCH * 2 * qd)?,
+            q: mk(PREFILL_BATCH * qd)?,
+            q_gate: mk(PREFILL_BATCH * qd)?,
+            k: mk(PREFILL_BATCH * cfg.kv_dim())?,
+            v: mk(PREFILL_BATCH * cfg.kv_dim())?,
+            attn: mk(PREFILL_BATCH * qd)?,
+            o: mk(PREFILL_BATCH * cfg.n_embd)?,
+            bcx: mk(PREFILL_BATCH * 3 * cfg.n_embd)?,
+            qkv_raw: mk(PREFILL_BATCH * max_conv_ch)?,
+            qkv_conv: mk(PREFILL_BATCH * max_conv_ch)?,
+            z_buf: mk(PREFILL_BATCH * max_v_dim)?,
+            alpha_buf: mk(PREFILL_BATCH * max_v_heads)?,
+            beta_buf: mk(PREFILL_BATCH * max_v_heads)?,
+            dn_out: mk(PREFILL_BATCH * max_v_dim)?,
+            dn_norm: mk(PREFILL_BATCH * max_v_dim)?,
+            gate: mk(PREFILL_BATCH * cfg.n_ff)?,
+            up: mk(PREFILL_BATCH * cfg.n_ff)?,
+            act: mk(PREFILL_BATCH * cfg.n_ff)?,
             hidden_buf: mk(cfg.n_embd)?,
             logits_buf: mk(cfg.n_vocab)?,
             logits: vec![0.0; cfg.n_vocab],
@@ -293,6 +295,31 @@ impl Executor for VkExec {
         self.forward_inner(Some(token), None, pos, page_table, out)
     }
 
+    fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        if tokens.len() <= 1 {
+            if let Some(&tok) = tokens.first() {
+                return self.forward(tok, pos0, page_table, out);
+            }
+            return Ok(());
+        }
+        if page_table.len() > self.max_pages {
+            return Err(EngineError::Context("page table exceeds GPU capacity".into()));
+        }
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        // Keep each single vkQueueSubmit well below Linux amdgpu's 2s TDR timeout on 27B+ models
+        let chunk_max = if self.cfg.n_layer >= 48 { 8 } else { PREFILL_BATCH };
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let chunk = &tokens[offset..(offset + chunk_max).min(tokens.len())];
+            let is_last_chunk = offset + chunk.len() == tokens.len();
+            let chunk_out = Out { logits: is_last_chunk && out.logits, hidden: is_last_chunk && out.hidden };
+            self.forward_batch_chunk(chunk, pos0 + offset, chunk_out)?;
+            offset += chunk.len();
+        }
+        Ok(())
+    }
+
     fn forward_embd(&mut self, embd: &[f32], pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
         self.forward_inner(None, Some(embd), pos, page_table, out)
     }
@@ -313,44 +340,68 @@ impl VkExec {
 
         let c = &self.cfg;
         let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
         if let Some(tok) = token {
             rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, 0, c.n_embd as u32);
+            rec.barrier();
         }
 
         for l in &self.layers {
             rec.rms_norm(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
+            rec.barrier();
             match &l.mixer {
                 VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
                     if *gated_q {
                         rec.qmv(wq.ty, &wq.buf, 0, &self.xn, 0, &self.qg, 0, wq.k, wq.m);
-                        rec.split_qg(&self.qg, &self.q, &self.q_gate, c.n_head as u32, c.head_dim as u32);
                     } else {
                         rec.qmv(wq.ty, &wq.buf, 0, &self.xn, 0, &self.q, 0, wq.k, wq.m);
                     }
                     rec.qmv(wk.ty, &wk.buf, 0, &self.xn, 0, &self.k, 0, wk.k, wk.m);
                     rec.qmv(wv.ty, &wv.buf, 0, &self.xn, 0, &self.v, 0, wv.k, wv.m);
-                    if let Some(b) = bq { rec.add(&self.q, 0, b, 0, (c.n_head * c.head_dim) as u32); }
-                    if let Some(b) = bk { rec.add(&self.k, 0, b, 0, wk.m); }
-                    if let Some(b) = bv { rec.add(&self.v, 0, b, 0, wv.m); }
-                    if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, 0, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
-                    if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, 0, kn, *n_head_kv, c.head_dim as u32, c.eps); }
-                    rec.rope_ext(&self.q, 0, &self.k, 0, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, pos as u32, *rope_base, c.rope_mode);
-                    let kv_off = *kv_layer_idx as u64 * self.layer_stride;
-                    rec.kv_write(&self.k, 0, &self.v, 0, &self.kv, kv_off, &self.pt_buf, 0, pos as u32, *n_head_kv * c.head_dim as u32);
-                    rec.attention_swa(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos as u32, *sliding_window);
-                    if *gated_q {
-                        rec.mul_sigmoid(&self.attn, &self.q_gate, (c.n_head * c.head_dim) as u32);
-                    }
                     if let Some(hg) = head_gate_w {
                         rec.qmv(hg.ty, &hg.buf, 0, &self.xn, 0, &self.head_gate_buf, 0, hg.k, hg.m);
+                    }
+                    rec.barrier();
+                    if *gated_q {
+                        rec.split_qg(&self.qg, &self.q, &self.q_gate, c.n_head as u32, c.head_dim as u32);
+                        rec.barrier();
+                    }
+                    if bq.is_some() || bk.is_some() || bv.is_some() {
+                        if let Some(b) = bq { rec.add(&self.q, 0, b, 0, (c.n_head * c.head_dim) as u32); }
+                        if let Some(b) = bk { rec.add(&self.k, 0, b, 0, wk.m); }
+                        if let Some(b) = bv { rec.add(&self.v, 0, b, 0, wv.m); }
+                        rec.barrier();
+                    }
+                    if q_norm.is_some() || k_norm.is_some() {
+                        if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, 0, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
+                        if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, 0, kn, *n_head_kv, c.head_dim as u32, c.eps); }
+                        rec.barrier();
+                    }
+                    rec.rope_ext(&self.q, 0, &self.k, 0, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, pos as u32, *rope_base, c.rope_mode);
+                    rec.barrier();
+                    let kv_off = *kv_layer_idx as u64 * self.layer_stride;
+                    rec.kv_write(&self.k, 0, &self.v, 0, &self.kv, kv_off, &self.pt_buf, 0, pos as u32, *n_head_kv * c.head_dim as u32);
+                    rec.barrier();
+                    rec.attention_swa(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos as u32, *sliding_window);
+                    rec.barrier();
+                    if *gated_q {
+                        rec.mul_sigmoid(&self.attn, &self.q_gate, (c.n_head * c.head_dim) as u32);
+                        rec.barrier();
+                    }
+                    if head_gate_w.is_some() {
                         rec.mul_head_sigmoid(&self.attn, &self.head_gate_buf, c.n_head as u32, c.head_dim as u32);
+                        rec.barrier();
                     }
                     rec.qmv(wo.ty, &wo.buf, 0, &self.attn, 0, &self.o, 0, wo.k, wo.m);
+                    rec.barrier();
                 }
                 VkMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
                     rec.qmv(in_proj.ty, &in_proj.buf, 0, &self.xn, 0, &self.bcx, 0, in_proj.k, in_proj.m);
+                    rec.barrier();
                     rec.shortconv_step(&self.bcx, conv_w, state, &self.xn, c.n_embd as u32, *l_cache);
+                    rec.barrier();
                     rec.qmv(out_proj.ty, &out_proj.buf, 0, &self.xn, 0, &self.o, 0, out_proj.k, out_proj.m);
+                    rec.barrier();
                 }
                 VkMixer::DeltaNet {
                     wqkv, wgate, walpha, wbeta, wout, conv_w, dt_bias, ssm_a, ssm_norm,
@@ -360,29 +411,200 @@ impl VkExec {
                     rec.qmv(wgate.ty, &wgate.buf, 0, &self.xn, 0, &self.z_buf, 0, wgate.k, wgate.m);
                     rec.qmv(walpha.ty, &walpha.buf, 0, &self.xn, 0, &self.alpha_buf, 0, walpha.k, walpha.m);
                     rec.qmv(wbeta.ty, &wbeta.buf, 0, &self.xn, 0, &self.beta_buf, 0, wbeta.k, wbeta.m);
+                    rec.barrier();
                     rec.ssm_conv_silu(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv);
+                    rec.barrier();
                     rec.deltanet_step(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps);
+                    rec.barrier();
                     rec.gated_rms_norm(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps);
+                    rec.barrier();
                     rec.qmv(wout.ty, &wout.buf, 0, &self.dn_norm, 0, &self.o, 0, wout.k, wout.m);
+                    rec.barrier();
                 }
             }
-            if let Some(pan) = &l.post_attn_norm { rec.rms_norm(&self.o, 0, pan, 0, &self.o, 0, c.n_embd as u32, c.eps); }
+            if let Some(pan) = &l.post_attn_norm {
+                rec.rms_norm(&self.o, 0, pan, 0, &self.o, 0, c.n_embd as u32, c.eps);
+                rec.barrier();
+            }
             rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
+            rec.barrier();
             rec.rms_norm(&self.x, 0, &l.ffn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
+            rec.barrier();
             rec.qmv(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m);
             rec.qmv(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m);
+            rec.barrier();
             rec.swiglu(&self.gate, 0, &self.up, 0, &self.act, 0, c.n_ff as u32);
+            rec.barrier();
             rec.qmv(l.down.ty, &l.down.buf, 0, &self.act, 0, &self.o, 0, l.down.k, l.down.m);
-            if let Some(pfn) = &l.post_ffw_norm { rec.rms_norm(&self.o, 0, pfn, 0, &self.o, 0, c.n_embd as u32, c.eps); }
+            rec.barrier();
+            if let Some(pfn) = &l.post_ffw_norm {
+                rec.rms_norm(&self.o, 0, pfn, 0, &self.o, 0, c.n_embd as u32, c.eps);
+                rec.barrier();
+            }
             rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
+            rec.barrier();
         }
 
         if out.logits || out.hidden {
             rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf, 0, c.n_embd as u32, c.eps);
+            rec.barrier();
         }
         if out.logits {
             let w = self.output.as_ref().unwrap_or(&self.embd);
             rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
+            rec.barrier();
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        if out.hidden {
+            self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        if out.logits {
+            self.ctx.download(&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn forward_batch_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+        let c = &self.cfg;
+        let batch = chunk.len() as u32;
+        let ne = c.n_embd as u32;
+        let qd = (c.n_head * c.head_dim) as u32;
+
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        for (b, &tok) in chunk.iter().enumerate() {
+            rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, (b * c.n_embd) as u64, ne);
+        }
+        rec.barrier();
+
+        for l in &self.layers {
+            for b in 0..chunk.len() {
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.attn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+            }
+            rec.barrier();
+            match &l.mixer {
+                VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
+                    let kv_dim = (*n_head_kv as usize) * c.head_dim;
+                    if *gated_q {
+                        rec.qmm(wq.ty, &wq.buf, 0, &self.xn, 0, &self.qg, 0, wq.k, wq.m, batch);
+                    } else {
+                        rec.qmm(wq.ty, &wq.buf, 0, &self.xn, 0, &self.q, 0, wq.k, wq.m, batch);
+                    }
+                    rec.qmm(wk.ty, &wk.buf, 0, &self.xn, 0, &self.k, 0, wk.k, wk.m, batch);
+                    rec.qmm(wv.ty, &wv.buf, 0, &self.xn, 0, &self.v, 0, wv.k, wv.m, batch);
+                    if let Some(hg) = head_gate_w {
+                        rec.qmm(hg.ty, &hg.buf, 0, &self.xn, 0, &self.head_gate_buf, 0, hg.k, hg.m, batch);
+                    }
+                    rec.barrier();
+                    if *gated_q {
+                        rec.split_qg_batch(&self.qg, &self.q, &self.q_gate, c.n_head as u32, c.head_dim as u32, batch);
+                        rec.barrier();
+                    }
+                    if bq.is_some() || bk.is_some() || bv.is_some() {
+                        for b in 0..chunk.len() {
+                            if let Some(bias) = bq { rec.add(&self.q, (b * qd as usize) as u64, bias, 0, qd); }
+                            if let Some(bias) = bk { rec.add(&self.k, (b * kv_dim) as u64, bias, 0, wk.m); }
+                            if let Some(bias) = bv { rec.add(&self.v, (b * kv_dim) as u64, bias, 0, wv.m); }
+                        }
+                        rec.barrier();
+                    }
+                    if q_norm.is_some() || k_norm.is_some() {
+                        for b in 0..chunk.len() {
+                            if let Some(qn) = q_norm { rec.rms_norm_heads(&self.q, (b * qd as usize) as u64, qn, c.n_head as u32, c.head_dim as u32, c.eps); }
+                            if let Some(kn) = k_norm { rec.rms_norm_heads(&self.k, (b * kv_dim) as u64, kn, *n_head_kv, c.head_dim as u32, c.eps); }
+                        }
+                        rec.barrier();
+                    }
+                    for b in 0..chunk.len() {
+                        rec.rope_ext(&self.q, (b * qd as usize) as u64, &self.k, (b * kv_dim) as u64, &self.rope_factors, *use_rope_factors, c.n_head as u32, *n_head_kv, c.head_dim as u32, c.n_rot as u32, (pos0 + b) as u32, *rope_base, c.rope_mode);
+                    }
+                    rec.barrier();
+                    let kv_off = *kv_layer_idx as u64 * self.layer_stride;
+                    for b in 0..chunk.len() {
+                        rec.kv_write(&self.k, (b * kv_dim) as u64, &self.v, (b * kv_dim) as u64, &self.kv, kv_off, &self.pt_buf, 0, (pos0 + b) as u32, kv_dim as u32);
+                    }
+                    rec.barrier();
+                    for b in 0..chunk.len() {
+                        rec.attention_swa(&self.q, (b * qd as usize) as u64, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, (b * qd as usize) as u64, c.n_head as u32, *n_head_kv, c.head_dim as u32, (pos0 + b) as u32, *sliding_window);
+                    }
+                    rec.barrier();
+                    if *gated_q {
+                        rec.mul_sigmoid(&self.attn, &self.q_gate, batch * qd);
+                        rec.barrier();
+                    }
+                    if head_gate_w.is_some() {
+                        rec.mul_head_sigmoid_batch(&self.attn, &self.head_gate_buf, c.n_head as u32, c.head_dim as u32, batch);
+                        rec.barrier();
+                    }
+                    rec.qmm(wo.ty, &wo.buf, 0, &self.attn, 0, &self.o, 0, wo.k, wo.m, batch);
+                    rec.barrier();
+                }
+                VkMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
+                    rec.qmm(in_proj.ty, &in_proj.buf, 0, &self.xn, 0, &self.bcx, 0, in_proj.k, in_proj.m, batch);
+                    rec.barrier();
+                    rec.shortconv_step_batch(&self.bcx, conv_w, state, &self.xn, ne, *l_cache, batch);
+                    rec.barrier();
+                    rec.qmm(out_proj.ty, &out_proj.buf, 0, &self.xn, 0, &self.o, 0, out_proj.k, out_proj.m, batch);
+                    rec.barrier();
+                }
+                VkMixer::DeltaNet {
+                    wqkv, wgate, walpha, wbeta, wout, conv_w, dt_bias, ssm_a, ssm_norm,
+                    conv_state, ssm_state, n_k_heads, n_v_heads, state_dim, k_conv, conv_ch,
+                } => {
+                    rec.qmm(wqkv.ty, &wqkv.buf, 0, &self.xn, 0, &self.qkv_raw, 0, wqkv.k, wqkv.m, batch);
+                    rec.qmm(wgate.ty, &wgate.buf, 0, &self.xn, 0, &self.z_buf, 0, wgate.k, wgate.m, batch);
+                    rec.qmm(walpha.ty, &walpha.buf, 0, &self.xn, 0, &self.alpha_buf, 0, walpha.k, walpha.m, batch);
+                    rec.qmm(wbeta.ty, &wbeta.buf, 0, &self.xn, 0, &self.beta_buf, 0, wbeta.k, wbeta.m, batch);
+                    rec.barrier();
+                    rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch);
+                    rec.barrier();
+                    rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, batch);
+                    rec.barrier();
+                    rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, batch);
+                    rec.barrier();
+                    rec.qmm(wout.ty, &wout.buf, 0, &self.dn_norm, 0, &self.o, 0, wout.k, wout.m, batch);
+                    rec.barrier();
+                }
+            }
+            if let Some(pan) = &l.post_attn_norm {
+                for b in 0..chunk.len() {
+                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pan, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            }
+            rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            rec.barrier();
+            for b in 0..chunk.len() {
+                rec.rms_norm(&self.x, (b * c.n_embd) as u64, &l.ffn_norm, 0, &self.xn, (b * c.n_embd) as u64, ne, c.eps);
+            }
+            rec.barrier();
+            rec.qmm(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m, batch);
+            rec.qmm(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m, batch);
+            rec.barrier();
+            rec.swiglu(&self.gate, 0, &self.up, 0, &self.act, 0, batch * c.n_ff as u32);
+            rec.barrier();
+            rec.qmm(l.down.ty, &l.down.buf, 0, &self.act, 0, &self.o, 0, l.down.k, l.down.m, batch);
+            rec.barrier();
+            if let Some(pfn) = &l.post_ffw_norm {
+                for b in 0..chunk.len() {
+                    rec.rms_norm(&self.o, (b * c.n_embd) as u64, pfn, 0, &self.o, (b * c.n_embd) as u64, ne, c.eps);
+                }
+                rec.barrier();
+            }
+            rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            rec.barrier();
+        }
+
+        let last_off = ((chunk.len() - 1) * c.n_embd) as u64;
+        if out.logits || out.hidden {
+            rec.rms_norm(&self.x, last_off, &self.out_norm, 0, &self.hidden_buf, 0, ne, c.eps);
+            rec.barrier();
+        }
+        if out.logits {
+            let w = self.output.as_ref().unwrap_or(&self.embd);
+            rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
+            rec.barrier();
         }
         rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
 
