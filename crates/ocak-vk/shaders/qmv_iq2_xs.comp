@@ -14,33 +14,33 @@ void main() {
     float acc = 0.0;
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nblk = pc.k / 256u;
-        for (uint blk = tid; blk < nblk; blk += 32u) {
+        uint nsub = pc.k / 32u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 3;
+            uint ib32 = sb & 7u;
             uint b = rbase + blk * 74u;
-            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1]) << 8)).x;
-            uint xb = pc.x_off + blk * 256u;
-            for (uint ib32 = 0u; ib32 < 8u; ib32++) {
-                uint sc = uint(w[b + 66u + ib32]);
-                float db0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
-                float db1 = d * (0.5 + float(sc >> 4)) * 0.25;
-                for (uint l = 0u; l < 4u; l++) {
-                    uint qo = b + 2u + 2u * (4u * ib32 + l);
-                    uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
-                    uint gidx = q & 511u;
-                    uint glo = tbl[2u * gidx];
-                    uint ghi = tbl[2u * gidx + 1u];
-                    uint signs = tbl[1792u + (q >> 9)];
-                    float dl = (l < 2u) ? db0 : db1;
-                    uint xo = xb + ib32 * 32u + l * 8u;
-                    float s = 0.0;
-                    for (uint j = 0u; j < 4u; j++) {
-                        float v0 = float((glo >> (8u * j)) & 0xFFu);
-                        float v1 = float((ghi >> (8u * j)) & 0xFFu);
-                        s += v0 * (((signs & (1u << j)) != 0u) ? -1.0 : 1.0) * x[xo + j];
-                        s += v1 * (((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0) * x[xo + j + 4u];
-                    }
-                    acc += dl * s;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1u]) << 8)).x;
+            uint sc = uint(w[b + 66u + ib32]);
+            float db0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
+            float db1 = d * (0.5 + float(sc >> 4)) * 0.25;
+            uint xb = pc.x_off + sb * 32u;
+            for (uint l = 0u; l < 4u; l++) {
+                uint qo = b + 2u + 2u * (4u * ib32 + l);
+                uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
+                uint gidx = q & 511u;
+                uint glo = tbl[2u * gidx];
+                uint ghi = tbl[2u * gidx + 1u];
+                uint signs = tbl[1792u + (q >> 9)];
+                float dl = (l < 2u) ? db0 : db1;
+                uint xo = xb + l * 8u;
+                float s = 0.0;
+                for (uint j = 0u; j < 4u; j++) {
+                    float v0 = float((glo >> (8u * j)) & 0xFFu);
+                    float v1 = float((ghi >> (8u * j)) & 0xFFu);
+                    s += v0 * (((signs & (1u << j)) != 0u) ? -1.0 : 1.0) * x[xo + j];
+                    s += v1 * (((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0) * x[xo + j + 4u];
                 }
+                acc += dl * s;
             }
         }
     }

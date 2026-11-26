@@ -21,21 +21,21 @@ void main() {
     float acc = 0.0;
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nblk = pc.k / 64u;
-        for (uint blk = tid; blk < nblk; blk += 32u) {
+        uint nsub = pc.k / 16u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 2;
+            uint s = sb & 3u;
             uint b = rbase + blk * 36u;
-            uint xb = pc.x_off + blk * 64u;
-            for (uint s = 0u; s < 4u; s++) {
-                float d = ue4m3(uint(w[b + s]));
-                uint xo = xb + s * 16u;
-                float sum = 0.0;
-                for (uint j = 0u; j < 8u; j++) {
-                    uint qv = uint(w[b + 4u + s * 8u + j]);
-                    sum += KFP4[qv & 0xFu] * x[xo + j];
-                    sum += KFP4[qv >> 4] * x[xo + 8u + j];
-                }
-                acc += d * sum;
+            float d = ue4m3(uint(w[b + s]));
+            uint xo = pc.x_off + sb * 16u;
+            uint qo = b + 4u + s * 8u;
+            float sum = 0.0;
+            for (uint j = 0u; j < 8u; j++) {
+                uint qv = uint(w[qo + j]);
+                sum += KFP4[qv & 0xFu] * x[xo + j];
+                sum += KFP4[qv >> 4] * x[xo + 8u + j];
             }
+            acc += d * sum;
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);

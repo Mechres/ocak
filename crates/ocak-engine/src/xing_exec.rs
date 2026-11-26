@@ -179,7 +179,15 @@ struct XingLayer {
     wv_b: TensorInfo,
     wo: TensorInfo,
     #[cfg(feature = "vulkan")]
+    vk_wq_a: Option<VkMat>,
+    #[cfg(feature = "vulkan")]
+    vk_wkv_a: Option<VkMat>,
+    #[cfg(feature = "vulkan")]
     vk_wq_b: Option<VkMat>,
+    #[cfg(feature = "vulkan")]
+    vk_wk_b: Option<VkMat>,
+    #[cfg(feature = "vulkan")]
+    vk_wv_b: Option<VkMat>,
     #[cfg(feature = "vulkan")]
     vk_wo: Option<VkMat>,
     ffn: XingFfn,
@@ -248,12 +256,23 @@ impl XingExec {
                 scale: f32v(&g, &p("hc_ffn_scale.weight"))?,
                 base: f32v(&g, &p("hc_ffn_base.weight"))?,
             };
+            let wq_a = req(&g, &p("attn_q_a.weight"))?;
+            let wkv_a = req(&g, &p("attn_kv_a_mqa.weight"))?;
             let wq_b = req(&g, &p("attn_q_b.weight"))?;
+            let wk_b = req(&g, &p("attn_k_b.weight"))?;
+            let wv_b = req(&g, &p("attn_v_b.weight"))?;
             let wo = req(&g, &p("attn_output.weight"))?;
             #[cfg(feature = "vulkan")]
-            let (vk_wq_b, vk_wo) = match &vk {
-                Some(c) => (try_upload_mat(c, &g, &wq_b), try_upload_mat(c, &g, &wo)),
-                None => (None, None),
+            let (vk_wq_a, vk_wkv_a, vk_wq_b, vk_wk_b, vk_wv_b, vk_wo) = match &vk {
+                Some(c) => (
+                    try_upload_mat(c, &g, &wq_a).or_else(|| try_upload_mat_gtt(c, &g, &wq_a)),
+                    try_upload_mat(c, &g, &wkv_a).or_else(|| try_upload_mat_gtt(c, &g, &wkv_a)),
+                    try_upload_mat(c, &g, &wq_b).or_else(|| try_upload_mat_gtt(c, &g, &wq_b)),
+                    try_upload_mat(c, &g, &wk_b).or_else(|| try_upload_mat_gtt(c, &g, &wk_b)),
+                    try_upload_mat(c, &g, &wv_b).or_else(|| try_upload_mat_gtt(c, &g, &wv_b)),
+                    try_upload_mat(c, &g, &wo).or_else(|| try_upload_mat_gtt(c, &g, &wo)),
+                ),
+                None => (None, None, None, None, None, None),
             };
 
             let ffn = if let Some(gate) = g.tensor(&p("ffn_gate.weight")).cloned() {
@@ -351,16 +370,24 @@ impl XingExec {
                 hc_ffn,
                 attn_norm: f32v(&g, &p("attn_norm.weight"))?,
                 ffn_norm: f32v(&g, &p("ffn_norm.weight"))?,
-                wq_a: req(&g, &p("attn_q_a.weight"))?,
+                wq_a,
                 q_a_norm: f32v(&g, &p("attn_q_a_norm.weight"))?,
                 wq_b,
-                wkv_a: req(&g, &p("attn_kv_a_mqa.weight"))?,
+                wkv_a,
                 kv_a_norm: f32v(&g, &p("attn_kv_a_norm.weight"))?,
-                wk_b: req(&g, &p("attn_k_b.weight"))?,
-                wv_b: req(&g, &p("attn_v_b.weight"))?,
+                wk_b,
+                wv_b,
                 wo,
                 #[cfg(feature = "vulkan")]
+                vk_wq_a,
+                #[cfg(feature = "vulkan")]
+                vk_wkv_a,
+                #[cfg(feature = "vulkan")]
                 vk_wq_b,
+                #[cfg(feature = "vulkan")]
+                vk_wk_b,
+                #[cfg(feature = "vulkan")]
+                vk_wv_b,
                 #[cfg(feature = "vulkan")]
                 vk_wo,
                 ffn,
@@ -373,8 +400,9 @@ impl XingExec {
         #[cfg(feature = "vulkan")]
         let (vk_x, vk_y, vk_g, vk_u, vk_a, vk_acc, vk_output) = match &vk {
             Some(c) => {
-                let x = c.create_device_buffer((cfg.n_ff_dense.max(cfg.n_embd) * 4) as u64).ok();
-                let y = c.create_device_buffer((cfg.n_vocab.max(cfg.n_ff_dense) * 4) as u64).ok();
+                let x_cap = cfg.n_ff_dense.max(cfg.n_embd).max(cfg.n_head * cfg.kv_rank);
+                let x = c.create_device_buffer((x_cap * 4) as u64).ok();
+                let y = c.create_device_buffer((cfg.n_vocab.max(cfg.n_ff_dense).max(cfg.n_head * (cfg.key_dim + cfg.kv_rank)) * 4) as u64).ok();
                 let fg = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
                 let fu = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
                 let fa = c.create_device_buffer((cfg.n_ff_dense * 4) as u64).ok();
@@ -585,14 +613,78 @@ impl Executor for XingExec {
             let (inp, post, comb) = self.hc_pre(&streams, &self.layers[li].hc_attn);
             ops::rms_norm(&inp, &self.layers[li].attn_norm, &mut normed, c.eps);
 
-            self.mv_cpu(&self.layers[li].wq_a, 0, &normed, &mut q_a);
-            ops::rms_norm(&q_a, &self.layers[li].q_a_norm, &mut q_an, c.eps);
+            // Fused GPU Submit 1: wq_a + wkv_a from `normed`
             #[cfg(feature = "vulkan")]
-            self.mv_hybrid(&self.layers[li].wq_b, self.layers[li].vk_wq_b.as_ref(), 0, &q_an, &mut q_full);
+            let did_gpu_a = if let (Some(c_vk), Some(bx), Some(by), Some(va), Some(vkva)) = (
+                &self.vk, &self.vk_x, &self.vk_y, &self.layers[li].vk_wq_a, &self.layers[li].vk_wkv_a,
+            ) {
+                let _ = c_vk.upload(bx, 0, bytemuck::cast_slice(&normed));
+                let mut rec = c_vk.begin();
+                rec.qmv(va.ty, &va.buf, 0, bx, 0, by, 0, va.k, va.m);
+                rec.qmv(vkva.ty, &vkva.buf, 0, bx, 0, by, c.q_rank as u64, vkva.k, vkva.m);
+                if rec.finish_and_wait().is_ok() {
+                    let mut pack = vec![0f32; c.q_rank + hd];
+                    let _ = c_vk.download(by, 0, bytemuck::cast_slice_mut(&mut pack));
+                    q_a.copy_from_slice(&pack[..c.q_rank]);
+                    kv_raw.copy_from_slice(&pack[c.q_rank..c.q_rank + hd]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             #[cfg(not(feature = "vulkan"))]
-            self.mv_cpu(&self.layers[li].wq_b, 0, &q_an, &mut q_full);
+            let did_gpu_a = false;
+            if !did_gpu_a {
+                self.mv_cpu(&self.layers[li].wq_a, 0, &normed, &mut q_a);
+                self.mv_cpu(&self.layers[li].wkv_a, 0, &normed, &mut kv_raw);
+            }
+            ops::rms_norm(&q_a, &self.layers[li].q_a_norm, &mut q_an, c.eps);
 
-            self.mv_cpu(&self.layers[li].wkv_a, 0, &normed, &mut kv_raw);
+            // Fused GPU Submit 2: wq_b -> 32x wk_b (absorption) in ONE command buffer!
+            #[cfg(feature = "vulkan")]
+            let did_gpu_qk = if let (Some(c_vk), Some(bx), Some(by), Some(vqb), Some(vkb)) = (
+                &self.vk, &self.vk_x, &self.vk_y, &self.layers[li].vk_wq_b, &self.layers[li].vk_wk_b,
+            ) {
+                let _ = c_vk.upload(bx, 0, bytemuck::cast_slice(&q_an));
+                let mut rec = c_vk.begin();
+                rec.qmv(vqb.ty, &vqb.buf, 0, bx, 0, by, 0, vqb.k, vqb.m);
+                let q_lat_off = (nh * c.key_dim) as u64;
+                for h in 0..nh {
+                    rec.qmv(
+                        vkb.ty,
+                        &vkb.buf,
+                        h as u64 * vkb.slice_bytes,
+                        by,
+                        (h * c.key_dim) as u64,
+                        by,
+                        q_lat_off + (h * latent) as u64,
+                        vkb.k,
+                        vkb.m,
+                    );
+                }
+                if rec.finish_and_wait().is_ok() {
+                    let mut pack = vec![0f32; nh * c.key_dim + nh * latent];
+                    let _ = c_vk.download(by, 0, bytemuck::cast_slice_mut(&mut pack));
+                    q_full.copy_from_slice(&pack[..nh * c.key_dim]);
+                    q_lat.copy_from_slice(&pack[nh * c.key_dim..]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            #[cfg(not(feature = "vulkan"))]
+            let did_gpu_qk = false;
+            if !did_gpu_qk {
+                #[cfg(feature = "vulkan")]
+                self.mv_hybrid(&self.layers[li].wq_b, self.layers[li].vk_wq_b.as_ref(), 0, &q_an, &mut q_full);
+                #[cfg(not(feature = "vulkan"))]
+                self.mv_cpu(&self.layers[li].wq_b, 0, &q_an, &mut q_full);
+            }
+
             self.rope_yarn_normal(&mut q_full, nh, c.key_dim, nope, pos);
             self.rope_yarn_normal(&mut kv_raw, 1, hd, latent, pos);
 
@@ -604,52 +696,125 @@ impl Executor for XingExec {
             let kv_layer_base = li * self.max_ctx * hd;
             self.kv_cache[kv_layer_base + pos * hd..kv_layer_base + (pos + 1) * hd].copy_from_slice(&kv_raw);
 
-            // Parallel 32-head MLA (wk_b absorption + latent attention + wv_b projection)
+            // Parallel 32-head latent attention
             let kv_slice = &self.kv_cache[kv_layer_base..kv_layer_base + (pos + 1) * hd];
-            let wk_b_ti = &self.layers[li].wk_b;
-            let wv_b_ti = &self.layers[li].wv_b;
-            let wk_b_raw = self.g.tensor_data(wk_b_ti);
-            let wv_b_raw = self.g.tensor_data(wv_b_ti);
-            let wk_b_stride = wk_b_ti.row_bytes() * wk_b_ti.ne[1] as usize;
-            let wv_b_stride = wv_b_ti.row_bytes() * wv_b_ti.ne[1] as usize;
-            let _ = (&mut q_lat, &mut attn_lat);
-            val_all.par_chunks_mut(vdim).enumerate().for_each(|(h, val_h)| {
-                let qn = &q_full[h * c.key_dim..h * c.key_dim + nope];
-                let qp = &q_full[h * c.key_dim + nope..h * c.key_dim + c.key_dim];
-                let mut ql = vec![0f32; latent];
-                let wkb_h = &wk_b_raw[h * wk_b_stride..(h + 1) * wk_b_stride];
-                for r in 0..latent {
-                    ql[r] = ocak_cpu::row_dot(wk_b_ti.ty, &wkb_h[r * wk_b_ti.row_bytes()..(r + 1) * wk_b_ti.row_bytes()], qn);
+            if did_gpu_qk {
+                attn_lat.par_chunks_mut(latent).enumerate().for_each(|(h, ah)| {
+                    let ql = &q_lat[h * latent..(h + 1) * latent];
+                    let qp = &q_full[h * c.key_dim + nope..h * c.key_dim + c.key_dim];
+                    let mut scores = vec![0f32; pos + 1];
+                    let mut mx = f32::NEG_INFINITY;
+                    for t in 0..=pos {
+                        let kc = &kv_slice[t * hd..(t + 1) * hd];
+                        let mut dot = 0f32;
+                        for i in 0..latent { dot += ql[i] * kc[i]; }
+                        for i in 0..n_rot { dot += qp[i] * kc[latent + i]; }
+                        let s = dot * kq_scale;
+                        scores[t] = s;
+                        if s > mx { mx = s; }
+                    }
+                    let mut sum = 0f32;
+                    for s in &mut scores { *s = (*s - mx).exp(); sum += *s; }
+                    let inv = 1.0 / sum;
+                    ah.fill(0.0);
+                    for t in 0..=pos {
+                        let w = scores[t] * inv;
+                        let vc = &kv_slice[t * hd..t * hd + latent];
+                        for i in 0..latent { ah[i] += w * vc[i]; }
+                    }
+                });
+                // Fused GPU Submit 3: 32x wv_b -> wo in ONE command buffer!
+                #[cfg(feature = "vulkan")]
+                let did_gpu_vo = if let (Some(c_vk), Some(bx), Some(by), Some(bacc), Some(vvb), Some(vwo)) = (
+                    &self.vk, &self.vk_x, &self.vk_y, &self.vk_acc, &self.layers[li].vk_wv_b, &self.layers[li].vk_wo,
+                ) {
+                    let _ = c_vk.upload(bx, 0, bytemuck::cast_slice(&attn_lat));
+                    let mut rec = c_vk.begin();
+                    for h in 0..nh {
+                        rec.qmv(
+                            vvb.ty,
+                            &vvb.buf,
+                            h as u64 * vvb.slice_bytes,
+                            bx,
+                            (h * latent) as u64,
+                            by,
+                            (h * vdim) as u64,
+                            vvb.k,
+                            vvb.m,
+                        );
+                    }
+                    rec.qmv(vwo.ty, &vwo.buf, 0, by, 0, bacc, 0, vwo.k, vwo.m);
+                    if rec.finish_and_wait().is_ok() {
+                        let _ = c_vk.download(bacc, 0, bytemuck::cast_slice_mut(&mut block_out));
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "vulkan"))]
+                let did_gpu_vo = false;
+                if !did_gpu_vo {
+                    let wv_b_ti = &self.layers[li].wv_b;
+                    let wv_b_raw = self.g.tensor_data(wv_b_ti);
+                    let wv_b_stride = wv_b_ti.row_bytes() * wv_b_ti.ne[1] as usize;
+                    val_all.par_chunks_mut(vdim).enumerate().for_each(|(h, val_h)| {
+                        let ah = &attn_lat[h * latent..(h + 1) * latent];
+                        let wvb_h = &wv_b_raw[h * wv_b_stride..(h + 1) * wv_b_stride];
+                        for r in 0..vdim {
+                            val_h[r] = ocak_cpu::row_dot(wv_b_ti.ty, &wvb_h[r * wv_b_ti.row_bytes()..(r + 1) * wv_b_ti.row_bytes()], ah);
+                        }
+                    });
+                    #[cfg(feature = "vulkan")]
+                    self.mv_hybrid(&self.layers[li].wo, self.layers[li].vk_wo.as_ref(), 0, &val_all, &mut block_out);
+                    #[cfg(not(feature = "vulkan"))]
+                    self.mv_cpu(&self.layers[li].wo, 0, &val_all, &mut block_out);
                 }
-                let mut scores = vec![0f32; pos + 1];
-                let mut mx = f32::NEG_INFINITY;
-                for t in 0..=pos {
-                    let kc = &kv_slice[t * hd..(t + 1) * hd];
-                    let mut dot = 0f32;
-                    for i in 0..latent { dot += ql[i] * kc[i]; }
-                    for i in 0..n_rot { dot += qp[i] * kc[latent + i]; }
-                    let s = dot * kq_scale;
-                    scores[t] = s;
-                    if s > mx { mx = s; }
-                }
-                let mut sum = 0f32;
-                for s in &mut scores { *s = (*s - mx).exp(); sum += *s; }
-                let mut ah = vec![0f32; latent];
-                for t in 0..=pos {
-                    let w = scores[t] / sum;
-                    let vc = &kv_slice[t * hd..t * hd + latent];
-                    for i in 0..latent { ah[i] += w * vc[i]; }
-                }
-                let wvb_h = &wv_b_raw[h * wv_b_stride..(h + 1) * wv_b_stride];
-                for r in 0..vdim {
-                    val_h[r] = ocak_cpu::row_dot(wv_b_ti.ty, &wvb_h[r * wv_b_ti.row_bytes()..(r + 1) * wv_b_ti.row_bytes()], &ah);
-                }
-            });
-
-            #[cfg(feature = "vulkan")]
-            self.mv_hybrid(&self.layers[li].wo, self.layers[li].vk_wo.as_ref(), 0, &val_all, &mut block_out);
-            #[cfg(not(feature = "vulkan"))]
-            self.mv_cpu(&self.layers[li].wo, 0, &val_all, &mut block_out);
+            } else {
+                let wk_b_ti = &self.layers[li].wk_b;
+                let wv_b_ti = &self.layers[li].wv_b;
+                let wk_b_raw = self.g.tensor_data(wk_b_ti);
+                let wv_b_raw = self.g.tensor_data(wv_b_ti);
+                let wk_b_stride = wk_b_ti.row_bytes() * wk_b_ti.ne[1] as usize;
+                let wv_b_stride = wv_b_ti.row_bytes() * wv_b_ti.ne[1] as usize;
+                val_all.par_chunks_mut(vdim).enumerate().for_each(|(h, val_h)| {
+                    let qn = &q_full[h * c.key_dim..h * c.key_dim + nope];
+                    let qp = &q_full[h * c.key_dim + nope..h * c.key_dim + c.key_dim];
+                    let mut ql = vec![0f32; latent];
+                    let wkb_h = &wk_b_raw[h * wk_b_stride..(h + 1) * wk_b_stride];
+                    for r in 0..latent {
+                        ql[r] = ocak_cpu::row_dot(wk_b_ti.ty, &wkb_h[r * wk_b_ti.row_bytes()..(r + 1) * wk_b_ti.row_bytes()], qn);
+                    }
+                    let mut scores = vec![0f32; pos + 1];
+                    let mut mx = f32::NEG_INFINITY;
+                    for t in 0..=pos {
+                        let kc = &kv_slice[t * hd..(t + 1) * hd];
+                        let mut dot = 0f32;
+                        for i in 0..latent { dot += ql[i] * kc[i]; }
+                        for i in 0..n_rot { dot += qp[i] * kc[latent + i]; }
+                        let s = dot * kq_scale;
+                        scores[t] = s;
+                        if s > mx { mx = s; }
+                    }
+                    let mut sum = 0f32;
+                    for s in &mut scores { *s = (*s - mx).exp(); sum += *s; }
+                    let mut ah = vec![0f32; latent];
+                    for t in 0..=pos {
+                        let w = scores[t] / sum;
+                        let vc = &kv_slice[t * hd..t * hd + latent];
+                        for i in 0..latent { ah[i] += w * vc[i]; }
+                    }
+                    let wvb_h = &wv_b_raw[h * wv_b_stride..(h + 1) * wv_b_stride];
+                    for r in 0..vdim {
+                        val_h[r] = ocak_cpu::row_dot(wv_b_ti.ty, &wvb_h[r * wv_b_ti.row_bytes()..(r + 1) * wv_b_ti.row_bytes()], &ah);
+                    }
+                });
+                #[cfg(feature = "vulkan")]
+                self.mv_hybrid(&self.layers[li].wo, self.layers[li].vk_wo.as_ref(), 0, &val_all, &mut block_out);
+                #[cfg(not(feature = "vulkan"))]
+                self.mv_cpu(&self.layers[li].wo, 0, &val_all, &mut block_out);
+            }
             Self::hc_post(&mut streams, &block_out, &post, &comb, ne);
 
             // 2. Hyper-Connection pre + Dense or MoE FFN

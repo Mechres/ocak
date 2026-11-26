@@ -61,9 +61,9 @@ Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak
 | `Qwen3.5-4B-Q4_K_M` | `qwen35` (Gated DeltaNet + Attn) | 2.55 GB | `1.000000` | `0.999335` | **34.8 tok/s** |
 | `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GB | `1.000000` | `0.999584` | **19.9 tok/s** |
 | `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GB | — | greedy verified | **7.8 tok/s** |
-| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + NextN MTP) | 9.14 GB | — | greedy + MTP 7/7 (100%) | **7.0 tok/s** |
-| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4` MoE, VRAM+GTT) | 16.42 GB | — | greedy verified | **5.6 tok/s** |
-| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, `gpu_moe=37` VRAM+GTT) | 10.79 GB | — | greedy verified | **3.5 tok/s** |
+| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + NextN MTP) | 9.14 GB | — | greedy + MTP 7/7 (100%) | **9.7 tok/s** |
+| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, `gpu_moe=37` VRAM+GTT) | 10.79 GB | — | greedy verified | **6.1 tok/s** |
+| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4` MoE, VRAM+GTT) | 16.42 GB | — | greedy verified | **5.7 tok/s** |
 | `Qwen3-ASR-1.7B` | `qwen3a` + `qwen3vl` (Native Audio) | 2.35 GB | — | end-to-end WAV verified | **1.49 s / clip** |
 
 - **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`).

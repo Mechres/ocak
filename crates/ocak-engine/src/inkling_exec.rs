@@ -370,7 +370,7 @@ impl InklingExec {
             };
             let ffn_res_query = load_f32_vec(&g, &format!("blk.{i}.ffn_res_query.weight"))?;
             let ffn_norm = load_f32_vec(&g, &format!("blk.{i}.ffn_norm.weight"))?;
-            let ffn_gate_inp = load_mat(&g, vk.as_ref(), &format!("blk.{i}.ffn_gate_inp.weight"), false)?;
+            let ffn_gate_inp = load_mat(&g, vk.as_ref(), &format!("blk.{i}.ffn_gate_inp.weight"), vk.is_some())?;
             let exp_probs_b = load_f32_vec(&g, &format!("blk.{i}.exp_probs_b.bias")).ok();
 
             let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
@@ -502,9 +502,26 @@ impl InklingExec {
     fn control(&self, cur: &[f32], msg: &[f32], lp: &LoopLayer, ctrl: usize) -> Result<Vec<f32>, EngineError> {
         let mut cat = rms_norm_unweighted(cur, 1e-6);
         cat.extend_from_slice(&rms_norm_unweighted(msg, 1e-6));
-        let gate = self.matvec(&lp.ctrl_down[ctrl], &cat)?;
-        let gain = self.matvec(&lp.ctrl_gain[ctrl], &gate)?;
-        let forget = self.matvec(&lp.ctrl_forget[ctrl], &gate)?;
+        let (gain, forget) = if let (Some(c), Some(bx), Some(by), Some((bd, wtd)), Some((bg, wtg)), Some((bf, wtf))) = (
+            &self.vk, &self.gpu_x, &self.gpu_y,
+            &lp.ctrl_down[ctrl].gpu, &lp.ctrl_gain[ctrl].gpu, &lp.ctrl_forget[ctrl].gpu,
+        ) {
+            let rank = lp.ctrl_down[ctrl].m as u32;
+            let ne = self.n_embd as u32;
+            c.upload(bx, 0, bytemuck::cast_slice(&cat)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut rec = c.begin();
+            // down -> by[0..rank], gain -> by[rank..rank+ne], forget -> by[rank+ne..rank+2*ne]
+            rec.qmv(*wtd, bd, 0, bx, 0, by, 0, 2 * ne, rank);
+            rec.qmv(*wtg, bg, 0, by, 0, by, rank as u64, rank, ne);
+            rec.qmv(*wtf, bf, 0, by, 0, by, (rank + ne) as u64, rank, ne);
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut gf = vec![0f32; 2 * self.n_embd];
+            c.download(by, (rank as u64) * 4, bytemuck::cast_slice_mut(&mut gf)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            (gf[..self.n_embd].to_vec(), gf[self.n_embd..].to_vec())
+        } else {
+            let gate = self.matvec(&lp.ctrl_down[ctrl], &cat)?;
+            (self.matvec(&lp.ctrl_gain[ctrl], &gate)?, self.matvec(&lp.ctrl_forget[ctrl], &gate)?)
+        };
         let mut out = vec![0f32; self.n_embd];
         for i in 0..self.n_embd {
             let g = gain[i].tanh();
