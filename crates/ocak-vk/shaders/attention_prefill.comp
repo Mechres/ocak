@@ -1,0 +1,153 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Flash-attention style causal prefill over the paged FP16 KV cache.
+// Workgroup (kvh, tile) owns R = 64 query rows: the `group` query heads that share KV head kvh,
+// for 64 / group consecutive tokens. Each step stages a BK-key tile of K and V in shared memory
+// once and reuses it for all 64 rows (vs. one full KV pass per (head, token) in attention.comp).
+// Thread layout: row r = tid / 4; the 4 lanes of a row split the keys (scores) and the output dims.
+// Compiled with HDMAX = 128 or 256 (max head_dim).
+#ifndef HDMAX
+#define HDMAX 128
+#endif
+#if HDMAX > 128
+#define BK 16u
+#else
+#define BK 32u
+#endif
+#define R 64u
+#define HHD (uint(HDMAX) / 2u)   // packed f16x2 per row
+#define KPT (BK / 4u)      // keys per lane
+#define DPT (HHD / 4u)     // packed output dims per lane
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KV { uint kv[]; };
+layout(set = 0, binding = 2) readonly buffer PT { uint pt[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint layer_kv_off;
+    uint pt_off;
+    uint out_off;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint pos0;
+    uint sliding_window;
+    uint n_tok;
+} pc;
+
+shared uint qs[R * HHD];
+shared uint ks[BK * HHD];
+shared uint vs[BK * HHD];
+shared float ps[R * BK];
+
+void main() {
+    uint kvh = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint group = pc.n_heads / pc.n_kv_heads;
+    uint bq = R / group;
+    uint q0 = gl_WorkGroupID.y * bq;
+    uint hhd = pc.head_dim >> 1;
+    uint half_kv_dim = pc.n_kv_heads * hhd;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    // Stage the 64 query rows (pre-scaled) as packed f16.
+    for (uint idx = tid; idx < R * hhd; idx += 256u) {
+        uint r = idx / hhd;
+        uint e = idx % hhd;
+        uint tok = q0 + r / group;
+        uint h = kvh * group + r % group;
+        vec2 v = vec2(0.0);
+        if (tok < pc.n_tok) {
+            uint qb = pc.q_off + (tok * pc.n_heads + h) * pc.head_dim + 2u * e;
+            v = vec2(q[qb], q[qb + 1u]) * scale;
+        }
+        qs[r * HHD + e] = packHalf2x16(v);
+    }
+
+    uint r = tid >> 2;
+    uint sub = tid & 3u;
+    uint tok_r = q0 + r / group;
+    bool row_valid = tok_r < pc.n_tok;
+    uint qpos = pc.pos0 + tok_r;
+    uint ntq = min(bq, pc.n_tok - q0);
+    uint max_qpos = pc.pos0 + q0 + ntq - 1u;
+    uint min_qpos = pc.pos0 + q0;
+    uint t_lo = (pc.sliding_window > 0u && min_qpos + 1u > pc.sliding_window) ? (min_qpos + 1u - pc.sliding_window) : 0u;
+    t_lo = (t_lo / BK) * BK;
+
+    float m = -1e30;
+    float l = 0.0;
+    vec2 acc[DPT];
+    for (uint j = 0u; j < DPT; j++) acc[j] = vec2(0.0);
+    barrier();
+
+    for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
+        // Stage the K/V tile.
+        for (uint idx = tid; idx < BK * hhd; idx += 256u) {
+            uint kk = idx / hhd;
+            uint e = idx % hhd;
+            uint t = t0 + kk;
+            uint kval = 0u, vval = 0u;
+            if (t <= max_qpos) {
+                uint page = pt[pc.pt_off + (t >> 4)];
+                uint slot = t & 15u;
+                uint kb = pc.layer_kv_off + ((page * 2u) * 16u + slot) * half_kv_dim + kvh * hhd + e;
+                kval = kv[kb];
+                vval = kv[kb + 16u * half_kv_dim];
+            }
+            ks[kk * HHD + e] = kval;
+            vs[kk * HHD + e] = vval;
+        }
+        barrier();
+
+        // Scores for this row's KPT keys.
+        float s[KPT];
+        for (uint j = 0u; j < KPT; j++) s[j] = 0.0;
+        for (uint e = 0u; e < hhd; e++) {
+            vec2 qv = unpackHalf2x16(qs[r * HHD + e]);
+            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HHD + e]));
+        }
+        float tmax = -1e30;
+        for (uint j = 0u; j < KPT; j++) {
+            uint t = t0 + sub * KPT + j;
+            bool ok = row_valid && t <= qpos && (pc.sliding_window == 0u || qpos - t < pc.sliding_window);
+            s[j] = ok ? s[j] : -3.0e38;
+            tmax = max(tmax, s[j]);
+        }
+        tmax = subgroupClusteredMax(tmax, 4u);
+        float m_new = max(m, tmax);
+        float alpha = exp(m - m_new);
+        float psum = 0.0;
+        for (uint j = 0u; j < KPT; j++) {
+            float p = (s[j] > -1.0e38) ? exp(s[j] - m_new) : 0.0;
+            ps[r * BK + sub * KPT + j] = p;
+            psum += p;
+        }
+        psum = subgroupClusteredAdd(psum, 4u);
+        l = l * alpha + psum;
+        m = m_new;
+        for (uint j = 0u; j < DPT; j++) acc[j] *= alpha;
+        barrier();
+
+        // O += P V over this row's DPT packed dims.
+        for (uint kk = 0u; kk < BK; kk++) {
+            float p = ps[r * BK + kk];
+            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HHD + sub * DPT + j]);
+        }
+        barrier();
+    }
+
+    if (row_valid) {
+        uint h = kvh * group + r % group;
+        float inv = 1.0 / l;
+        uint ob = pc.out_off + (tok_r * pc.n_heads + h) * pc.head_dim;
+        for (uint j = 0u; j < DPT; j++) {
+            uint d2 = sub * DPT + j;
+            if (d2 < hhd) {
+                o[ob + 2u * d2] = acc[j].x * inv;
+                o[ob + 2u * d2 + 1u] = acc[j].y * inv;
+            }
+        }
+    }
+}

@@ -826,7 +826,10 @@ impl VkExec {
         let ne = c.n_embd as u32;
         let n_layer = self.layers.len();
         let mut l0 = 0usize;
-        while n_layer - l0 > LAYERS_PER_SUBMIT {
+        // Small batches (decode-time verify / commit) stay in one submit: each extra submit costs a
+        // CPU-GPU round trip, and their GPU time is far from the TDR limit.
+        let split = chunk.len() >= 64;
+        while split && n_layer - l0 > LAYERS_PER_SUBMIT {
             let mut rec = self.ctx.begin();
             rec.set_defer_barriers(true);
             rec.set_attn_split(false);
@@ -939,7 +942,15 @@ impl VkExec {
                     let kv_off = *kv_layer_idx as u64 * self.layer_stride;
                     rec.kv_write_batch(&self.k, 0, &self.v, 0, &self.kv, kv_off, &self.pt_buf, 0, pos0 as u32, kv_dim as u32, batch);
                     rec.barrier();
-                    rec.attention_batch(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos0 as u32, *sliding_window, batch);
+                    if batch >= 16 {
+                        rec.attention_prefill(&self.q, 0, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, 0, c.n_head as u32, *n_head_kv, c.head_dim as u32, pos0 as u32, *sliding_window, batch);
+                    } else {
+                        // Small batches (speculative verify): per-token decode attention keeps
+                        // split-K parallelism over long contexts.
+                        for b in 0..chunk.len() {
+                            rec.attention_swa(&self.q, (b * qd as usize) as u64, &self.kv, kv_off, &self.pt_buf, 0, &self.attn, (b * qd as usize) as u64, c.n_head as u32, *n_head_kv, c.head_dim as u32, (pos0 + b) as u32, *sliding_window);
+                        }
+                    }
                     rec.barrier();
                     if *gated_q {
                         rec.mul_sigmoid(&self.attn, &self.q_gate, batch * qd);

@@ -116,6 +116,22 @@ fn main() {
         assert!(status.success(), "shader compilation failed on {src}");
         let _ = fs::metadata(&dst).expect("spv missing");
     }
+    // Sources compiled several times with different defines: (output name, source, defines).
+    let variants: [(&str, &str, &[&str]); 2] = [
+        ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
+        ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
+    ];
+    for (name, src, defs) in variants {
+        println!("cargo:rerun-if-changed={src}");
+        let dst = out_dir.join(format!("{name}.spv"));
+        let status = if has_glslc || has_usr_glslc {
+            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
+            Command::new(bin).args(["--target-env=vulkan1.3", "-O"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc")
+        } else {
+            Command::new("glslangValidator").args(["-V", "--target-env", "vulkan1.3"]).args(defs).arg("-o").arg(&dst).arg(src).status().expect("failed to invoke glslangValidator")
+        };
+        assert!(status.success(), "shader compilation failed on {src} ({name})");
+    }
     // One tiled-prefill matmul source, specialised per weight format.
     let tiled = [
         ("q4_k", "Q4_K"), ("q5_k", "Q5_K"), ("q6_k", "Q6_K"), ("q2_k", "Q2_K"), ("q3_k", "Q3_K"),

@@ -193,6 +193,8 @@ struct Pipelines {
     moe_group: PipelineBundle,
     inkling_kv_store: PipelineBundle,
     inkling_attn_batch: PipelineBundle,
+    attention_prefill_128: PipelineBundle,
+    attention_prefill_256: PipelineBundle,
     argmax: PipelineBundle,
 }
 
@@ -263,7 +265,7 @@ impl Pipelines {
         .into_iter()
         .chain(self.qmmt.iter())
         .chain(self.qmmg.iter())
-        .chain([&self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch])
+        .chain([&self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.attention_prefill_128, &self.attention_prefill_256])
         {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -593,6 +595,8 @@ impl VkContext {
                 moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), 2, 12)?,
                 inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), 4, 44)?,
                 inkling_attn_batch: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_batch.spv")), 10, 88)?,
+                attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), 4, 40)?,
+                attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), 4, 40)?,
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), 2, 8)?,
             };
 
@@ -1641,6 +1645,27 @@ impl<'a> Recorder<'a> {
     pub fn attention(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32) {
         self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
     }
+    /// Flash-style causal prefill attention (attention_prefill.comp) for queries at pos..pos+batch:
+    /// each workgroup stages K/V tiles once for 64 query rows of one KV head. Falls back to
+    /// `attention_batch` when head_dim > 256 or the GQA group size does not divide 64.
+    pub fn attention_prefill(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32, batch: u32) {
+        let group = n_heads / n_kv_heads.max(1);
+        let pipe = match head_dim {
+            0..=128 => &self.ctx.pipelines.attention_prefill_128,
+            129..=256 => &self.ctx.pipelines.attention_prefill_256,
+            _ => {
+                self.attention_batch(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, sliding_window, batch);
+                return;
+            }
+        };
+        if group == 0 || !64u32.is_multiple_of(group) || !head_dim.is_multiple_of(2) {
+            self.attention_batch(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, sliding_window, batch);
+            return;
+        }
+        let pc = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), off_u32(out_off), n_heads, n_kv_heads, head_dim, pos, sliding_window, batch];
+        self.dispatch_raw(pipe, &[q.buf, kv.buf, page_table.buf, out.buf], bytemuck::cast_slice(&pc), n_kv_heads, batch.div_ceil(64 / group), 1);
+    }
+
     /// Causal prefill attention for queries at pos..pos+batch in one single-pass dispatch.
     /// q/out rows are n_heads*head_dim floats; K/V for all those positions must already be written.
     pub fn attention_batch(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32, batch: u32) {
@@ -2160,6 +2185,44 @@ mod tests {
                 let dt = t.elapsed().as_secs_f64() / 20.0;
                 eprintln!("{wt:?} k={k} m={m}: {:.3} ms  {:.2} TFLOPS", dt * 1e3, 2.0 * (k * m * batch * n_used) as f64 / dt / 1e12);
             }
+        }
+    }
+
+    #[test]
+    fn vk_attention_prefill_matches_batch() {
+        let c = VkContext::new().expect("vulkan init");
+        let mut s = 0x51ED_2701u64;
+        let mut rnd = || -> f32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        // (n_heads, n_kv_heads, head_dim, pos0, n_tok, sliding_window)
+        for &(nh, nkv, hd, pos0, ntok, sw) in &[(16u32, 4u32, 128u32, 37u32, 75u32, 0u32), (8, 8, 64, 0, 40, 0), (16, 2, 256, 300, 50, 0), (12, 4, 128, 500, 70, 64)] {
+            let n_ctx = (pos0 + ntok) as usize;
+            let n_pages = n_ctx.div_ceil(16);
+            let half_kv_dim = (nkv * hd / 2) as usize;
+            // Paged cache with a shuffled page table.
+            let kvd: Vec<u32> = (0..n_pages * 2 * 16 * half_kv_dim).map(|_| half::f16::from_f32(rnd()).to_bits() as u32 | ((half::f16::from_f32(rnd()).to_bits() as u32) << 16)).collect();
+            let pt: Vec<u32> = (0..n_pages as u32).rev().collect();
+            let qv: Vec<f32> = (0..(ntok * nh * hd) as usize).map(|_| rnd() * 2.0).collect();
+            let bkv = c.create_device_buffer((kvd.len() * 4) as u64).unwrap();
+            c.upload(&bkv, 0, bytemuck::cast_slice(&kvd)).unwrap();
+            let bpt = c.create_device_buffer((pt.len() * 4).max(16) as u64).unwrap();
+            c.upload(&bpt, 0, bytemuck::cast_slice(&pt)).unwrap();
+            let bq = c.create_device_buffer((qv.len() * 4) as u64).unwrap();
+            c.upload(&bq, 0, bytemuck::cast_slice(&qv)).unwrap();
+            let bo1 = c.create_device_buffer((qv.len() * 4) as u64).unwrap();
+            let bo2 = c.create_device_buffer((qv.len() * 4) as u64).unwrap();
+            let mut rec = c.begin();
+            rec.attention_prefill(&bq, 0, &bkv, 0, &bpt, 0, &bo1, 0, nh, nkv, hd, pos0, sw, ntok);
+            rec.attention_batch(&bq, 0, &bkv, 0, &bpt, 0, &bo2, 0, nh, nkv, hd, pos0, sw, ntok);
+            rec.finish_and_wait().unwrap();
+            let mut o1 = vec![0f32; qv.len()];
+            let mut o2 = vec![0f32; qv.len()];
+            c.download(&bo1, 0, bytemuck::cast_slice_mut(&mut o1)).unwrap();
+            c.download(&bo2, 0, bytemuck::cast_slice_mut(&mut o2)).unwrap();
+            let maxerr = o1.iter().zip(&o2).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+            assert!(maxerr < 2e-3, "attention_prefill mismatch nh={nh} nkv={nkv} hd={hd} pos0={pos0} ntok={ntok} sw={sw}: max err {maxerr}");
         }
     }
 
