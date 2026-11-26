@@ -186,7 +186,7 @@ impl MtpDrafter {
         let pt: Vec<u32> = (0..n_pages as u32).collect();
         let pt_buf = ctx.create_device_buffer((pt.len() * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
         ctx.upload(&pt_buf, 0, bytemuck::cast_slice(&pt)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let kv = mk(n_pages * 2 * 16 * kv_dim)?;
+        let kv = mk(n_pages * 2 * 16 * (kv_dim / 2))?;
 
         self.gpu = Some(MtpGpu {
             eh_proj: up_mat(&self.eh_proj)?,

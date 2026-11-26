@@ -7,43 +7,65 @@ layout(set = 0, binding = 1) readonly buffer X { float x[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
 layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+
+float dot8_iq2xs(uint rbase, uint blk, uint ib32, uint l,
+                 float x0, float x1, float x2, float x3, float x4, float x5, float x6, float x7) {
+    uint b = rbase + blk * 74u;
+    float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+    uint sc = uint(w[b + 66u + ib32]);
+    float dl = d * (0.5 + float((l < 2u) ? (sc & 0xFu) : (sc >> 4))) * 0.25;
+    uint qo = b + 2u + 2u * (4u * ib32 + l);
+    uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
+    uint gidx = q & 511u;
+    uint glo = tbl[2u * gidx];
+    uint ghi = tbl[2u * gidx + 1u];
+    uint signs = tbl[1792u + (q >> 9)];
+    float s = 0.0;
+    s += float(glo & 0xFFu) * (((signs & 1u) != 0u) ? -1.0 : 1.0) * x0;
+    s += float((glo >> 8u) & 0xFFu) * (((signs & 2u) != 0u) ? -1.0 : 1.0) * x1;
+    s += float((glo >> 16u) & 0xFFu) * (((signs & 4u) != 0u) ? -1.0 : 1.0) * x2;
+    s += float((glo >> 24u) & 0xFFu) * (((signs & 8u) != 0u) ? -1.0 : 1.0) * x3;
+    s += float(ghi & 0xFFu) * (((signs & 16u) != 0u) ? -1.0 : 1.0) * x4;
+    s += float((ghi >> 8u) & 0xFFu) * (((signs & 32u) != 0u) ? -1.0 : 1.0) * x5;
+    s += float((ghi >> 16u) & 0xFFu) * (((signs & 64u) != 0u) ? -1.0 : 1.0) * x6;
+    s += float((ghi >> 24u) & 0xFFu) * (((signs & 128u) != 0u) ? -1.0 : 1.0) * x7;
+    return dl * s;
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
-    uint row = gl_WorkGroupID.x * 4u + ly;
-    float acc = 0.0;
-    if (row < pc.m) {
-        uint rbase = pc.w_off + row * pc.row_bytes;
+    uint row0 = (gl_WorkGroupID.x * 4u + ly) * 4u;
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    uint rb0 = pc.w_off + row0 * pc.row_bytes;
+    uint rb1 = rb0 + pc.row_bytes;
+    uint rb2 = rb1 + pc.row_bytes;
+    uint rb3 = rb2 + pc.row_bytes;
+    bool v0 = row0 < pc.m;
+    bool v1 = (row0 + 1u) < pc.m;
+    bool v2 = (row0 + 2u) < pc.m;
+    bool v3 = (row0 + 3u) < pc.m;
+    if (v0) {
         uint nsub = pc.k / 32u;
         for (uint sb = tid; sb < nsub; sb += 32u) {
             uint blk = sb >> 3;
             uint ib32 = sb & 7u;
-            uint b = rbase + blk * 74u;
-            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1u]) << 8)).x;
-            uint sc = uint(w[b + 66u + ib32]);
-            float db0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
-            float db1 = d * (0.5 + float(sc >> 4)) * 0.25;
-            uint xb = pc.x_off + sb * 32u;
             for (uint l = 0u; l < 4u; l++) {
-                uint qo = b + 2u + 2u * (4u * ib32 + l);
-                uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
-                uint gidx = q & 511u;
-                uint glo = tbl[2u * gidx];
-                uint ghi = tbl[2u * gidx + 1u];
-                uint signs = tbl[1792u + (q >> 9)];
-                float dl = (l < 2u) ? db0 : db1;
-                uint xo = xb + l * 8u;
-                float s = 0.0;
-                for (uint j = 0u; j < 4u; j++) {
-                    float v0 = float((glo >> (8u * j)) & 0xFFu);
-                    float v1 = float((ghi >> (8u * j)) & 0xFFu);
-                    s += v0 * (((signs & (1u << j)) != 0u) ? -1.0 : 1.0) * x[xo + j];
-                    s += v1 * (((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0) * x[xo + j + 4u];
-                }
-                acc += dl * s;
+                uint xo = pc.x_off + sb * 32u + l * 8u;
+                float x0 = x[xo], x1 = x[xo + 1u], x2 = x[xo + 2u], x3 = x[xo + 3u];
+                float x4 = x[xo + 4u], x5 = x[xo + 5u], x6 = x[xo + 6u], x7 = x[xo + 7u];
+                acc0 += dot8_iq2xs(rb0, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v1) acc1 += dot8_iq2xs(rb1, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v2) acc2 += dot8_iq2xs(rb2, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v3) acc3 += dot8_iq2xs(rb3, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
             }
         }
     }
-    float s_out = subgroupClusteredAdd(acc, 32u);
-    if (tid == 0u && row < pc.m) y[pc.y_off + row] = s_out;
+    vec4 r = subgroupClusteredAdd(vec4(acc0, acc1, acc2, acc3), 32u);
+    if (tid == 0u) {
+        if (v0) y[pc.y_off + row0] = r.x;
+        if (v1) y[pc.y_off + row0 + 1u] = r.y;
+        if (v2) y[pc.y_off + row0 + 2u] = r.z;
+        if (v3) y[pc.y_off + row0 + 3u] = r.w;
+    }
 }

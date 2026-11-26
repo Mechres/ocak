@@ -1,5 +1,6 @@
 //! Multi-protocol HTTP/SSE server: OpenAI, Anthropic `/v1/messages`, Embeddings, Audio/ASR,
 //! Prometheus `/metrics`, Admin SSE, embedded `/ui`, and RX 6700 XT WarmSleep watchdog.
+pub mod tools;
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -420,7 +421,7 @@ async fn list_models(State(st): State<Arc<AppState>>) -> Json<Value> {
 #[derive(Debug, Deserialize)]
 struct ChatReq {
     model: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<Value>,
     #[serde(default)]
     stream: bool,
     #[serde(default = "def_max_tok")]
@@ -435,6 +436,10 @@ struct ChatReq {
     stop: Vec<String>,
     reasoning_max_tokens: Option<usize>,
     response_format: Option<Value>,
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[allow(dead_code)]
+    tool_choice: Option<Value>,
 }
 
 fn def_max_tok() -> usize { 256 }
@@ -513,6 +518,9 @@ async fn chat_completions(
     let sampler = build_sampler(&st, &entry.id, &req);
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model_id = entry.id.clone();
+    let tool_defs = tools::extract_openai_tools(&req.tools);
+    let has_tools = !tool_defs.is_empty();
+    let chat_msgs = tools::openai_to_chat(&req.messages, &tool_defs);
 
     if req.stream {
         let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
@@ -521,7 +529,7 @@ async fn chat_completions(
             let mut guard = st_c.native.blocking_lock();
             let Some(active) = guard.as_mut() else { return };
             let fam = detect_family(active.engine.tokenizer.chat_template());
-            let prompt = render(fam, &req.messages, true, true);
+            let prompt = render(fam, &chat_msgs, true, true);
             let greq = GenRequest {
                 prompt,
                 parse_special: true,
@@ -535,7 +543,7 @@ async fn chat_completions(
             let model_c = model_id.clone();
             let tx_c = tx.clone();
             let res = active.engine.generate(&greq, |_tok, piece| {
-                if piece.is_empty() { return true; }
+                if piece.is_empty() || has_tools { return true; }
                 let chunk = json!({
                     "id": id_c,
                     "object": "chat.completion.chunk",
@@ -547,11 +555,44 @@ async fn chat_completions(
             if let Ok(gr) = res {
                 st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
                 st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+                let mut finish_reason = json!(gr.finish_reason);
+                if has_tools {
+                    let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
+                    if !clean.is_empty() {
+                        let c = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "content": clean }, "finish_reason": null }]
+                        });
+                        let _ = tx.blocking_send(Ok(Event::default().data(c.to_string())));
+                    }
+                    if !calls.is_empty() {
+                        let tc_json: Vec<Value> = calls
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, tc)| json!({
+                                "index": idx,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": { "name": tc.name, "arguments": tc.arguments.to_string() }
+                            }))
+                            .collect();
+                        let tc_chunk = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "tool_calls": tc_json }, "finish_reason": null }]
+                        });
+                        let _ = tx.blocking_send(Ok(Event::default().data(tc_chunk.to_string())));
+                        finish_reason = json!("tool_calls");
+                    }
+                }
                 let done_chunk = json!({
                     "id": id,
                     "object": "chat.completion.chunk",
                     "model": model_id,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": gr.finish_reason }],
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                     "timings": gr.timings
                 });
                 let _ = tx.blocking_send(Ok(Event::default().data(done_chunk.to_string())));
@@ -565,7 +606,7 @@ async fn chat_completions(
     let mut guard = st.native.lock().await;
     let active = guard.as_mut().unwrap();
     let fam = detect_family(active.engine.tokenizer.chat_template());
-    let prompt = render(fam, &req.messages, true, true);
+    let prompt = render(fam, &chat_msgs, true, true);
     let greq = GenRequest {
         prompt,
         parse_special: true,
@@ -582,14 +623,33 @@ async fn chat_completions(
     st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
     st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
     st.governor.lock().await.touch(&model_id, Instant::now());
+    let (msg_obj, finish_reason) = if has_tools {
+        let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
+        if !calls.is_empty() {
+            let tc_json: Vec<Value> = calls
+                .iter()
+                .map(|tc| json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments.to_string() }
+                }))
+                .collect();
+            let content_val = if clean.is_empty() { Value::Null } else { json!(clean) };
+            (json!({ "role": "assistant", "content": content_val, "tool_calls": tc_json }), json!("tool_calls"))
+        } else {
+            (json!({ "role": "assistant", "content": gr.text }), json!(gr.finish_reason))
+        }
+    } else {
+        (json!({ "role": "assistant", "content": gr.text }), json!(gr.finish_reason))
+    };
     Json(json!({
         "id": id,
         "object": "chat.completion",
         "model": model_id,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": gr.text },
-            "finish_reason": gr.finish_reason
+            "message": msg_obj,
+            "finish_reason": finish_reason
         }],
         "usage": {
             "prompt_tokens": gr.timings.prompt_n,
@@ -678,7 +738,7 @@ async fn embeddings(State(st): State<Arc<AppState>>, Json(req): Json<EmbReq>) ->
     Json(json!({ "object": "list", "model": entry.id, "data": data })).into_response()
 }
 
-/// Anthropic Messages API (`/v1/messages`) with streaming SSE for Claude Code compatibility.
+/// Anthropic Messages API (`/v1/messages`) with streaming SSE + tool_use for Claude Code compatibility.
 #[derive(Debug, Deserialize)]
 struct AnthropicReq {
     model: String,
@@ -689,34 +749,15 @@ struct AnthropicReq {
     #[serde(default)]
     stream: bool,
     temperature: Option<f32>,
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[allow(dead_code)]
+    tool_choice: Option<Value>,
 }
 
 fn anthropic_to_chat(req: &AnthropicReq) -> Vec<ChatMessage> {
-    let mut out = Vec::new();
-    if let Some(sys) = &req.system {
-        let s = match sys {
-            Value::String(s) => s.clone(),
-            Value::Array(a) => a.iter().filter_map(|v| v.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"),
-            _ => String::new(),
-        };
-        if !s.is_empty() {
-            out.push(ChatMessage { role: "system".into(), content: s });
-        }
-    }
-    for m in &req.messages {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
-        let content = match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(|b| b.get("text").or_else(|| b.get("content")).and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        out.push(ChatMessage { role, content });
-    }
-    out
+    let tool_defs = tools::extract_anthropic_tools(&req.tools);
+    tools::anthropic_messages_to_chat(req.system.as_ref(), &req.messages, &tool_defs)
 }
 
 async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<AnthropicReq>) -> Response {
@@ -727,6 +768,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
     if let Err(e) = st.ensure_native(&entry).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "type": "error", "error": { "type": "api_error", "message": e } }))).into_response();
     }
+    let has_tools = !req.tools.is_empty();
     let chat_msgs = anthropic_to_chat(&req);
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
     let model_id = entry.id.clone();
@@ -740,8 +782,10 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                 "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_id, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
             });
             let _ = tx.blocking_send(Ok(Event::default().event("message_start").data(start.to_string())));
-            let blk = json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } });
-            let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+            if !has_tools {
+                let blk = json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } });
+                let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+            }
 
             let mut guard = st_c.native.blocking_lock();
             if let Some(active) = guard.as_mut() {
@@ -758,14 +802,50 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                 };
                 let tx_c = tx.clone();
                 if let Ok(gr) = active.engine.generate(&greq, |_, piece| {
-                    if piece.is_empty() { return true; }
+                    if piece.is_empty() || has_tools { return true; }
                     let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": piece } });
                     tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_ok()
                 }) {
                     st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
                     st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
-                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": 0 }).to_string())));
-                    let md = json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": gr.timings.predicted_n } });
+                    let mut stop_reason = "end_turn";
+                    if has_tools {
+                        let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
+                        let mut idx = 0usize;
+                        if !clean.is_empty() || calls.is_empty() {
+                            let blk = json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "text", "text": "" } });
+                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                            let txt = if calls.is_empty() { &gr.text } else { &clean };
+                            if !txt.is_empty() {
+                                let d = json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "text_delta", "text": txt } });
+                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                            }
+                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
+                            idx += 1;
+                        }
+                        if !calls.is_empty() {
+                            stop_reason = "tool_use";
+                            for tc in &calls {
+                                let blk = json!({
+                                    "type": "content_block_start",
+                                    "index": idx,
+                                    "content_block": { "type": "tool_use", "id": tc.id, "name": tc.name, "input": {} }
+                                });
+                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                let d = json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": { "type": "input_json_delta", "partial_json": tc.arguments.to_string() }
+                                });
+                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
+                                idx += 1;
+                            }
+                        }
+                    } else {
+                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": 0 }).to_string())));
+                    }
+                    let md = json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason }, "usage": { "output_tokens": gr.timings.predicted_n } });
                     let _ = tx.blocking_send(Ok(Event::default().event("message_delta").data(md.to_string())));
                     let _ = tx.blocking_send(Ok(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string())));
                 }
@@ -792,13 +872,30 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         Ok(gr) => {
             st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
             st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+            let (content, stop_reason) = if has_tools {
+                let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
+                if !calls.is_empty() {
+                    let mut blocks = Vec::new();
+                    if !clean.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": clean }));
+                    }
+                    for tc in &calls {
+                        blocks.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments }));
+                    }
+                    (blocks, "tool_use")
+                } else {
+                    (vec![json!({ "type": "text", "text": gr.text })], "end_turn")
+                }
+            } else {
+                (vec![json!({ "type": "text", "text": gr.text })], "end_turn")
+            };
             Json(json!({
                 "id": msg_id,
                 "type": "message",
                 "role": "assistant",
                 "model": model_id,
-                "content": [{ "type": "text", "text": gr.text }],
-                "stop_reason": "end_turn",
+                "content": content,
+                "stop_reason": stop_reason,
                 "usage": { "input_tokens": gr.timings.prompt_n, "output_tokens": gr.timings.predicted_n }
             }))
             .into_response()

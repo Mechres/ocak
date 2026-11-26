@@ -94,7 +94,7 @@ impl NativeEngine {
         let tokenizer = Tokenizer::from_gguf(&g).map_err(|e| EngineError::Gguf(e.to_string()))?;
         let max_ctx = opts.max_ctx.min(cfg.n_ctx_train.max(2048));
         let n_pages = opts.kv_pages.max((max_ctx + PAGE_TOKENS - 1) / PAGE_TOKENS + 16);
-        let kv_bytes = (cfg.n_kv_layers * n_pages * 2 * PAGE_TOKENS * cfg.kv_dim() * 4) as u64;
+        let kv_bytes = (cfg.n_kv_layers * n_pages * 2 * PAGE_TOKENS * cfg.kv_dim() * 2) as u64;
         let vram_bytes = g.file_len() + kv_bytes + 32 * 1024 * 1024;
         let exec: Box<dyn Executor> = if cfg.arch == "xing4_0" {
             let n_cpu_moe = if g.file_len() > 11 * (1u64 << 30) { 12 } else { 8 };

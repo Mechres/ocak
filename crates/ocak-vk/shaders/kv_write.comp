@@ -2,7 +2,7 @@
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer K { float k[]; };
 layout(set = 0, binding = 1) readonly buffer V { float v[]; };
-layout(set = 0, binding = 2) writeonly buffer KV { float kv[]; };
+layout(set = 0, binding = 2) writeonly buffer KV { uint kv[]; };
 layout(set = 0, binding = 3) readonly buffer PT { uint pt[]; };
 layout(push_constant) uniform PC {
     uint k_off;
@@ -14,11 +14,12 @@ layout(push_constant) uniform PC {
 } pc;
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.kv_dim) return;
+    uint half_dim = pc.kv_dim >> 1;
+    if (i >= half_dim) return;
     uint page = pt[pc.pt_off + (pc.pos >> 4)];
     uint slot = pc.pos & 15u;
-    uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * pc.kv_dim + i;
-    uint vo = pc.layer_kv_off + ((page * 2u + 1u) * 16u + slot) * pc.kv_dim + i;
-    kv[ko] = k[pc.k_off + i];
-    kv[vo] = v[pc.v_off + i];
+    uint ko = pc.layer_kv_off + ((page * 2u + 0u) * 16u + slot) * half_dim + i;
+    uint vo = pc.layer_kv_off + ((page * 2u + 1u) * 16u + slot) * half_dim + i;
+    kv[ko] = packHalf2x16(vec2(k[pc.k_off + 2u * i], k[pc.k_off + 2u * i + 1u]));
+    kv[vo] = packHalf2x16(vec2(v[pc.v_off + 2u * i], v[pc.v_off + 2u * i + 1u]));
 }

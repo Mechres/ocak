@@ -841,7 +841,10 @@ impl<'a> Recorder<'a> {
 
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
         let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k)];
-        let gx = (m + 3) / 4;
+        let gx = match ty {
+            WType::IQ2XS => (m + 15) / 16,
+            _ => (m + 3) / 4,
+        };
         let (pipe, needs_iq) = match ty {
             WType::F32 => (&self.ctx.pipelines.qmv_f32, false),
             WType::F16 => (&self.ctx.pipelines.qmv_f16, false),
@@ -1168,7 +1171,7 @@ impl<'a> Recorder<'a> {
 
     pub fn kv_write(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, pos: u32, kv_dim: u32) {
         let pc = [k_off as u32, v_off as u32, layer_kv_off as u32, pt_off as u32, pos, kv_dim];
-        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), (kv_dim + 255) / 256, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.kv_write, &[k.buf, v.buf, kv.buf, page_table.buf], bytemuck::cast_slice(&pc), ((kv_dim / 2) + 255) / 256, 1, 1);
     }
 
     pub fn attention(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32) {

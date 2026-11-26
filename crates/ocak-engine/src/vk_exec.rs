@@ -232,7 +232,8 @@ impl VkExec {
         let head_gate_buf = mk(PREFILL_BATCH * cfg.n_head)?;
         let output = if cfg.tied_output { None } else { Some(upload_weight(&ctx, &g, req_tensor(&g, "output.weight")?)?) };
 
-        let layer_stride = (n_pages * 2 * 16 * cfg.kv_dim()) as u64;
+        // FP16 packed KV cache: 2 f16s per u32 (half the VRAM & attention bandwidth!)
+        let layer_stride = (n_pages * 2 * 16 * (cfg.kv_dim() / 2)) as u64;
         let qd = cfg.n_head * cfg.head_dim;
         Ok(Self {
             kv: mk(layer_stride as usize * cfg.n_kv_layers)?,
