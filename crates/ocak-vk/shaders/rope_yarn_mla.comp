@@ -19,14 +19,18 @@ layout(push_constant) uniform PC {
 } pc;
 void main() {
     uint wg = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
     uint i = gl_LocalInvocationID.x;
+    uint pos = pc.pos + b;
     uint half_r = pc.n_rot >> 1;
     uint half_lat = pc.latent >> 1;
     uint half_hd = half_lat + half_r;
+    uint kvr_base = b * (pc.latent + pc.n_rot);
+    uint qf_tok = b * pc.nh * pc.key_dim;
     if (wg == pc.nh) {
-        uint dst_lat = pc.kv_layer_off + pc.pos * half_hd;
+        uint dst_lat = pc.kv_layer_off + pos * half_hd;
         for (uint j = i; j < half_lat; j += 32u) {
-            kvc[dst_lat + j] = packHalf2x16(vec2(kvr[2u * j], kvr[2u * j + 1u]));
+            kvc[dst_lat + j] = packHalf2x16(vec2(kvr[kvr_base + 2u * j], kvr[kvr_base + 2u * j + 1u]));
         }
     }
     if (wg <= pc.nh && i < half_r) {
@@ -38,24 +42,24 @@ void main() {
                 : clamp((float(i) - pc.low) / (pc.high - pc.low), 0.0, 1.0);
             freq = freq_inv * ((1.0 - ramp) + ramp / pc.factor);
         }
-        float ang = float(pc.pos) * freq;
+        float ang = float(pos) * freq;
         float sc = cos(ang) * pc.mscale;
         float ss = sin(ang) * pc.mscale;
         if (wg < pc.nh) {
-            uint base = wg * pc.key_dim + pc.nope;
+            uint base = qf_tok + wg * pc.key_dim + pc.nope;
             float x0 = qf[base + 2u * i];
             float x1 = qf[base + 2u * i + 1u];
             qf[base + 2u * i] = x0 * sc - x1 * ss;
             qf[base + 2u * i + 1u] = x0 * ss + x1 * sc;
         } else {
-            uint base = pc.latent;
+            uint base = kvr_base + pc.latent;
             float x0 = kvr[base + 2u * i];
             float x1 = kvr[base + 2u * i + 1u];
             float y0 = x0 * sc - x1 * ss;
             float y1 = x0 * ss + x1 * sc;
             kvr[base + 2u * i] = y0;
             kvr[base + 2u * i + 1u] = y1;
-            uint dst = pc.kv_layer_off + pc.pos * half_hd + half_lat;
+            uint dst = pc.kv_layer_off + pos * half_hd + half_lat;
             kvc[dst + i] = packHalf2x16(vec2(y0, y1));
         }
     }

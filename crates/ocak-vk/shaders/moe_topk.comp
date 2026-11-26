@@ -12,11 +12,14 @@ layout(push_constant) uniform PC {
     float scale;
 } pc;
 void main() {
+    uint b = gl_WorkGroupID.y;
+    uint lg_off = b * pc.n_exp;
+    uint out_off = b * pc.n_used;
     float probs[128];
     float biased[128];
     uint used_mask[128];
     for (uint e = 0u; e < pc.n_exp; e++) {
-        float p = 1.0 / (1.0 + exp(-logits[e]));
+        float p = 1.0 / (1.0 + exp(-logits[lg_off + e]));
         probs[e] = p;
         biased[e] = p + ((pc.has_bias != 0u) ? bias[e] : 0.0);
         used_mask[e] = 0u;
@@ -32,12 +35,12 @@ void main() {
             }
         }
         used_mask[best] = 1u;
-        ids[k] = best;
-        weights[k] = probs[best];
+        ids[out_off + k] = best;
+        weights[out_off + k] = probs[best];
         wsum += probs[best];
     }
     float mult = (pc.norm_w != 0u) ? (pc.scale / (wsum + 1e-20)) : pc.scale;
     for (uint k = 0u; k < pc.n_used; k++) {
-        weights[k] *= mult;
+        weights[out_off + k] *= mult;
     }
 }

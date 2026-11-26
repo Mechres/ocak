@@ -178,6 +178,7 @@ struct Pipelines {
     qmm_f32: PipelineBundle,
     qmm_iq2_s: PipelineBundle,
     qmm_iq2_xs: PipelineBundle,
+    qmm_iq3_xxs: PipelineBundle,
     qmm_iq3_s: PipelineBundle,
     qmm2_iq2_xs: PipelineBundle,
     qmm2_q4_k: PipelineBundle,
@@ -202,7 +203,7 @@ impl Pipelines {
             &self.add_scaled_id, &self.add_scaled_exp_id,
             &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
             &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
-            &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_s,
+            &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_xxs, &self.qmm_iq3_s,
             &self.qmm2_iq2_xs, &self.qmm2_q4_k, &self.qmm2_q5_k, &self.qmm2_iq3_s,
             &self.argmax,
         ] {
@@ -465,6 +466,7 @@ impl VkContext {
                 qmm_f32: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f32.spv")), 3, 28)?,
                 qmm_iq2_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_s.spv")), 4, 28)?,
                 qmm_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), 4, 28)?,
+                qmm_iq3_xxs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_xxs.spv")), 4, 28)?,
                 qmm_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), 4, 28)?,
                 qmm2_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq2_xs.spv")), 4, 28)?,
                 qmm2_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
@@ -1031,6 +1033,7 @@ impl<'a> Recorder<'a> {
             WType::F32 => self.dispatch_raw(&self.ctx.pipelines.qmm_f32, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::IQ2S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             WType::IQ2XS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
+            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_xxs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
             _ => {
                 for b in 0..batch {
@@ -1143,15 +1146,24 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn hc_sinkhorn(&mut self, mixes: &Buffer, params: &Buffer, out_hc: &Buffer, iters: u32, hc_eps: f32) {
+        self.hc_sinkhorn_batch(mixes, params, out_hc, iters, hc_eps, 1);
+    }
+
+    pub fn hc_sinkhorn_batch(&mut self, mixes: &Buffer, params: &Buffer, out_hc: &Buffer, iters: u32, hc_eps: f32, batch: u32) {
         let pc = [iters, hc_eps.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.hc_sinkhorn, &[mixes.buf, params.buf, out_hc.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.hc_sinkhorn, &[mixes.buf, params.buf, out_hc.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
     pub fn hc_mix(&mut self, streams: &Buffer, blk: &Buffer, hc: &Buffer, out: &Buffer, ne: u32, mode: u32) {
-        let pc = [ne, mode];
-        self.dispatch_raw(&self.ctx.pipelines.hc_mix, &[streams.buf, blk.buf, hc.buf, out.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, 1, 1);
+        self.hc_mix_batch(streams, blk, hc, out, ne, mode, 1);
     }
 
+    pub fn hc_mix_batch(&mut self, streams: &Buffer, blk: &Buffer, hc: &Buffer, out: &Buffer, ne: u32, mode: u32, batch: u32) {
+        let pc = [ne, mode];
+        self.dispatch_raw(&self.ctx.pipelines.hc_mix, &[streams.buf, blk.buf, hc.buf, out.buf], bytemuck::cast_slice(&pc), (ne + 255) / 256, batch, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn rope_yarn_mla(
         &mut self,
         q_full: &Buffer,
@@ -1170,13 +1182,37 @@ impl<'a> Recorder<'a> {
         high: f32,
         mscale: f32,
     ) {
+        self.rope_yarn_mla_batch(q_full, kv_raw, kv_cache, nh, key_dim, nope, n_rot, latent, pos, kv_layer_off, rope_base, factor, low, high, mscale, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_yarn_mla_batch(
+        &mut self,
+        q_full: &Buffer,
+        kv_raw: &Buffer,
+        kv_cache: &Buffer,
+        nh: u32,
+        key_dim: u32,
+        nope: u32,
+        n_rot: u32,
+        latent: u32,
+        pos: u32,
+        kv_layer_off: u32,
+        rope_base: f32,
+        factor: f32,
+        low: f32,
+        high: f32,
+        mscale: f32,
+        batch: u32,
+    ) {
         let pc = [
             nh, key_dim, nope, n_rot, latent, pos, kv_layer_off,
             rope_base.to_bits(), factor.to_bits(), low.to_bits(), high.to_bits(), mscale.to_bits(),
         ];
-        self.dispatch_raw(&self.ctx.pipelines.rope_yarn_mla, &[q_full.buf, kv_raw.buf, kv_cache.buf], bytemuck::cast_slice(&pc), nh + 1, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.rope_yarn_mla, &[q_full.buf, kv_raw.buf, kv_cache.buf], bytemuck::cast_slice(&pc), nh + 1, batch, 1);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mla_attn(
         &mut self,
         q_lat: &Buffer,
@@ -1192,13 +1228,39 @@ impl<'a> Recorder<'a> {
         kv_layer_off: u32,
         kq_scale: f32,
     ) {
-        let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh, 1, 1);
+        self.mla_attn_batch(q_lat, q_full, kv_cache, out, nh, key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale, 1);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attn_batch(
+        &mut self,
+        q_lat: &Buffer,
+        q_full: &Buffer,
+        kv_cache: &Buffer,
+        out: &Buffer,
+        nh: u32,
+        key_dim: u32,
+        nope: u32,
+        n_rot: u32,
+        latent: u32,
+        pos: u32,
+        kv_layer_off: u32,
+        kq_scale: f32,
+        batch: u32,
+    ) {
+        let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh, batch, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_topk(&mut self, logits: &Buffer, bias: &Buffer, ids: &Buffer, weights: &Buffer, n_exp: u32, n_used: u32, has_bias: bool, norm_w: bool, scale: f32) {
+        self.moe_topk_batch(logits, bias, ids, weights, n_exp, n_used, has_bias, norm_w, scale, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_topk_batch(&mut self, logits: &Buffer, bias: &Buffer, ids: &Buffer, weights: &Buffer, n_exp: u32, n_used: u32, has_bias: bool, norm_w: bool, scale: f32, batch: u32) {
         let pc = [n_exp, n_used, has_bias as u32, norm_w as u32, scale.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.moe_topk, &[logits.buf, bias.buf, ids.buf, weights.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.moe_topk, &[logits.buf, bias.buf, ids.buf, weights.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
     pub fn qmv_id(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot: u32, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
@@ -1720,7 +1782,7 @@ mod tests {
         let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
         let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
 
-        for wt in [WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::IQ2S, WType::IQ2XS, WType::IQ3S] {
+        for wt in [WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::IQ2S, WType::IQ2XS, WType::IQ3S, WType::IQ3XXS] {
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = if wt == WType::F32 {
                 let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();

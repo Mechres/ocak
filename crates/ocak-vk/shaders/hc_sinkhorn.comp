@@ -5,18 +5,20 @@ layout(set = 0, binding = 1) readonly buffer Params { float params[]; }; // [sca
 layout(set = 0, binding = 2) writeonly buffer Out { float out_hc[]; };    // [pre(4), post(4), comb(16)]
 layout(push_constant) uniform PC { uint iters; float hc_eps; } pc;
 void main() {
+    uint b = gl_WorkGroupID.y;
+    uint mb = b * 24u;
     float s0 = params[0];
     float s1 = params[1];
     float s2 = params[2];
     for (uint h = 0u; h < 4u; h++) {
-        out_hc[h] = 1.0 / (1.0 + exp(-(mixes[h] * s0 + params[3u + h])));
-        out_hc[4u + h] = 2.0 / (1.0 + exp(-(mixes[4u + h] * s1 + params[3u + 4u + h])));
+        out_hc[mb + h] = 1.0 / (1.0 + exp(-(mixes[mb + h] * s0 + params[3u + h])));
+        out_hc[mb + 4u + h] = 2.0 / (1.0 + exp(-(mixes[mb + 4u + h] * s1 + params[3u + 4u + h])));
     }
     float c[16]; // c[s * 4 + d]
     for (uint k = 0u; k < 16u; k++) {
         uint s = k & 3u;
         uint d = k >> 2;
-        c[s * 4u + d] = clamp(mixes[8u + k] * s2 + params[3u + 8u + k], -30.0, 30.0);
+        c[s * 4u + d] = clamp(mixes[mb + 8u + k] * s2 + params[3u + 8u + k], -30.0, 30.0);
     }
     for (uint d = 0u; d < 4u; d++) {
         float peak = -1e30;
@@ -42,5 +44,5 @@ void main() {
             for (uint d = 0u; d < 4u; d++) c[s * 4u + d] /= sum;
         }
     }
-    for (uint i = 0u; i < 16u; i++) out_hc[8u + i] = c[i];
+    for (uint i = 0u; i < 16u; i++) out_hc[mb + 8u + i] = c[i];
 }

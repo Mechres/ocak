@@ -7,29 +7,33 @@ layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
 layout(push_constant) uniform PC { uint ne; uint mode; } pc;
 void main() {
     uint e = gl_GlobalInvocationID.x;
+    uint b = gl_WorkGroupID.y;
     if (e >= pc.ne) return;
+    uint sb = b * 4u * pc.ne;
+    uint bb = b * pc.ne;
+    uint hb = b * 24u;
     if (pc.mode == 0u) {
-        // hc_pre mix_in: o[e] = sum_h pre[h] * st[h*ne + e]
+        // hc_pre mix_in: o[bb + e] = sum_h pre[h] * st[sb + h*ne + e]
         float acc = 0.0;
-        for (uint h = 0u; h < 4u; h++) acc += hc[h] * st[h * pc.ne + e];
-        o[e] = acc;
+        for (uint h = 0u; h < 4u; h++) acc += hc[hb + h] * st[sb + h * pc.ne + e];
+        o[bb + e] = acc;
     } else if (pc.mode == 1u) {
-        // hc_post: o[d*ne + e] = post[d] * blk[e] + sum_s comb[s*4 + d] * st[s*ne + e]
-        float bv = blk[e];
-        float s0 = st[e];
-        float s1 = st[pc.ne + e];
-        float s2 = st[2u * pc.ne + e];
-        float s3 = st[3u * pc.ne + e];
+        // hc_post: o[sb + d*ne + e] = post[d] * blk[bb + e] + sum_s comb[s*4 + d] * st[sb + s*ne + e]
+        float bv = blk[bb + e];
+        float s0 = st[sb + e];
+        float s1 = st[sb + pc.ne + e];
+        float s2 = st[sb + 2u * pc.ne + e];
+        float s3 = st[sb + 3u * pc.ne + e];
         for (uint d = 0u; d < 4u; d++) {
-            float v = hc[4u + d] * bv
-                + hc[8u + d] * s0
-                + hc[8u + 4u + d] * s1
-                + hc[8u + 8u + d] * s2
-                + hc[8u + 12u + d] * s3;
-            o[d * pc.ne + e] = v;
+            float v = hc[hb + 4u + d] * bv
+                + hc[hb + 8u + d] * s0
+                + hc[hb + 8u + 4u + d] * s1
+                + hc[hb + 8u + 8u + d] * s2
+                + hc[hb + 8u + 12u + d] * s3;
+            o[sb + d * pc.ne + e] = v;
         }
     } else {
         // final mean across 4 streams (mode == 2)
-        o[e] = 0.25 * (st[e] + st[pc.ne + e] + st[2u * pc.ne + e] + st[3u * pc.ne + e]);
+        o[bb + e] = 0.25 * (st[sb + e] + st[sb + pc.ne + e] + st[sb + 2u * pc.ne + e] + st[sb + 3u * pc.ne + e]);
     }
 }

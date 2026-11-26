@@ -18,13 +18,15 @@ shared float ssum[256];
 shared float w_shared[4096];
 void main() {
     uint h = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint nh = gl_NumWorkGroups.x;
     uint tid = gl_LocalInvocationID.x;
     uint half_lat = pc.latent >> 1;
     uint half_rot = pc.n_rot >> 1;
     uint half_hd = half_lat + half_rot;
-    uint n_t = pc.pos + 1u;
-    uint ql_base = h * pc.latent;
-    uint qp_base = h * pc.key_dim + pc.nope;
+    uint n_t = pc.pos + b + 1u;
+    uint ql_base = (b * nh + h) * pc.latent;
+    uint qp_base = (b * nh + h) * pc.key_dim + pc.nope;
 
     float local_max = -1e30;
     for (uint t = tid; t < n_t; t += 256u) {
@@ -64,7 +66,7 @@ void main() {
     }
     float inv = 1.0 / ssum[0];
 
-    uint out_base = h * pc.latent;
+    uint out_base = (b * nh + h) * pc.latent;
     for (uint i = tid; i < half_lat; i += 256u) {
         vec2 acc = vec2(0.0);
         for (uint t = 0u; t < n_t; t++) {

@@ -11,6 +11,8 @@ use ocak_vk::{Buffer, VkContext, WType};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+const XING_PREFILL_BATCH: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct XingConfig {
     pub n_layer: usize,
@@ -471,9 +473,9 @@ impl XingExec {
                 let x = c.create_device_buffer((x_cap * 4) as u64).ok();
                 let y = c.create_device_buffer((cfg.n_vocab.max(cfg.n_ff_dense).max(cfg.n_head * (cfg.key_dim + cfg.kv_rank)) * 4) as u64).ok();
                 let ffn_cap = cfg.n_ff_dense.max((cfg.n_used + 1) * cfg.n_ff_exp);
-                let fg = c.create_device_buffer((ffn_cap * 4) as u64).ok();
-                let fu = c.create_device_buffer((ffn_cap * 4) as u64).ok();
-                let fa = c.create_device_buffer((ffn_cap * 4) as u64).ok();
+                let fg = c.create_device_buffer((XING_PREFILL_BATCH * ffn_cap * 4) as u64).ok();
+                let fu = c.create_device_buffer((XING_PREFILL_BATCH * ffn_cap * 4) as u64).ok();
+                let fa = c.create_device_buffer((XING_PREFILL_BATCH * ffn_cap * 4) as u64).ok();
                 let acc = c.create_device_buffer((cfg.n_embd * 4) as u64).ok();
                 let vo = try_upload_mat(c, &g, &output);
                 (x, y, fg, fu, fa, acc, vo)
@@ -523,17 +525,18 @@ impl XingExec {
                     }
                 }
                 let mk = |n: usize| c.create_device_buffer((n * 4) as u64).ok();
+                let pb = XING_PREFILL_BATCH;
                 let ones_v = vec![1.0f32; 4 * cfg.n_embd];
                 let zero_b = vec![0.0f32; cfg.n_expert];
                 if ok {
                     match (
-                        upload_f32_buf(c, &ones_v), mk(4 * cfg.n_embd), mk(4 * cfg.n_embd), mk(4 * cfg.n_embd),
-                        mk(24), mk(24), mk(cfg.n_embd), mk(cfg.n_embd), mk(cfg.n_embd),
-                        mk(cfg.q_rank), mk(cfg.q_rank), mk(hd),
-                        mk(cfg.n_head * cfg.key_dim), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.kv_rank), mk(cfg.n_head * cfg.value_dim),
+                        upload_f32_buf(c, &ones_v), mk(pb * 4 * cfg.n_embd), mk(pb * 4 * cfg.n_embd), mk(pb * 4 * cfg.n_embd),
+                        mk(pb * 24), mk(pb * 24), mk(pb * cfg.n_embd), mk(pb * cfg.n_embd), mk(pb * cfg.n_embd),
+                        mk(pb * cfg.q_rank), mk(pb * cfg.q_rank), mk(pb * hd),
+                        mk(pb * cfg.n_head * cfg.key_dim), mk(pb * cfg.n_head * cfg.kv_rank), mk(pb * cfg.n_head * cfg.kv_rank), mk(pb * cfg.n_head * cfg.value_dim),
                         mk(cfg.n_layer * max_ctx * (hd / 2)),
-                        mk(cfg.n_expert), mk(cfg.n_used), mk(cfg.n_used), upload_f32_buf(c, &zero_b),
-                        upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(cfg.n_used * cfg.n_embd),
+                        mk(pb * cfg.n_expert), mk(pb * cfg.n_used), mk(pb * cfg.n_used), upload_f32_buf(c, &zero_b),
+                        upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(pb * cfg.n_used * cfg.n_embd),
                     ) {
                         (
                             Some(ones), Some(streams_a), Some(streams_b), Some(streams_norm),
@@ -1275,6 +1278,274 @@ impl Executor for XingExec {
 
     fn logits(&self) -> &[f32] { &self.logits }
     fn hidden(&self) -> &[f32] { &self.hidden }
+
+    fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        if tokens.len() <= 1 {
+            if let Some(&tok) = tokens.first() {
+                return self.forward(tok, pos0, page_table, out);
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "vulkan")]
+        if self.gpu_pipe.is_some() && self.vk.is_some() && self.vk_output.is_some() {
+            if pos0 + tokens.len() > self.max_ctx {
+                return Err(EngineError::Context(format!(
+                    "pos {} >= max_ctx {}",
+                    pos0 + tokens.len() - 1,
+                    self.max_ctx
+                )));
+            }
+            let mut off = 0usize;
+            while off < tokens.len() {
+                let chunk = &tokens[off..(off + XING_PREFILL_BATCH).min(tokens.len())];
+                let is_last = off + chunk.len() == tokens.len();
+                self.forward_batch_gpu_chunk(
+                    chunk,
+                    pos0 + off,
+                    Out { logits: is_last && out.logits, hidden: is_last && out.hidden },
+                )?;
+                off += chunk.len();
+            }
+            return Ok(());
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            let is_last = i + 1 == tokens.len();
+            self.forward(tok, pos0 + i, page_table, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl XingExec {
+    fn forward_batch_gpu_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+        let c = self.cfg.clone();
+        let (ne, nh, latent, n_rot, nope, vdim) = (c.n_embd, c.n_head, c.kv_rank, c.n_rot, c.key_dim - c.n_rot, c.value_dim);
+        let hd = latent + n_rot;
+        let bs = chunk.len();
+        let batch = bs as u32;
+        let yarn = c.rope_factor > 1.0;
+        let raw_log_mul = if yarn {
+            if (c.yarn_log_mul - 0.1).abs() < 1e-4 { 0.1 } else { 0.1 * c.yarn_log_mul }
+        } else {
+            0.0
+        };
+        let mscale = if yarn { 1.0 + raw_log_mul * c.rope_factor.ln() } else { 1.0 };
+        let kq_scale = mscale * mscale / (c.key_dim as f32).sqrt();
+
+        let rb = self.embd.row_bytes();
+        let emb_raw = self.g.tensor_data(&self.embd);
+        let mut streams = vec![0f32; bs * 4 * ne];
+        let mut emb = vec![0f32; ne];
+        for (t, &tok) in chunk.iter().enumerate() {
+            let r = tok as usize;
+            dequantize_row(self.embd.ty, &emb_raw[r * rb..(r + 1) * rb], &mut emb, ne);
+            for h in 0..4 {
+                let dst = (t * 4 + h) * ne;
+                streams[dst..dst + ne].copy_from_slice(&emb);
+            }
+        }
+
+        let (Some(c_vk), Some(gp), Some(bg), Some(bu), Some(ba), Some(vout)) = (
+            &self.vk, &self.gpu_pipe, &self.vk_g, &self.vk_u, &self.vk_a, &self.vk_output,
+        ) else {
+            return Err(EngineError::Backend("xing gpu_pipe unavailable".into()));
+        };
+
+        c_vk.upload(&gp.streams_a, 0, bytemuck::cast_slice(&streams)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let corr_dim = |n_r: f32| -> f32 {
+            (n_rot as f32 * (c.rope_orig_ctx as f32 / (n_r * 2.0 * std::f32::consts::PI)).ln())
+                / (2.0 * c.rope_base.ln())
+        };
+        let low = corr_dim(c.yarn_beta_fast).floor().max(0.0);
+        let high = corr_dim(c.yarn_beta_slow).ceil().min((n_rot - 1) as f32);
+        let attn_factor = if yarn { 1.0 / (1.0 + 0.1 * c.rope_factor.ln()) } else { 1.0 };
+        let rope_mscale = if yarn { (1.0 + 0.1 * c.rope_factor.ln()) * attn_factor } else { 1.0 };
+
+        let mut rec = c_vk.begin();
+        rec.set_defer_barriers(true);
+        let mut cur_a = true;
+        for li in 0..c.n_layer {
+            let l = &self.layers[li];
+            let gl = &gp.layers[li];
+            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+
+            // 1. HC pre (attn)
+            for t in 0..bs {
+                let off = (t * 4 * ne) as u64;
+                rec.rms_norm(st_cur, off, &gp.ones, 0, &gp.streams_norm, off, (4 * ne) as u32, c.eps);
+            }
+            rec.barrier();
+            rec.qmm(gl.hc_attn_fn.ty, &gl.hc_attn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_attn_fn.k, gl.hc_attn_fn.m, batch);
+            rec.barrier();
+            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_attn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
+            rec.barrier();
+
+            // 2. MLA Attention (batched projections + causal batched attention)
+            for t in 0..bs {
+                let off = (t * ne) as u64;
+                rec.rms_norm(&gp.inp, off, &gl.attn_norm, 0, &gp.normed, off, ne as u32, c.eps);
+            }
+            rec.barrier();
+            let va = l.vk_wq_a.as_ref().unwrap();
+            let vkva = l.vk_wkv_a.as_ref().unwrap();
+            let vqb = l.vk_wq_b.as_ref().unwrap();
+            let vkb = l.vk_wk_b.as_ref().unwrap();
+            let vvb = l.vk_wv_b.as_ref().unwrap();
+            let vwo = l.vk_wo.as_ref().unwrap();
+            rec.qmm(va.ty, &va.buf, 0, &gp.normed, 0, &gp.q_a, 0, va.k, va.m, batch);
+            rec.qmm(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m, batch);
+            rec.barrier();
+            for t in 0..bs {
+                rec.rms_norm(&gp.q_a, (t * c.q_rank) as u64, &gl.q_a_norm, 0, &gp.q_an, (t * c.q_rank) as u64, c.q_rank as u32, c.eps);
+                rec.rms_norm(&gp.kv_raw, (t * hd) as u64, &gl.kv_a_norm, 0, &gp.kv_raw, (t * hd) as u64, latent as u32, c.eps);
+            }
+            rec.barrier();
+            rec.qmm(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m, batch);
+            rec.barrier();
+            let kv_layer_off = (li * self.max_ctx * (hd / 2)) as u32;
+            rec.rope_yarn_mla_batch(
+                &gp.q_full, &gp.kv_raw, &gp.kv_cache,
+                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                pos0 as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale, batch,
+            );
+            rec.barrier();
+            for t in 0..bs {
+                for h in 0..nh {
+                    rec.qmv(
+                        vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes,
+                        &gp.q_full, ((t * nh + h) * c.key_dim) as u64,
+                        &gp.q_lat, ((t * nh + h) * latent) as u64,
+                        vkb.k, vkb.m,
+                    );
+                }
+            }
+            rec.barrier();
+            rec.mla_attn_batch(
+                &gp.q_lat, &gp.q_full, &gp.kv_cache, &gp.attn_lat,
+                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                pos0 as u32, kv_layer_off, kq_scale, batch,
+            );
+            rec.barrier();
+            for t in 0..bs {
+                for h in 0..nh {
+                    rec.qmv(
+                        vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes,
+                        &gp.attn_lat, ((t * nh + h) * latent) as u64,
+                        &gp.val_all, ((t * nh + h) * vdim) as u64,
+                        vvb.k, vvb.m,
+                    );
+                }
+            }
+            rec.barrier();
+            rec.qmm(vwo.ty, &vwo.buf, 0, &gp.val_all, 0, &gp.block_out, 0, vwo.k, vwo.m, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
+            rec.barrier();
+            cur_a = !cur_a;
+
+            // 3. HC pre (FFN)
+            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+            for t in 0..bs {
+                let off = (t * 4 * ne) as u64;
+                rec.rms_norm(st_cur, off, &gp.ones, 0, &gp.streams_norm, off, (4 * ne) as u32, c.eps);
+            }
+            rec.barrier();
+            rec.qmm(gl.hc_ffn_fn.ty, &gl.hc_ffn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_ffn_fn.k, gl.hc_ffn_fn.m, batch);
+            rec.barrier();
+            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_ffn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
+            rec.barrier();
+            for t in 0..bs {
+                let off = (t * ne) as u64;
+                rec.rms_norm(&gp.inp, off, &gl.ffn_norm, 0, &gp.normed, off, ne as u32, c.eps);
+            }
+            rec.barrier();
+
+            // 4. Dense or MoE FFN
+            match &l.ffn {
+                XingFfn::Dense { vk_gate, vk_up, vk_down, .. } => {
+                    let (vg, vu, vd) = (vk_gate.as_ref().unwrap(), vk_up.as_ref().unwrap(), vk_down.as_ref().unwrap());
+                    rec.qmm(vg.ty, &vg.buf, 0, &gp.normed, 0, bg, 0, vg.k, vg.m, batch);
+                    rec.qmm(vu.ty, &vu.buf, 0, &gp.normed, 0, bu, 0, vu.k, vu.m, batch);
+                    rec.barrier();
+                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * c.n_ff_dense as u32);
+                    rec.barrier();
+                    rec.qmm(vd.ty, &vd.buf, 0, ba, 0, &gp.block_out, 0, vd.k, vd.m, batch);
+                    rec.barrier();
+                }
+                XingFfn::Moe { vk_gate_exps, vk_up_exps, vk_down_exps, vk_gate_sh, vk_up_sh, vk_down_sh, .. } => {
+                    let vgi = gl.gate_inp.as_ref().unwrap();
+                    let (vgs, vus, vds) = (vk_gate_sh.as_ref().unwrap(), vk_up_sh.as_ref().unwrap(), vk_down_sh.as_ref().unwrap());
+                    let sh_off = (bs * c.n_used * c.n_ff_exp) as u64;
+                    rec.qmm(vgi.ty, &vgi.buf, 0, &gp.normed, 0, &gp.router_logits, 0, vgi.k, vgi.m, batch);
+                    rec.qmm(vgs.ty, &vgs.buf, 0, &gp.normed, 0, bg, sh_off, vgs.k, vgs.m, batch);
+                    rec.qmm(vus.ty, &vus.buf, 0, &gp.normed, 0, bu, sh_off, vus.k, vus.m, batch);
+                    rec.barrier();
+                    let (bias_buf, has_bias) = match &gl.exp_probs_b {
+                        Some(b) => (b, true),
+                        None => (&gp.dummy_bias, false),
+                    };
+                    let n_used = c.n_used as u32;
+                    rec.moe_topk_batch(&gp.router_logits, bias_buf, &gp.top_ids, &gp.top_w, c.n_expert as u32, n_used, has_bias, c.exp_weights_norm, c.exp_weights_scale, batch);
+                    rec.swiglu(bg, sh_off, bu, sh_off, ba, sh_off, batch * c.n_ff_exp as u32);
+                    rec.barrier();
+                    let (vg, vu, vd) = (vk_gate_exps.as_ref().unwrap(), vk_up_exps.as_ref().unwrap(), vk_down_exps.as_ref().unwrap());
+                    // Shared down (batched qmm) + all B tokens' routed gate/up in parallel!
+                    rec.qmm(vds.ty, &vds.buf, 0, ba, sh_off, &gp.block_out, 0, vds.k, vds.m, batch);
+                    for t in 0..bs {
+                        let slot_base = (t * c.n_used) as u32;
+                        let y_off = (t * c.n_used * c.n_ff_exp) as u64;
+                        rec.qmv_id_batch(vg.ty, &vg.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bg, y_off, vg.k, vg.m, vg.slice_bytes);
+                        rec.qmv_id_batch(vu.ty, &vu.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bu, y_off, vu.k, vu.m, vu.slice_bytes);
+                    }
+                    rec.barrier();
+                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * n_used * c.n_ff_exp as u32);
+                    rec.barrier();
+                    for t in 0..bs {
+                        let slot_base = (t * c.n_used) as u32;
+                        let a_off = (t * c.n_used * c.n_ff_exp) as u64;
+                        let tmp_off = (t * c.n_used * ne) as u64;
+                        rec.qmv_id_batch(vd.ty, &vd.buf, &gp.top_ids, slot_base, n_used, ba, a_off, c.n_ff_exp as u32, &gp.moe_tmp, tmp_off, vd.k, vd.m, vd.slice_bytes);
+                    }
+                    rec.barrier();
+                    for t in 0..bs {
+                        let slot_base = (t * c.n_used) as u32;
+                        let tmp_off = (t * c.n_used * ne) as u64;
+                        rec.add_scaled_id_batch(&gp.block_out, (t * ne) as u64, &gp.moe_tmp, tmp_off, &gp.top_w, ne as u32, slot_base, n_used, false);
+                    }
+                    rec.barrier();
+                }
+            }
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
+            rec.barrier();
+            cur_a = !cur_a;
+        }
+
+        let st_final = if cur_a { &gp.streams_a } else { &gp.streams_b };
+        if out.logits || out.hidden {
+            rec.hc_mix_batch(st_final, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 2, batch);
+            rec.barrier();
+            let last_off = ((bs - 1) * ne) as u64;
+            rec.rms_norm(&gp.inp, last_off, &gp.out_norm, 0, &gp.hidden_buf, 0, ne as u32, c.eps);
+            rec.barrier();
+        }
+        if out.logits {
+            rec.qmv(vout.ty, &vout.buf, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, vout.k, vout.m);
+            rec.barrier();
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        if out.hidden {
+            c_vk.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        if out.logits {
+            c_vk.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

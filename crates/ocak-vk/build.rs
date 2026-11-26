@@ -73,6 +73,7 @@ fn main() {
         "qmm_f32",
         "qmm_iq2_s",
         "qmm_iq2_xs",
+        "qmm_iq3_xxs",
         "qmm_iq3_s",
         "qmm2_iq2_xs",
         "qmm2_q4_k",
