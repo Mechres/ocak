@@ -70,6 +70,12 @@ fn main() {
         "qmm_f16",
         "qmm_f32",
         "qmm_iq2_s",
+        "qmm_iq2_xs",
+        "qmm_iq3_s",
+        "qmm2_iq2_xs",
+        "qmm2_q4_k",
+        "qmm2_q5_k",
+        "qmm2_iq3_s",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

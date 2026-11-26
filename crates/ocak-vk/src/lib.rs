@@ -175,6 +175,12 @@ struct Pipelines {
     qmm_f16: PipelineBundle,
     qmm_f32: PipelineBundle,
     qmm_iq2_s: PipelineBundle,
+    qmm_iq2_xs: PipelineBundle,
+    qmm_iq3_s: PipelineBundle,
+    qmm2_iq2_xs: PipelineBundle,
+    qmm2_q4_k: PipelineBundle,
+    qmm2_q5_k: PipelineBundle,
+    qmm2_iq3_s: PipelineBundle,
 }
 
 impl Pipelines {
@@ -193,7 +199,8 @@ impl Pipelines {
             &self.add_scaled_id, &self.add_scaled_exp_id,
             &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
             &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
-            &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s,
+            &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_s,
+            &self.qmm2_iq2_xs, &self.qmm2_q4_k, &self.qmm2_q5_k, &self.qmm2_iq3_s,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -409,6 +416,12 @@ impl VkContext {
                 qmm_f16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f16.spv")), 3, 28)?,
                 qmm_f32: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f32.spv")), 3, 28)?,
                 qmm_iq2_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_s.spv")), 4, 28)?,
+                qmm_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), 4, 28)?,
+                qmm_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), 4, 28)?,
+                qmm2_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq2_xs.spv")), 4, 28)?,
+                qmm2_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
+                qmm2_q5_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), 3, 28)?,
+                qmm2_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), 4, 28)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -866,6 +879,31 @@ impl<'a> Recorder<'a> {
         }
         let pc = [w_off as u32, x_off as u32, y_off as u32, k, m, ty.row_bytes(k), batch];
         let gx = (m + 3) / 4;
+        if batch == 2 {
+            match ty {
+                WType::IQ2XS => {
+                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), (m + 15) / 16, 1, 1);
+                    return;
+                }
+                WType::Q4K => {
+                    self.dispatch_raw(&self.ctx.pipelines.qmm2_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+                    return;
+                }
+                WType::Q5K => {
+                    self.dispatch_raw(&self.ctx.pipelines.qmm2_q5_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+                    return;
+                }
+                WType::IQ3S => {
+                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
+                    return;
+                }
+                _ => {
+                    self.qmv(ty, w, w_off, x, x_off, y, y_off, k, m);
+                    self.qmv(ty, w, w_off, x, x_off + k as u64, y, y_off + m as u64, k, m);
+                    return;
+                }
+            }
+        }
         let gy = (batch + 7) / 8;
         match ty {
             WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
@@ -876,6 +914,8 @@ impl<'a> Recorder<'a> {
             WType::F16 => self.dispatch_raw(&self.ctx.pipelines.qmm_f16, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::F32 => self.dispatch_raw(&self.ctx.pipelines.qmm_f32, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             WType::IQ2S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
+            WType::IQ2XS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
+            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1),
             _ => {
                 for b in 0..batch {
                     self.qmv(ty, w, w_off, x, x_off + (b * k) as u64, y, y_off + (b * m) as u64, k, m);
@@ -897,6 +937,37 @@ impl<'a> Recorder<'a> {
     pub fn add_scaled(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32, scale: f32) {
         let pc = [a_off as u32, b_off as u32, n, scale.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.add_scaled, &[a.buf, b.buf], bytemuck::cast_slice(&pc), (n + 255) / 256, 1, 1);
+    }
+
+    pub fn copy_buf_bytes(&mut self, src: &Buffer, dst: &Buffer, bytes: u64) {
+        unsafe {
+            let pre = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(
+                self.exec.cmd_buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &pre,
+                &[],
+                &[],
+            );
+            let reg = [vk::BufferCopy::default().src_offset(0).dst_offset(0).size(bytes)];
+            self.ctx.device.cmd_copy_buffer(self.exec.cmd_buf, src.buf, dst.buf, &reg);
+            let post = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(
+                self.exec.cmd_buf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &post,
+                &[],
+                &[],
+            );
+        }
     }
 
     pub fn zero_buf(&mut self, dst: &Buffer) {
@@ -1521,7 +1592,7 @@ mod tests {
         let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
         let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
 
-        for wt in [WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::IQ2S] {
+        for wt in [WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::IQ2S, WType::IQ2XS, WType::IQ3S] {
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = if wt == WType::F32 {
                 let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
@@ -1548,6 +1619,21 @@ mod tests {
                     (y_qmm[i] - y_qmv[i]).abs() <= tol,
                     "qmm vs qmv mismatch for {wt:?} idx={i}: qmm={} qmv={}",
                     y_qmm[i],
+                    y_qmv[i]
+                );
+            }
+            // Also verify batch=2 (qmm2_* fast path)
+            let mut rec2 = c.begin();
+            rec2.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, 2);
+            rec2.finish_and_wait().unwrap();
+            let mut y_qmm2 = vec![0f32; 2 * m];
+            c.download(&by_qmm, 0, bytemuck::cast_slice_mut(&mut y_qmm2)).unwrap();
+            for i in 0..2 * m {
+                let tol = 1e-3 + 1e-4 * y_qmv[i].abs();
+                assert!(
+                    (y_qmm2[i] - y_qmv[i]).abs() <= tol,
+                    "qmm2 vs qmv mismatch for {wt:?} idx={i}: qmm2={} qmv={}",
+                    y_qmm2[i],
                     y_qmv[i]
                 );
             }

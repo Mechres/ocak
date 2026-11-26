@@ -110,7 +110,11 @@ impl NativeEngine {
             BackendKind::CpuAvx2 => Box::new(CpuExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
         } };
         let backend_name = exec.name();
-        let mtp = crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten();
+        let mut mtp = crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten();
+        #[cfg(feature = "vulkan")]
+        if let (Some(m), Some((ctx, hb, hty, hk, hm))) = (mtp.as_mut(), exec.mtp_gpu_shared()) {
+            let _ = m.attach_gpu(ctx, hb, hty, hk, hm);
+        }
         Ok(Self {
             cfg,
             tokenizer,
@@ -238,7 +242,8 @@ impl NativeEngine {
         let use_mtp = self.mtp.is_some()
             && !req.json_mode
             && req.thinking.is_none()
-            && std::env::var("OCAK_MTP_VERIFY").is_ok();
+            && (req.sampler.temperature <= 0.0 || std::env::var("OCAK_MTP_VERIFY").is_ok())
+            && std::env::var("OCAK_DISABLE_MTP").is_err();
         if let Some(m) = &mut self.mtp {
             m.reset();
         }
@@ -285,9 +290,15 @@ impl NativeEngine {
         let mut hidden_buf = if use_mtp { self.exec.hidden().to_vec() } else { Vec::new() };
         let mut mtp_drafted = 0usize;
         let mut mtp_accepted = 0usize;
-        let mut pending_draft: Option<u32> = None;
-        for step in 0..req.max_tokens {
-            let next_tok = if let Some(forced) = think_gov.as_mut().and_then(|g| g.forced_next()) {
+        let mut mtp_pos = 0usize;
+        let mut forced_tok: Option<u32> = None;
+        let prof_mtp = std::env::var("OCAK_MTP_PROFILE").is_ok();
+        let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
+
+        while gen_tokens.len() < req.max_tokens && tokens.len() < self.max_ctx {
+            let next_tok = if let Some(ft) = forced_tok.take() {
+                ft
+            } else if let Some(forced) = think_gov.as_mut().and_then(|g| g.forced_next()) {
                 forced
             } else {
                 if let Some(jg) = &json_g {
@@ -295,12 +306,6 @@ impl NativeEngine {
                 }
                 sampler.sample(&mut logits_buf)
             };
-            if let Some(dt) = pending_draft.take() {
-                mtp_drafted += 1;
-                if dt == next_tok {
-                    mtp_accepted += 1;
-                }
-            }
 
             if self.tokenizer.is_eog(next_tok) {
                 finish = FinishReason::Stop;
@@ -321,7 +326,6 @@ impl NativeEngine {
             tokens.push(next_tok);
             full_text.push_str(&piece);
 
-            // Check stop strings
             if req.stop.iter().any(|s| !s.is_empty() && full_text.ends_with(s)) {
                 finish = FinishReason::Stop;
                 break;
@@ -330,23 +334,77 @@ impl NativeEngine {
                 finish = FinishReason::Cancelled;
                 break;
             }
-            if step + 1 == req.max_tokens || tokens.len() >= self.max_ctx {
+            if gen_tokens.len() >= req.max_tokens || tokens.len() >= self.max_ctx {
                 break;
             }
+
             let pos = tokens.len() - 1;
-            if use_mtp {
-                if let Some(m) = &mut self.mtp {
-                    if let Ok(dl) = m.draft_logits(&hidden_buf, next_tok, step) {
-                        let dt = dl
-                            .iter()
-                            .enumerate()
-                            .max_by(|a, b| a.1.total_cmp(b.1))
-                            .map(|(i, _)| i as u32)
-                            .unwrap_or(0);
-                        pending_draft = Some(dt);
+            // Real 2-token batched speculative MTP verify when greedy + MTP drafter available
+            if use_mtp && gen_tokens.len() + 1 < req.max_tokens && tokens.len() + 1 < self.max_ctx {
+                let t0 = Instant::now();
+                let draft_tok = self.mtp.as_mut().and_then(|m| {
+                    let dl = m.draft_logits(&hidden_buf, next_tok, mtp_pos).ok()?;
+                    mtp_pos += 1;
+                    dl.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u32)
+                });
+                ms_draft += t0.elapsed().as_secs_f64() * 1000.0;
+                if let Some(dt) = draft_tok {
+                    mtp_drafted += 1;
+                    ensure_page(&mut self.pager, &mut pages, pos + 1)?;
+                    let t2 = Instant::now();
+                    match self.exec.forward_verify2([next_tok, dt], pos, &pages) {
+                        Ok(Some(([mut l0, l1], [h0, h1]))) => {
+                            ms_v2 += t2.elapsed().as_secs_f64() * 1000.0;
+                            let v1 = sampler.sample(&mut l0);
+                            if v1 == dt {
+                                // ACCEPTED! Emit draft token immediately and carry forward (l1, h1)!
+                                mtp_accepted += 1;
+                                if self.tokenizer.is_eog(dt) {
+                                    finish = FinishReason::Stop;
+                                    break;
+                                }
+                                sampler.accept(dt);
+                                let b2 = self.tokenizer.token_bytes(dt);
+                                let p2 = detok.push(&b2);
+                                gen_tokens.push(dt);
+                                tokens.push(dt);
+                                full_text.push_str(&p2);
+                                if req.stop.iter().any(|s| !s.is_empty() && full_text.ends_with(s)) {
+                                    finish = FinishReason::Stop;
+                                    break;
+                                }
+                                if !on_chunk(dt, &p2) {
+                                    finish = FinishReason::Cancelled;
+                                    break;
+                                }
+                                logits_buf = l1;
+                                hidden_buf = h1;
+                                continue;
+                            } else {
+                                // REJECTED: restore exact post-next_tok recurrent state (zero re-forward!)
+                                let t3 = Instant::now();
+                                if let Err(e) = self.exec.restore_recurrent() {
+                                    self.pager.release(&pages);
+                                    return Err(e);
+                                }
+                                ms_rej += t3.elapsed().as_secs_f64() * 1000.0;
+                                forced_tok = Some(v1);
+                                hidden_buf = h0;
+                                continue;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.pager.release(&pages);
+                            return Err(e);
+                        }
                     }
                 }
             }
+
             ensure_page(&mut self.pager, &mut pages, pos)?;
             if let Err(e) = self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: use_mtp }) {
                 self.pager.release(&pages);
@@ -369,6 +427,12 @@ impl NativeEngine {
         self.pager.release(&pages);
 
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+        if prof_mtp {
+            let gpu_ok = self.mtp.as_ref().map(|m| m.has_gpu()).unwrap_or(false);
+            eprintln!(
+                "[mtp-profile] gpu={gpu_ok} drafted={mtp_drafted} accepted={mtp_accepted} draft={ms_draft:.1}ms v2={ms_v2:.1}ms rej={ms_rej:.1}ms total={dec_ms:.1}ms"
+            );
+        }
         let timings = Timings {
             prompt_n: prompt_len,
             cache_n,

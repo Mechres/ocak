@@ -7,7 +7,7 @@ use std::sync::Arc;
 const PREFILL_BATCH: usize = 16;
 
 struct WeightBuf {
-    buf: Buffer,
+    buf: Arc<Buffer>,
     ty: WType,
     k: u32,
     m: u32,
@@ -105,6 +105,9 @@ pub struct VkExec {
     act: Buffer,
     hidden_buf: Buffer,
     logits_buf: Buffer,
+    hidden_buf2: Buffer,
+    logits_buf2: Buffer,
+    rec_snaps: Option<Vec<(Buffer, Option<Buffer>)>>,
     logits: Vec<f32>,
     hidden: Vec<f32>,
 }
@@ -122,7 +125,7 @@ fn upload_weight(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Result<
     let raw = g.tensor_data(ti);
     let buf = ctx.create_device_buffer(raw.len() as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
     ctx.upload(&buf, 0, raw).map_err(|e| EngineError::Backend(e.to_string()))?;
-    Ok(WeightBuf { buf, ty, k: ti.n_cols() as u32, m: ti.n_rows() as u32 })
+    Ok(WeightBuf { buf: Arc::new(buf), ty, k: ti.n_cols() as u32, m: ti.n_rows() as u32 })
 }
 
 fn req_tensor<'a>(g: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, EngineError> {
@@ -258,6 +261,9 @@ impl VkExec {
             act: mk(PREFILL_BATCH * cfg.n_ff)?,
             hidden_buf: mk(cfg.n_embd)?,
             logits_buf: mk(cfg.n_vocab)?,
+            hidden_buf2: mk(2 * cfg.n_embd)?,
+            logits_buf2: mk(2 * cfg.n_vocab)?,
+            rec_snaps: None,
             logits: vec![0.0; cfg.n_vocab],
             hidden: vec![0.0; cfg.n_embd],
             layers,
@@ -318,6 +324,100 @@ impl Executor for VkExec {
             offset += chunk.len();
         }
         Ok(())
+    }
+
+    fn forward_verify2(
+        &mut self,
+        tokens: [u32; 2],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<([Vec<f32>; 2], [Vec<f32>; 2])>, EngineError> {
+        if page_table.len() > self.max_pages {
+            return Err(EngineError::Context("page table exceeds GPU capacity".into()));
+        }
+        self.ensure_rec_snaps()?;
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let c = &self.cfg;
+        let ne = c.n_embd as u32;
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        self.record_batch_layers(&mut rec, &tokens, pos0, true);
+        // Final norm + lm_head for BOTH tokens using a single 2-token qmm!
+        rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf2, 0, ne, c.eps);
+        rec.rms_norm(&self.x, ne as u64, &self.out_norm, 0, &self.hidden_buf2, ne as u64, ne, c.eps);
+        rec.barrier();
+        let w = self.output.as_ref().unwrap_or(&self.embd);
+        rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, 2);
+        rec.barrier();
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        let mut h_both = vec![0f32; 2 * c.n_embd];
+        let mut l_both = vec![0f32; 2 * c.n_vocab];
+        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_both)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.ctx.download(&self.logits_buf2, 0, bytemuck::cast_slice_mut(&mut l_both)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let h0 = h_both[..c.n_embd].to_vec();
+        let h1 = h_both[c.n_embd..].to_vec();
+        let l0 = l_both[..c.n_vocab].to_vec();
+        let l1 = l_both[c.n_vocab..].to_vec();
+        self.hidden.copy_from_slice(&h1);
+        self.logits.copy_from_slice(&l1);
+        Ok(Some(([l0, l1], [h0, h1])))
+    }
+
+    fn snapshot_recurrent(&mut self) -> Result<(), EngineError> {
+        self.ensure_rec_snaps()?;
+        let snaps = self.rec_snaps.as_ref().unwrap();
+        if snaps.is_empty() {
+            return Ok(());
+        }
+        let mut rec = self.ctx.begin();
+        let mut idx = 0usize;
+        for l in &self.layers {
+            match &l.mixer {
+                VkMixer::ShortConv { state, .. } => {
+                    rec.copy_buf_bytes(state, &snaps[idx].0, state.size());
+                    idx += 1;
+                }
+                VkMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                    rec.copy_buf_bytes(conv_state, &snaps[idx].0, conv_state.size());
+                    rec.copy_buf_bytes(ssm_state, snaps[idx].1.as_ref().unwrap(), ssm_state.size());
+                    idx += 1;
+                }
+                VkMixer::FullAttn { .. } => {}
+            }
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    fn restore_recurrent(&mut self) -> Result<(), EngineError> {
+        let Some(snaps) = self.rec_snaps.as_ref() else { return Ok(()); };
+        if snaps.is_empty() {
+            return Ok(());
+        }
+        let mut rec = self.ctx.begin();
+        let mut idx = 0usize;
+        for l in &self.layers {
+            match &l.mixer {
+                VkMixer::ShortConv { state, .. } => {
+                    rec.copy_buf_bytes(&snaps[idx].0, state, state.size());
+                    idx += 1;
+                }
+                VkMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                    rec.copy_buf_bytes(&snaps[idx].0, conv_state, conv_state.size());
+                    rec.copy_buf_bytes(snaps[idx].1.as_ref().unwrap(), ssm_state, ssm_state.size());
+                    idx += 1;
+                }
+                VkMixer::FullAttn { .. } => {}
+            }
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    fn mtp_gpu_shared(&self) -> Option<(Arc<VkContext>, Arc<Buffer>, WType, u32, u32)> {
+        let w = self.output.as_ref().unwrap_or(&self.embd);
+        Some((Arc::clone(&self.ctx), Arc::clone(&w.buf), w.ty, w.k, w.m))
     }
 
     fn forward_embd(&mut self, embd: &[f32], pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
@@ -465,14 +565,63 @@ impl VkExec {
         Ok(())
     }
 
+    fn ensure_rec_snaps(&mut self) -> Result<(), EngineError> {
+        if self.rec_snaps.is_none() {
+            let mut snaps = Vec::new();
+            for l in &self.layers {
+                match &l.mixer {
+                    VkMixer::ShortConv { state, .. } => {
+                        let b = self.ctx.create_device_buffer(state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        snaps.push((b, None));
+                    }
+                    VkMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                        let b1 = self.ctx.create_device_buffer(conv_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        let b2 = self.ctx.create_device_buffer(ssm_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        snaps.push((b1, Some(b2)));
+                    }
+                    VkMixer::FullAttn { .. } => {}
+                }
+            }
+            self.rec_snaps = Some(snaps);
+        }
+        Ok(())
+    }
+
     fn forward_batch_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+        let c = &self.cfg;
+        let ne = c.n_embd as u32;
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        self.record_batch_layers(&mut rec, chunk, pos0, false);
+
+        let last_off = ((chunk.len() - 1) * c.n_embd) as u64;
+        if out.logits || out.hidden {
+            rec.rms_norm(&self.x, last_off, &self.out_norm, 0, &self.hidden_buf, 0, ne, c.eps);
+            rec.barrier();
+        }
+        if out.logits {
+            let w = self.output.as_ref().unwrap_or(&self.embd);
+            rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
+            rec.barrier();
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+
+        if out.hidden {
+            self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        if out.logits {
+            self.ctx.download(&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn record_batch_layers(&self, rec: &mut ocak_vk::Recorder<'_>, chunk: &[u32], pos0: usize, snap_after_t0: bool) {
         let c = &self.cfg;
         let batch = chunk.len() as u32;
         let ne = c.n_embd as u32;
         let qd = (c.n_head * c.head_dim) as u32;
+        let mut rec_snap_idx = 0usize;
 
-        let mut rec = self.ctx.begin();
-        rec.set_defer_barriers(true);
         for (b, &tok) in chunk.iter().enumerate() {
             rec.embed(self.embd.ty, &self.embd.buf, tok, &self.x, (b * c.n_embd) as u64, ne);
         }
@@ -543,8 +692,25 @@ impl VkExec {
                 VkMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
                     rec.qmm(in_proj.ty, &in_proj.buf, 0, &self.xn, 0, &self.bcx, 0, in_proj.k, in_proj.m, batch);
                     rec.barrier();
-                    rec.shortconv_step_batch(&self.bcx, conv_w, state, &self.xn, ne, *l_cache, batch);
-                    rec.barrier();
+                    if snap_after_t0 && batch == 2 {
+                        let snaps = self.rec_snaps.as_ref().unwrap();
+                        rec.shortconv_step_batch(&self.bcx, conv_w, state, &self.xn, ne, *l_cache, 1);
+                        rec.barrier();
+                        rec.copy_buf_bytes(state, &snaps[rec_snap_idx].0, state.size());
+                        rec.copy(&self.xn, 0, &self.o, 0, ne);
+                        rec.copy(&self.bcx, (3 * ne) as u64, &self.bcx, 0, 3 * ne);
+                        rec.barrier();
+                        rec.shortconv_step_batch(&self.bcx, conv_w, state, &self.xn, ne, *l_cache, 1);
+                        rec.barrier();
+                        rec.copy(&self.xn, 0, &self.xn, ne as u64, ne);
+                        rec.barrier();
+                        rec.copy(&self.o, 0, &self.xn, 0, ne);
+                        rec.barrier();
+                    } else {
+                        rec.shortconv_step_batch(&self.bcx, conv_w, state, &self.xn, ne, *l_cache, batch);
+                        rec.barrier();
+                    }
+                    rec_snap_idx += 1;
                     rec.qmm(out_proj.ty, &out_proj.buf, 0, &self.xn, 0, &self.o, 0, out_proj.k, out_proj.m, batch);
                     rec.barrier();
                 }
@@ -557,12 +723,46 @@ impl VkExec {
                     rec.qmm(walpha.ty, &walpha.buf, 0, &self.xn, 0, &self.alpha_buf, 0, walpha.k, walpha.m, batch);
                     rec.qmm(wbeta.ty, &wbeta.buf, 0, &self.xn, 0, &self.beta_buf, 0, wbeta.k, wbeta.m, batch);
                     rec.barrier();
-                    rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch);
-                    rec.barrier();
-                    rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, batch);
-                    rec.barrier();
-                    rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, batch);
-                    rec.barrier();
+                    if snap_after_t0 && batch == 2 {
+                        let snaps = self.rec_snaps.as_ref().unwrap();
+                        let v_dim = *n_v_heads * *state_dim;
+                        // Token 0 -> snapshot exact post-t0 recurrent state!
+                        rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 1);
+                        rec.barrier();
+                        rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 1);
+                        rec.barrier();
+                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 1);
+                        rec.barrier();
+                        rec.copy_buf_bytes(conv_state, &snaps[rec_snap_idx].0, conv_state.size());
+                        rec.copy_buf_bytes(ssm_state, snaps[rec_snap_idx].1.as_ref().unwrap(), ssm_state.size());
+                        // Save token 0 dn_norm into dn_out[v_dim..] and shift token 1 inputs to offset 0
+                        rec.copy(&self.dn_norm, 0, &self.dn_out, v_dim as u64, v_dim);
+                        rec.copy(&self.qkv_raw, *conv_ch as u64, &self.qkv_raw, 0, *conv_ch);
+                        rec.copy(&self.alpha_buf, *n_v_heads as u64, &self.alpha_buf, 0, *n_v_heads);
+                        rec.copy(&self.beta_buf, *n_v_heads as u64, &self.beta_buf, 0, *n_v_heads);
+                        rec.copy(&self.z_buf, v_dim as u64, &self.z_buf, 0, v_dim);
+                        rec.barrier();
+                        // Token 1
+                        rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 1);
+                        rec.barrier();
+                        rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 1);
+                        rec.barrier();
+                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 1);
+                        rec.barrier();
+                        // Place token 1 at dn_norm[v_dim..] and restore token 0 at dn_norm[0..]
+                        rec.copy(&self.dn_norm, 0, &self.dn_norm, v_dim as u64, v_dim);
+                        rec.barrier();
+                        rec.copy(&self.dn_out, v_dim as u64, &self.dn_norm, 0, v_dim);
+                        rec.barrier();
+                    } else {
+                        rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch);
+                        rec.barrier();
+                        rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, batch);
+                        rec.barrier();
+                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, batch);
+                        rec.barrier();
+                    }
+                    rec_snap_idx += 1;
                     rec.qmm(wout.ty, &wout.buf, 0, &self.dn_norm, 0, &self.o, 0, wout.k, wout.m, batch);
                     rec.barrier();
                 }
@@ -595,25 +795,5 @@ impl VkExec {
             rec.add(&self.x, 0, &self.o, 0, batch * ne);
             rec.barrier();
         }
-
-        let last_off = ((chunk.len() - 1) * c.n_embd) as u64;
-        if out.logits || out.hidden {
-            rec.rms_norm(&self.x, last_off, &self.out_norm, 0, &self.hidden_buf, 0, ne, c.eps);
-            rec.barrier();
-        }
-        if out.logits {
-            let w = self.output.as_ref().unwrap_or(&self.embd);
-            rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
-            rec.barrier();
-        }
-        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
-
-        if out.hidden {
-            self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        }
-        if out.logits {
-            self.ctx.download(&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        }
-        Ok(())
     }
 }

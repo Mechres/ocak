@@ -1,0 +1,82 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+
+vec2 dot8_iq2xs(uint rbase, uint blk, uint ib32, uint l,
+                vec2 x0, vec2 x1, vec2 x2, vec2 x3, vec2 x4, vec2 x5, vec2 x6, vec2 x7) {
+    uint b = rbase + blk * 74u;
+    float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+    uint sc = uint(w[b + 66u + ib32]);
+    float dl = d * (0.5 + float((l < 2u) ? (sc & 0xFu) : (sc >> 4))) * 0.25;
+    uint qo = b + 2u + 2u * (4u * ib32 + l);
+    uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
+    uint gidx = q & 511u;
+    uint glo = tbl[2u * gidx];
+    uint ghi = tbl[2u * gidx + 1u];
+    uint signs = tbl[1792u + (q >> 9)];
+    vec2 s = vec2(0.0);
+    s += float(glo & 0xFFu) * (((signs & 1u) != 0u) ? -1.0 : 1.0) * x0;
+    s += float((glo >> 8u) & 0xFFu) * (((signs & 2u) != 0u) ? -1.0 : 1.0) * x1;
+    s += float((glo >> 16u) & 0xFFu) * (((signs & 4u) != 0u) ? -1.0 : 1.0) * x2;
+    s += float((glo >> 24u) & 0xFFu) * (((signs & 8u) != 0u) ? -1.0 : 1.0) * x3;
+    s += float(ghi & 0xFFu) * (((signs & 16u) != 0u) ? -1.0 : 1.0) * x4;
+    s += float((ghi >> 8u) & 0xFFu) * (((signs & 32u) != 0u) ? -1.0 : 1.0) * x5;
+    s += float((ghi >> 16u) & 0xFFu) * (((signs & 64u) != 0u) ? -1.0 : 1.0) * x6;
+    s += float((ghi >> 24u) & 0xFFu) * (((signs & 128u) != 0u) ? -1.0 : 1.0) * x7;
+    return dl * s;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row0 = (gl_WorkGroupID.x * 4u + ly) * 4u;
+    uint o0 = pc.x_off;
+    uint o1 = pc.x_off + pc.k;
+    vec2 acc0 = vec2(0.0), acc1 = vec2(0.0), acc2 = vec2(0.0), acc3 = vec2(0.0);
+    uint rb0 = pc.w_off + row0 * pc.row_bytes;
+    uint rb1 = rb0 + pc.row_bytes;
+    uint rb2 = rb1 + pc.row_bytes;
+    uint rb3 = rb2 + pc.row_bytes;
+    bool v0 = row0 < pc.m;
+    bool v1 = (row0 + 1u) < pc.m;
+    bool v2 = (row0 + 2u) < pc.m;
+    bool v3 = (row0 + 3u) < pc.m;
+    if (v0) {
+        uint nsub = pc.k / 32u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 3;
+            uint ib32 = sb & 7u;
+            for (uint l = 0u; l < 4u; l++) {
+                uint xr = sb * 32u + l * 8u;
+                vec2 x0 = vec2(x[o0 + xr],      x[o1 + xr]);
+                vec2 x1 = vec2(x[o0 + xr + 1u], x[o1 + xr + 1u]);
+                vec2 x2 = vec2(x[o0 + xr + 2u], x[o1 + xr + 2u]);
+                vec2 x3 = vec2(x[o0 + xr + 3u], x[o1 + xr + 3u]);
+                vec2 x4 = vec2(x[o0 + xr + 4u], x[o1 + xr + 4u]);
+                vec2 x5 = vec2(x[o0 + xr + 5u], x[o1 + xr + 5u]);
+                vec2 x6 = vec2(x[o0 + xr + 6u], x[o1 + xr + 6u]);
+                vec2 x7 = vec2(x[o0 + xr + 7u], x[o1 + xr + 7u]);
+                acc0 += dot8_iq2xs(rb0, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v1) acc1 += dot8_iq2xs(rb1, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v2) acc2 += dot8_iq2xs(rb2, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+                if (v3) acc3 += dot8_iq2xs(rb3, blk, ib32, l, x0, x1, x2, x3, x4, x5, x6, x7);
+            }
+        }
+    }
+    vec2 r0 = subgroupClusteredAdd(acc0, 32u);
+    vec2 r1 = subgroupClusteredAdd(acc1, 32u);
+    vec2 r2 = subgroupClusteredAdd(acc2, 32u);
+    vec2 r3 = subgroupClusteredAdd(acc3, 32u);
+    if (tid == 0u) {
+        if (v0) { y[pc.y_off + row0] = r0.x; y[pc.y_off + pc.m + row0] = r0.y; }
+        if (v1) { y[pc.y_off + row0 + 1u] = r1.x; y[pc.y_off + pc.m + row0 + 1u] = r1.y; }
+        if (v2) { y[pc.y_off + row0 + 2u] = r2.x; y[pc.y_off + pc.m + row0 + 2u] = r2.y; }
+        if (v3) { y[pc.y_off + row0 + 3u] = r3.x; y[pc.y_off + pc.m + row0 + 3u] = r3.y; }
+    }
+}

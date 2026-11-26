@@ -4,7 +4,61 @@ use crate::exec::EngineError;
 use ocak_cpu::{gemv, ops};
 use ocak_gguf::quant::dequantize_row;
 use ocak_gguf::{GgufFile, TensorInfo};
+#[cfg(feature = "vulkan")]
+use ocak_vk::{Buffer, VkContext, WType};
 use std::sync::Arc;
+
+#[cfg(feature = "vulkan")]
+struct MtpGpuMat {
+    buf: Buffer,
+    ty: WType,
+    k: u32,
+    m: u32,
+}
+
+#[cfg(feature = "vulkan")]
+struct MtpGpu {
+    ctx: Arc<VkContext>,
+    head_buf: Arc<Buffer>,
+    head_ty: WType,
+    head_k: u32,
+    head_m: u32,
+    eh_proj: MtpGpuMat,
+    wq: MtpGpuMat,
+    wk: MtpGpuMat,
+    wv: MtpGpuMat,
+    wo: MtpGpuMat,
+    ffn_gate: MtpGpuMat,
+    ffn_up: MtpGpuMat,
+    ffn_down: MtpGpuMat,
+    enorm: Buffer,
+    hnorm: Buffer,
+    attn_norm: Buffer,
+    post_attn_norm: Buffer,
+    q_norm: Buffer,
+    k_norm: Buffer,
+    head_norm: Buffer,
+    // Scratch & KV buffers
+    kv: Buffer,
+    pt_buf: Buffer,
+    tok_e: Buffer,
+    h_in: Buffer,
+    concat: Buffer,
+    x: Buffer,
+    xn: Buffer,
+    qg: Buffer,
+    q: Buffer,
+    q_gate: Buffer,
+    k: Buffer,
+    v: Buffer,
+    attn: Buffer,
+    o: Buffer,
+    gf: Buffer,
+    uf: Buffer,
+    af: Buffer,
+    h_out: Buffer,
+    logits: Buffer,
+}
 
 pub struct MtpDrafter {
     g: Arc<GgufFile>,
@@ -28,6 +82,8 @@ pub struct MtpDrafter {
     head_w: TensorInfo,
     kv: Vec<f32>,
     max_ctx: usize,
+    #[cfg(feature = "vulkan")]
+    gpu: Option<MtpGpu>,
 }
 
 fn req(g: &GgufFile, name: &str) -> Result<TensorInfo, EngineError> {
@@ -88,7 +144,99 @@ impl MtpDrafter {
             max_ctx,
             cfg,
             g,
+            #[cfg(feature = "vulkan")]
+            gpu: None,
         }))
+    }
+
+    /// Attaches a shared Vulkan context + `lm_head` weight so MTP drafting runs in 1 GPU submit (~3-5 ms).
+    #[cfg(feature = "vulkan")]
+    pub fn attach_gpu(
+        &mut self,
+        ctx: Arc<VkContext>,
+        head_buf: Arc<Buffer>,
+        head_ty: WType,
+        head_k: u32,
+        head_m: u32,
+    ) -> Result<(), EngineError> {
+        let up_mat = |ti: &TensorInfo| -> Result<MtpGpuMat, EngineError> {
+            let ty = WType::from_ggml(ti.ty).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let raw = self.g.tensor_data(ti);
+            let buf = if let Ok(b) = ctx.create_device_buffer(raw.len() as u64) {
+                ctx.upload(&b, 0, raw).map_err(|e| EngineError::Backend(e.to_string()))?;
+                b
+            } else {
+                ctx.create_gtt_buffer_from_slice(raw).map_err(|e| EngineError::Backend(e.to_string()))?
+            };
+            Ok(MtpGpuMat { buf, ty, k: ti.n_cols() as u32, m: ti.n_rows() as u32 })
+        };
+        let up_f32 = |v: &[f32]| -> Result<Buffer, EngineError> {
+            let bytes = bytemuck::cast_slice(v);
+            let b = ctx.create_device_buffer(bytes.len() as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
+            ctx.upload(&b, 0, bytes).map_err(|e| EngineError::Backend(e.to_string()))?;
+            Ok(b)
+        };
+        let mk = |elems: usize| -> Result<Buffer, EngineError> {
+            ctx.create_device_buffer((elems.max(4) * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))
+        };
+        let c = &self.cfg;
+        let qd = c.n_head * c.head_dim;
+        let kv_dim = c.n_head_kv * c.head_dim;
+        let n_pages = (self.max_ctx + 15) / 16 + 1;
+        let pt: Vec<u32> = (0..n_pages as u32).collect();
+        let pt_buf = ctx.create_device_buffer((pt.len() * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
+        ctx.upload(&pt_buf, 0, bytemuck::cast_slice(&pt)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let kv = mk(n_pages * 2 * 16 * kv_dim)?;
+
+        self.gpu = Some(MtpGpu {
+            eh_proj: up_mat(&self.eh_proj)?,
+            wq: up_mat(&self.wq)?,
+            wk: up_mat(&self.wk)?,
+            wv: up_mat(&self.wv)?,
+            wo: up_mat(&self.wo)?,
+            ffn_gate: up_mat(&self.ffn_gate)?,
+            ffn_up: up_mat(&self.ffn_up)?,
+            ffn_down: up_mat(&self.ffn_down)?,
+            enorm: up_f32(&self.enorm)?,
+            hnorm: up_f32(&self.hnorm)?,
+            attn_norm: up_f32(&self.attn_norm)?,
+            post_attn_norm: up_f32(&self.post_attn_norm)?,
+            q_norm: up_f32(&self.q_norm)?,
+            k_norm: up_f32(&self.k_norm)?,
+            head_norm: up_f32(&self.head_norm)?,
+            kv,
+            pt_buf,
+            tok_e: mk(c.n_embd)?,
+            h_in: mk(c.n_embd)?,
+            concat: mk(2 * c.n_embd)?,
+            x: mk(c.n_embd)?,
+            xn: mk(c.n_embd)?,
+            qg: mk(2 * qd)?,
+            q: mk(qd)?,
+            q_gate: mk(qd)?,
+            k: mk(kv_dim)?,
+            v: mk(kv_dim)?,
+            attn: mk(qd)?,
+            o: mk(c.n_embd)?,
+            gf: mk(c.n_ff)?,
+            uf: mk(c.n_ff)?,
+            af: mk(c.n_ff)?,
+            h_out: mk(c.n_embd)?,
+            logits: mk(c.n_vocab)?,
+            ctx,
+            head_buf,
+            head_ty,
+            head_k,
+            head_m,
+        });
+        Ok(())
+    }
+
+    pub fn has_gpu(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        { self.gpu.is_some() }
+        #[cfg(not(feature = "vulkan"))]
+        { false }
     }
 
     pub fn reset(&mut self) {
@@ -112,6 +260,61 @@ impl MtpDrafter {
         let rb = self.embd.row_bytes();
         let r = token as usize;
         dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
+
+        #[cfg(feature = "vulkan")]
+        if let Some(gp) = &self.gpu {
+            gp.ctx.upload(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h_main)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut rec = gp.ctx.begin();
+            rec.set_defer_barriers(true);
+            rec.rms_norm(&gp.tok_e, 0, &gp.enorm, 0, &gp.concat, 0, ne as u32, c.eps);
+            rec.rms_norm(&gp.h_in, 0, &gp.hnorm, 0, &gp.concat, ne as u64, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.eh_proj.ty, &gp.eh_proj.buf, 0, &gp.concat, 0, &gp.x, 0, gp.eh_proj.k, gp.eh_proj.m);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.attn_norm, 0, &gp.xn, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.wq.ty, &gp.wq.buf, 0, &gp.xn, 0, &gp.qg, 0, gp.wq.k, gp.wq.m);
+            rec.qmv(gp.wk.ty, &gp.wk.buf, 0, &gp.xn, 0, &gp.k, 0, gp.wk.k, gp.wk.m);
+            rec.qmv(gp.wv.ty, &gp.wv.buf, 0, &gp.xn, 0, &gp.v, 0, gp.wv.k, gp.wv.m);
+            rec.barrier();
+            rec.split_qg(&gp.qg, &gp.q, &gp.q_gate, nh as u32, hd as u32);
+            rec.barrier();
+            rec.rms_norm_heads(&gp.q, 0, &gp.q_norm, nh as u32, hd as u32, c.eps);
+            rec.rms_norm_heads(&gp.k, 0, &gp.k_norm, nkv as u32, hd as u32, c.eps);
+            rec.barrier();
+            rec.rope(&gp.q, 0, &gp.k, 0, nh as u32, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1);
+            rec.barrier();
+            rec.kv_write(&gp.k, 0, &gp.v, 0, &gp.kv, 0, &gp.pt_buf, 0, pos as u32, kv_dim as u32);
+            rec.barrier();
+            rec.attention_swa(&gp.q, 0, &gp.kv, 0, &gp.pt_buf, 0, &gp.attn, 0, nh as u32, nkv as u32, hd as u32, pos as u32, 0);
+            rec.barrier();
+            rec.mul_sigmoid(&gp.attn, &gp.q_gate, (nh * hd) as u32);
+            rec.barrier();
+            rec.qmv(gp.wo.ty, &gp.wo.buf, 0, &gp.attn, 0, &gp.o, 0, gp.wo.k, gp.wo.m);
+            rec.barrier();
+            rec.add(&gp.x, 0, &gp.o, 0, ne as u32);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.post_attn_norm, 0, &gp.xn, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.ffn_gate.ty, &gp.ffn_gate.buf, 0, &gp.xn, 0, &gp.gf, 0, gp.ffn_gate.k, gp.ffn_gate.m);
+            rec.qmv(gp.ffn_up.ty, &gp.ffn_up.buf, 0, &gp.xn, 0, &gp.uf, 0, gp.ffn_up.k, gp.ffn_up.m);
+            rec.barrier();
+            rec.swiglu(&gp.gf, 0, &gp.uf, 0, &gp.af, 0, c.n_ff as u32);
+            rec.barrier();
+            rec.qmv(gp.ffn_down.ty, &gp.ffn_down.buf, 0, &gp.af, 0, &gp.o, 0, gp.ffn_down.k, gp.ffn_down.m);
+            rec.barrier();
+            rec.add(&gp.x, 0, &gp.o, 0, ne as u32);
+            rec.barrier();
+            rec.rms_norm(&gp.x, 0, &gp.head_norm, 0, &gp.h_out, 0, ne as u32, c.eps);
+            rec.barrier();
+            rec.qmv(gp.head_ty, &gp.head_buf, 0, &gp.h_out, 0, &gp.logits, 0, gp.head_k, gp.head_m);
+            rec.barrier();
+            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut logits = vec![0f32; c.n_vocab];
+            gp.ctx.download(&gp.logits, 0, bytemuck::cast_slice_mut(&mut logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            return Ok(logits);
+        }
 
         let mut e_norm = vec![0f32; ne];
         let mut h_norm = vec![0f32; ne];

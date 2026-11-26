@@ -40,6 +40,29 @@ pub trait Executor: Send {
         }
         Ok(())
     }
+    /// Runs a 2-token speculative verify batch `[t0, t1]` at `pos0, pos0 + 1`, returning
+    /// `Some(([logits0, logits1], [hidden0, hidden1]))` when supported.
+    fn forward_verify2(
+        &mut self,
+        _tokens: [u32; 2],
+        _pos0: usize,
+        _page_table: &[u32],
+    ) -> Result<Option<([Vec<f32>; 2], [Vec<f32>; 2])>, EngineError> {
+        Ok(None)
+    }
+    /// Snapshots recurrent (DeltaNet / ShortConv) states for speculative rollback.
+    fn snapshot_recurrent(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+    /// Restores previously snapshotted recurrent states after a speculative rejection.
+    fn restore_recurrent(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+    /// Optional shared Vulkan context + lm_head weight for GPU-accelerated MTP drafting.
+    #[cfg(feature = "vulkan")]
+    fn mtp_gpu_shared(&self) -> Option<(std::sync::Arc<ocak_vk::VkContext>, std::sync::Arc<ocak_vk::Buffer>, ocak_vk::WType, u32, u32)> {
+        None
+    }
     /// Processes a precomputed input embedding vector (`[n_embd]`) at position `pos` (for multimodal audio/vision).
     fn forward_embd(&mut self, _embd: &[f32], _pos: usize, _page_table: &[u32], _out: Out) -> Result<(), EngineError> {
         Err(EngineError::Unsupported("forward_embd not implemented for this executor".into()))
