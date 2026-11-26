@@ -80,6 +80,7 @@ pub struct AppState {
     governor: Mutex<VramGovernor>,
     load_lock: Mutex<()>,
     native: Mutex<Option<ActiveNative>>,
+    asr: Mutex<Option<(String, ocak_engine::asr::Qwen3AsrEngine)>>,
     active_meta: std::sync::RwLock<Option<(String, ocak_tok::TemplateFamily, bool)>>,
     batcher: Arc<batch::BatchCoordinator>,
     bridges: Mutex<HashMap<String, LlamaBridgeHandle>>,
@@ -129,6 +130,7 @@ impl AppState {
             governor: Mutex::new(gov),
             load_lock: Mutex::new(()),
             native: Mutex::new(None),
+            asr: Mutex::new(None),
             active_meta: std::sync::RwLock::new(None),
             batcher: Arc::new(batch::BatchCoordinator::new()),
             bridges: Mutex::new(HashMap::new()),
@@ -174,6 +176,12 @@ impl AppState {
             }
         }
         {
+            let mut asr = self.asr.lock().await;
+            if asr.as_ref().map(|(aid, _)| aid.as_str()) == Some(id) {
+                *asr = None;
+            }
+        }
+        {
             let mut br = self.bridges.lock().await;
             if let Some(mut h) = br.remove(id) {
                 h.stop();
@@ -181,6 +189,56 @@ impl AppState {
         }
         let mut g = self.governor.lock().await;
         g.set_state(id, 0, ModelResidencyState::WarmSleep, Instant::now());
+    }
+
+    pub async fn ensure_asr(&self, entry: &CatalogEntry, mmproj: &std::path::Path) -> Result<(), String> {
+        {
+            let asr = self.asr.lock().await;
+            if asr.as_ref().map(|(aid, _)| aid.as_str()) == Some(entry.id.as_str()) {
+                self.governor.lock().await.touch(&entry.id, Instant::now());
+                return Ok(());
+            }
+        }
+        let _load_guard = self.load_lock.lock().await;
+        {
+            let asr = self.asr.lock().await;
+            if asr.as_ref().map(|(aid, _)| aid.as_str()) == Some(entry.id.as_str()) {
+                self.governor.lock().await.touch(&entry.id, Instant::now());
+                return Ok(());
+            }
+        }
+        let mm_size = std::fs::metadata(mmproj).map(|m| m.len()).unwrap_or(0);
+        let est = entry.size_bytes + mm_size + 512 * 1024 * 1024;
+        let evict = {
+            let g = self.governor.lock().await;
+            match g.plan(est) {
+                Admission::Fits => Vec::new(),
+                Admission::EvictFirst(v) => v,
+                Admission::TooLarge => Vec::new(),
+            }
+        };
+        for old in evict {
+            self.sleep_model(&old).await;
+        }
+        *self.asr.lock().await = None;
+        self.governor
+            .lock()
+            .await
+            .set_state(&entry.id, est, ModelResidencyState::Loading, Instant::now());
+        let model_path = entry.path.clone();
+        let mmproj_owned = mmproj.to_path_buf();
+        let eng = tokio::task::spawn_blocking(move || {
+            ocak_engine::asr::Qwen3AsrEngine::load(&model_path, &mmproj_owned, true)
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("ASR load failed: {e}"))?;
+        *self.asr.lock().await = Some((entry.id.clone(), eng));
+        self.governor
+            .lock()
+            .await
+            .set_state(&entry.id, est, ModelResidencyState::ActiveGpu, Instant::now());
+        Ok(())
     }
 
     pub async fn ensure_native(&self, entry: &CatalogEntry) -> Result<(ocak_tok::TemplateFamily, bool), String> {
@@ -682,8 +740,8 @@ async fn chat_completions(
 
     let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
     if req.stream {
-        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
-        let (tok_tx, mut tok_rx) = mpsc::channel::<String>(256);
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(1024);
+        let (tok_tx, mut tok_rx) = mpsc::channel::<String>(1024);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         st.batcher.submit(
             Arc::clone(&st),
@@ -1284,16 +1342,29 @@ async fn audio_transcriptions(
             })
         });
         if let Some(mmproj) = mmproj_path {
-            let model_path = entry.path.clone();
-            let wav_owned = wav_slice.to_vec();
-            let res = tokio::task::spawn_blocking(move || {
-                let mut asr = ocak_engine::asr::Qwen3AsrEngine::load(&model_path, &mmproj, true)?;
-                asr.transcribe_wav(&wav_owned, 256)
-            })
-            .await;
-            if let Ok(Ok(raw)) = res {
-                let clean = raw.split("<asr_text>").nth(1).unwrap_or(&raw).trim().to_string();
-                return Json(json!({ "text": clean, "raw": raw, "backend": "native-vk-qwen3a" })).into_response();
+            if let Err(e) = st.ensure_asr(&entry, &mmproj).await {
+                tracing::warn!(error = %e, "native ASR load failed, falling back to bridge");
+            } else {
+                let st_c = Arc::clone(&st);
+                let model_id = entry.id.clone();
+                let wav_owned = wav_slice.to_vec();
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut guard = st_c.asr.blocking_lock();
+                    let Some((aid, eng)) = guard.as_mut() else {
+                        return Err("ASR engine unloaded".to_string());
+                    };
+                    if aid != &model_id {
+                        return Err("ASR model swapped".to_string());
+                    }
+                    let out = eng.transcribe_wav(&wav_owned, 256).map_err(|e| e.to_string());
+                    st_c.governor.blocking_lock().touch(&model_id, Instant::now());
+                    out
+                })
+                .await;
+                if let Ok(Ok(raw)) = res {
+                    let clean = raw.split("<asr_text>").nth(1).unwrap_or(&raw).trim().to_string();
+                    return Json(json!({ "text": clean, "raw": raw, "backend": "native-vk-qwen3a" })).into_response();
+                }
             }
         }
     }
@@ -1558,5 +1629,90 @@ mod tests {
         .await;
         assert_eq!(st_w, StatusCode::OK, "{bw}");
         println!("Auto-wake completed in {:.0} ms", t_w.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[tokio::test]
+    async fn slow_sse_does_not_stall_batch_and_swap_queues_cleanly() {
+        let tiny = PathBuf::from("/home/mechres/Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf");
+        if !tiny.exists() {
+            return;
+        }
+        let state = AppState::new(ServerConfig::default());
+        let entry_tiny = state.find_model("tinyllama-1.1b-chat-v1.0.Q4_K_M").unwrap().clone();
+        state.ensure_native(&entry_tiny).await.unwrap();
+
+        // 1. Slow SSE client (capacity 1, never read) + healthy batched client
+        let (slow_tx, _slow_rx_never_read) = mpsc::channel::<String>(1);
+        let (slow_done_tx, slow_done_rx) = tokio::sync::oneshot::channel();
+        let (fast_done_tx, fast_done_rx) = tokio::sync::oneshot::channel();
+        state.batcher.submit(
+            Arc::clone(&state),
+            batch::BatchJob {
+                model_id: entry_tiny.id.clone(),
+                greq: GenRequest {
+                    prompt: "Count to twenty: 1, 2, 3,".into(),
+                    parse_special: false,
+                    max_tokens: 24,
+                    sampler: SamplerParams { temperature: 0.0, ..Default::default() },
+                    stop: Vec::new(),
+                    json_mode: false,
+                    thinking: None,
+                },
+                token_tx: Some(slow_tx),
+                done_tx: slow_done_tx,
+            },
+        );
+        state.batcher.submit(
+            Arc::clone(&state),
+            batch::BatchJob {
+                model_id: entry_tiny.id.clone(),
+                greq: GenRequest {
+                    prompt: "The capital of France is".into(),
+                    parse_special: false,
+                    max_tokens: 8,
+                    sampler: SamplerParams { temperature: 0.0, ..Default::default() },
+                    stop: Vec::new(),
+                    json_mode: false,
+                    thinking: None,
+                },
+                token_tx: None,
+                done_tx: fast_done_tx,
+            },
+        );
+        let fast_res = tokio::time::timeout(Duration::from_secs(15), fast_done_rx)
+            .await
+            .expect("healthy slot stalled by slow SSE client")
+            .unwrap()
+            .unwrap();
+        assert!(!fast_res.text.is_empty());
+        let _ = slow_done_rx.await;
+
+        // 2. Graceful model swap when queued job targets a different model
+        if let Some(lfm) = state.find_model("LFM3-1.7B").cloned() {
+            let (swap_done_tx, swap_done_rx) = tokio::sync::oneshot::channel();
+            state.batcher.submit(
+                Arc::clone(&state),
+                batch::BatchJob {
+                    model_id: lfm.id.clone(),
+                    greq: GenRequest {
+                        prompt: "Hello".into(),
+                        parse_special: false,
+                        max_tokens: 6,
+                        sampler: SamplerParams { temperature: 0.0, ..Default::default() },
+                        stop: Vec::new(),
+                        json_mode: false,
+                        thinking: None,
+                    },
+                    token_tx: None,
+                    done_tx: swap_done_tx,
+                },
+            );
+            let swap_res = tokio::time::timeout(Duration::from_secs(30), swap_done_rx)
+                .await
+                .expect("model swap timed out")
+                .unwrap()
+                .expect("graceful model swap failed");
+            assert!(!swap_res.text.is_empty());
+        }
     }
 }

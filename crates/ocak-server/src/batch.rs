@@ -74,6 +74,16 @@ impl BatchCoordinator {
 
             let target_model = first_job.model_id.clone();
             let mut guard = st.native.blocking_lock();
+            if guard.as_ref().map(|a| a.id.as_str()) != Some(target_model.as_str()) {
+                drop(guard);
+                if let Some(entry) = st.find_model(&target_model).cloned() {
+                    if let Err(e) = tokio::runtime::Handle::current().block_on(st.ensure_native(&entry)) {
+                        let _ = first_job.done_tx.send(Err(e));
+                        continue;
+                    }
+                }
+                guard = st.native.blocking_lock();
+            }
             let Some(active) = guard.as_mut() else {
                 let _ = first_job.done_tx.send(Err("native engine not loaded".into()));
                 continue;
@@ -92,7 +102,14 @@ impl BatchCoordinator {
                         return true;
                     }
                     if let Some(tx) = &mut token_tx {
-                        tx.blocking_send(piece.to_string()).is_ok()
+                        match tx.try_send(piece.to_string()) {
+                            Ok(()) => true,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(model = %target_model, "SSE client channel full; cancelling slow stream");
+                                false
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => false,
+                        }
                     } else {
                         true
                     }
@@ -154,7 +171,14 @@ impl BatchCoordinator {
                         return true;
                     }
                     if let Some(tx) = &metas[idx].0 {
-                        tx.blocking_send(piece.to_string()).is_ok()
+                        match tx.try_send(piece.to_string()) {
+                            Ok(()) => true,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(model = %target_model, slot = idx, "SSE client channel full; decoupling slow slot");
+                                false
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => false,
+                        }
                     } else {
                         true
                     }
