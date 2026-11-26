@@ -113,6 +113,7 @@ struct PipelineBundle {
 
 struct Pipelines {
     rms_norm: PipelineBundle,
+    add_rms_norm: PipelineBundle,
     add: PipelineBundle,
     add_scaled: PipelineBundle,
     copy: PipelineBundle,
@@ -186,7 +187,7 @@ struct Pipelines {
 impl Pipelines {
     unsafe fn destroy(&self, dev: &Device) {
         for p in [
-            &self.rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.situ, &self.rope,
+            &self.rms_norm, &self.add_rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.situ, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_bf16, &self.qmv_q8_0, &self.qmv_q4_0,
             &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k,
@@ -354,6 +355,7 @@ impl VkContext {
 
             let pipelines = Pipelines {
                 rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 20)?,
+                add_rms_norm: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_rms_norm.spv")), 4, 24)?,
                 add: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
                 add_scaled: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
                 copy: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv")), 2, 12)?,
@@ -930,6 +932,12 @@ impl<'a> Recorder<'a> {
     pub fn rms_norm(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
         let pc = [x_off as u32, w_off as u32, out_off as u32, n, eps.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rms_norm(&mut self, x: &Buffer, x_off: u64, r: &Buffer, r_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
+        let pc = [x_off as u32, r_off as u32, w_off as u32, out_off as u32, n, eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.add_rms_norm, &[x.buf, r.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
     }
 
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {

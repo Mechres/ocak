@@ -10,10 +10,9 @@ layout(push_constant) uniform PC { uint slot; uint x_off; uint y_off; uint k; ui
 const float KFP4[16] = float[16](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
 float ue4m3(uint v) {
     if (v == 0u || v == 0x7Fu) return 0.0;
-    int e = int((v >> 3) & 0xFu);
-    float m = float(v & 7u);
-    float raw = (e == 0) ? (m * exp2(-9.0)) : ((1.0 + m * 0.125) * exp2(float(e - 7)));
-    return raw * 0.5;
+    uint e = (v >> 3) & 0xFu;
+    uint m = v & 7u;
+    return (e == 0u) ? (float(m) * (1.0 / 1024.0)) : uintBitsToFloat(((e + 119u) << 23) | (m << 20));
 }
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -34,10 +33,11 @@ void main() {
             uint xo = xbase + sb * 16u;
             uint qo = b + 4u + s * 8u;
             float sum = 0.0;
-            for (uint j = 0u; j < 8u; j++) {
-                uint qv = uint(w[qo + j]);
-                sum += KFP4[qv & 0xFu] * x[xo + j];
-                sum += KFP4[qv >> 4] * x[xo + 8u + j];
+            for (uint j = 0u; j < 8u; j += 2u) {
+                uint q0 = uint(w[qo + j]);
+                uint q1 = uint(w[qo + j + 1u]);
+                sum += KFP4[q0 & 0xFu] * x[xo + j] + KFP4[q0 >> 4] * x[xo + 8u + j]
+                     + KFP4[q1 & 0xFu] * x[xo + j + 1u] + KFP4[q1 >> 4] * x[xo + 9u + j];
             }
             acc += d * sum;
         }

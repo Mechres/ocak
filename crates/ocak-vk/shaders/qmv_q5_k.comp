@@ -22,40 +22,29 @@ void main() {
     float acc = 0.0;
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nblk = pc.k / 256u;
-        for (uint blk = tid; blk < nblk; blk += 32u) {
+        uint nsub = pc.k / 32u;
+        for (uint sb = tid; sb < nsub; sb += 32u) {
+            uint blk = sb >> 3;
+            uint j = sb & 7u;
             uint b = rbase + blk * 176u;
-            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1]) << 8)).x;
-            float dmin = unpackHalf2x16(uint(w[b+2]) | (uint(w[b+3]) << 8)).x;
-            uint sb = b + 4u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+            float dmin = unpackHalf2x16(uint(w[b + 2u]) | (uint(w[b + 3u]) << 8)).x;
+            uint sc, mn;
+            get_scale_min_k4(j, b + 4u, sc, mn);
             uint qh_base = b + 16u;
-            uint qb_base = b + 48u;
-            uint xb = pc.x_off + blk * 256u;
-            uint u1 = 1u, u2 = 2u;
-            for (uint g = 0; g < 4u; g++) {
-                uint sc1, m1, sc2, m2;
-                get_scale_min_k4(2u * g, sb, sc1, m1);
-                get_scale_min_k4(2u * g + 1u, sb, sc2, m2);
-                float lo = 0.0, hi = 0.0, sx1 = 0.0, sx2 = 0.0;
-                uint qoff = qb_base + g * 32u;
-                uint xoff = xb + g * 64u;
-                for (uint l = 0; l < 32u; l++) {
-                    uint q = uint(w[qoff + l]);
-                    uint qh = uint(w[qh_base + l]);
-                    uint a = (q & 0xFu) + (((qh & u1) != 0u) ? 16u : 0u);
-                    uint c = (q >> 4) + (((qh & u2) != 0u) ? 16u : 0u);
-                    float x1 = x[xoff + l];
-                    float x2 = x[xoff + 32u + l];
-                    lo += float(a) * x1;
-                    hi += float(c) * x2;
-                    sx1 += x1;
-                    sx2 += x2;
-                }
-                acc += d * float(sc1) * lo - dmin * float(m1) * sx1;
-                acc += d * float(sc2) * hi - dmin * float(m2) * sx2;
-                u1 <<= 2u;
-                u2 <<= 2u;
+            uint qoff = b + 48u + (j >> 1) * 32u;
+            uint shift = (j & 1u) * 4u;
+            uint hb = 1u << j;
+            uint xb = pc.x_off + sb * 32u;
+            float s = 0.0, sx = 0.0;
+            for (uint l = 0u; l < 32u; l++) {
+                uint q = (uint(w[qoff + l]) >> shift) & 0xFu;
+                uint qh = ((uint(w[qh_base + l]) & hb) != 0u) ? 16u : 0u;
+                float xv = x[xb + l];
+                s += float(q + qh) * xv;
+                sx += xv;
             }
+            acc += (d * float(sc)) * s - (dmin * float(mn)) * sx;
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);

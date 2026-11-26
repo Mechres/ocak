@@ -588,9 +588,12 @@ impl VkExec {
             rec.barrier();
         }
 
-        for l in &self.layers {
-            rec.rms_norm(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
+        if !self.layers.is_empty() {
+            rec.rms_norm(&self.x, 0, &self.layers[0].attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
             rec.barrier();
+        }
+
+        for (li, l) in self.layers.iter().enumerate() {
             match &l.mixer {
                 VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
                     if *gated_q {
@@ -668,9 +671,7 @@ impl VkExec {
                 rec.rms_norm(&self.o, 0, pan, 0, &self.o, 0, c.n_embd as u32, c.eps);
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
-            rec.barrier();
-            rec.rms_norm(&self.x, 0, &l.ffn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
+            rec.add_rms_norm(&self.x, 0, &self.o, 0, &l.ffn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
             rec.barrier();
             rec.qmv(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m);
             rec.qmv(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m);
@@ -683,14 +684,18 @@ impl VkExec {
                 rec.rms_norm(&self.o, 0, pfn, 0, &self.o, 0, c.n_embd as u32, c.eps);
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
-            rec.barrier();
+            if li + 1 < self.layers.len() {
+                rec.add_rms_norm(&self.x, 0, &self.o, 0, &self.layers[li + 1].attn_norm, 0, &self.xn, 0, c.n_embd as u32, c.eps);
+                rec.barrier();
+            } else if out.logits || out.hidden {
+                rec.add_rms_norm(&self.x, 0, &self.o, 0, &self.out_norm, 0, &self.hidden_buf, 0, c.n_embd as u32, c.eps);
+                rec.barrier();
+            } else {
+                rec.add(&self.x, 0, &self.o, 0, c.n_embd as u32);
+                rec.barrier();
+            }
         }
 
-        if out.logits || out.hidden {
-            rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf, 0, c.n_embd as u32, c.eps);
-            rec.barrier();
-        }
         if out.logits {
             let w = self.output.as_ref().unwrap_or(&self.embd);
             rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);

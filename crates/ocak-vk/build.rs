@@ -8,6 +8,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shaders = [
         "rms_norm",
+        "add_rms_norm",
         "add",
         "add_scaled",
         "copy",
