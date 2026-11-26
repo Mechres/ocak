@@ -22,29 +22,25 @@ void main() {
     float acc = 0.0;
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nsub = pc.k / 32u;
-        for (uint sb = tid; sb < nsub; sb += 32u) {
-            uint blk = sb >> 3;
-            uint j = sb & 7u;
+        uint nb = pc.k / 256u;
+        for (uint blk = 0u; blk < nb; blk++) {
             uint b = rbase + blk * 176u;
             float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
             float dmin = unpackHalf2x16(uint(w[b + 2u]) | (uint(w[b + 3u]) << 8)).x;
-            uint sc, mn;
-            get_scale_min_k4(j, b + 4u, sc, mn);
-            uint qh_base = b + 16u;
-            uint qoff = b + 48u + (j >> 1) * 32u;
-            uint shift = (j & 1u) * 4u;
-            uint hb = 1u << j;
-            uint xb = pc.x_off + sb * 32u;
-            float s = 0.0, sx = 0.0;
-            for (uint l = 0u; l < 32u; l++) {
-                uint q = (uint(w[qoff + l]) >> shift) & 0xFu;
-                uint qh = ((uint(w[qh_base + l]) & hb) != 0u) ? 16u : 0u;
-                float xv = x[xb + l];
-                s += float(q + qh) * xv;
-                sx += xv;
+            uint qh = uint(w[b + 16u + tid]);
+            uint xbase = pc.x_off + blk * 256u + tid;
+            for (uint pair = 0u; pair < 4u; pair++) {
+                uint j0 = pair * 2u;
+                uint j1 = j0 + 1u;
+                uint sc0, mn0, sc1, mn1;
+                get_scale_min_k4(j0, b + 4u, sc0, mn0);
+                get_scale_min_k4(j1, b + 4u, sc1, mn1);
+                uint qb = uint(w[b + 48u + pair * 32u + tid]);
+                uint q0 = (qb & 0xFu) | (((qh >> j0) & 1u) << 4);
+                uint q1 = (qb >> 4) | (((qh >> j1) & 1u) << 4);
+                acc += (d * float(sc0) * float(q0) - dmin * float(mn0)) * x[xbase + j0 * 32u];
+                acc += (d * float(sc1) * float(q1) - dmin * float(mn1)) * x[xbase + j1 * 32u];
             }
-            acc += (d * float(sc)) * s - (dmin * float(mn)) * sx;
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);

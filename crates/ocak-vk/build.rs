@@ -77,6 +77,7 @@ fn main() {
         "qmm2_q4_k",
         "qmm2_q5_k",
         "qmm2_iq3_s",
+        "argmax",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

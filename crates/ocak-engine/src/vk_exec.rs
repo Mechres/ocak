@@ -107,6 +107,7 @@ pub struct VkExec {
     logits_buf: Buffer,
     hidden_buf2: Buffer,
     logits_buf2: Buffer,
+    argmax_buf: Buffer,
     rec_snaps: Option<Vec<(Buffer, Option<Buffer>)>>,
     logits: Vec<f32>,
     hidden: Vec<f32>,
@@ -264,6 +265,7 @@ impl VkExec {
             logits_buf: mk(cfg.n_vocab)?,
             hidden_buf2: mk(2 * cfg.n_embd)?,
             logits_buf2: mk(2 * cfg.n_vocab)?,
+            argmax_buf: mk(4)?,
             rec_snaps: None,
             logits: vec![0.0; cfg.n_vocab],
             hidden: vec![0.0; cfg.n_embd],
@@ -299,7 +301,11 @@ impl Executor for VkExec {
     }
 
     fn forward(&mut self, token: u32, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
-        self.forward_inner(Some(token), None, pos, page_table, out)
+        self.forward_inner(Some(token), None, pos, page_table, out, false).map(|_| ())
+    }
+
+    fn forward_argmax(&mut self, token: u32, pos: usize, page_table: &[u32]) -> Result<Option<u32>, EngineError> {
+        self.forward_inner(Some(token), None, pos, page_table, Out { logits: true, hidden: false }, true)
     }
 
     fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
@@ -563,7 +569,7 @@ impl Executor for VkExec {
     }
 
     fn forward_embd(&mut self, embd: &[f32], pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
-        self.forward_inner(None, Some(embd), pos, page_table, out)
+        self.forward_inner(None, Some(embd), pos, page_table, out, false).map(|_| ())
     }
 
     fn logits(&self) -> &[f32] { &self.logits }
@@ -571,7 +577,7 @@ impl Executor for VkExec {
 }
 
 impl VkExec {
-    fn forward_inner(&mut self, token: Option<u32>, embd: Option<&[f32]>, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+    fn forward_inner(&mut self, token: Option<u32>, embd: Option<&[f32]>, pos: usize, page_table: &[u32], out: Out, gpu_argmax: bool) -> Result<Option<u32>, EngineError> {
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
@@ -700,6 +706,10 @@ impl VkExec {
             let w = self.output.as_ref().unwrap_or(&self.embd);
             rec.qmv(w.ty, &w.buf, 0, &self.hidden_buf, 0, &self.logits_buf, 0, w.k, w.m);
             rec.barrier();
+            if gpu_argmax {
+                rec.argmax(&self.logits_buf, 0, &self.argmax_buf, c.n_vocab as u32);
+                rec.barrier();
+            }
         }
         rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
 
@@ -707,9 +717,14 @@ impl VkExec {
             self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
         }
         if out.logits {
+            if gpu_argmax {
+                let mut idx = [0u32; 1];
+                self.ctx.download(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                return Ok(Some(idx[0]));
+            }
             self.ctx.download(&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn ensure_rec_snaps(&mut self) -> Result<(), EngineError> {

@@ -13,31 +13,29 @@ void main() {
     float acc = 0.0;
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
-        uint nsub = pc.k / 32u;
-        for (uint sb = tid; sb < nsub; sb += 32u) {
-            uint blk = sb >> 3;
-            uint j = sb & 7u;
+        uint nb = pc.k / 256u;
+        uint is = tid >> 4;
+        for (uint blk = 0u; blk < nb; blk++) {
             uint b = rbase + blk * 210u;
             float d = unpackHalf2x16(uint(w[b + 208u]) | (uint(w[b + 209u]) << 8)).x;
-            uint half_i = j >> 2;
-            uint q_idx = j & 3u;
-            uint ql = b + half_i * 64u + (q_idx & 1u) * 32u;
-            uint ql_shift = (q_idx >> 1) * 4u;
-            uint qh = b + 128u + half_i * 32u;
-            uint qh_shift = q_idx * 2u;
-            uint sc_base = b + 192u + half_i * 8u + q_idx * 2u;
-            float sc0 = d * float(bitfieldExtract(int(w[sc_base]), 0, 8));
-            float sc1 = d * float(bitfieldExtract(int(w[sc_base + 1u]), 0, 8));
-            uint xb = pc.x_off + sb * 32u;
-            float s0 = 0.0, s1 = 0.0;
-            for (uint l = 0u; l < 16u; l++) {
-                uint q1 = ((uint(w[ql + l]) >> ql_shift) & 0xFu) | (((uint(w[qh + l]) >> qh_shift) & 3u) << 4);
-                s0 += float(int(q1) - 32) * x[xb + l];
-                uint l2 = l + 16u;
-                uint q2 = ((uint(w[ql + l2]) >> ql_shift) & 0xFu) | (((uint(w[qh + l2]) >> qh_shift) & 3u) << 4);
-                s1 += float(int(q2) - 32) * x[xb + l2];
+            uint xbase = pc.x_off + blk * 256u + tid;
+            for (uint half_i = 0u; half_i < 2u; half_i++) {
+                uint ql_base = b + half_i * 64u;
+                uint qh_base = b + 128u + half_i * 32u;
+                uint sc_base = b + 192u + half_i * 8u;
+                uint ql0 = uint(w[ql_base + tid]);
+                uint ql1 = uint(w[ql_base + 32u + tid]);
+                uint qh = uint(w[qh_base + tid]);
+                float sc0 = d * float(bitfieldExtract(int(w[sc_base + is]), 0, 8));
+                float sc1 = d * float(bitfieldExtract(int(w[sc_base + 2u + is]), 0, 8));
+                float sc2 = d * float(bitfieldExtract(int(w[sc_base + 4u + is]), 0, 8));
+                float sc3 = d * float(bitfieldExtract(int(w[sc_base + 6u + is]), 0, 8));
+                uint xb = xbase + half_i * 128u;
+                acc += sc0 * float(int((ql0 & 0xFu) | ((qh & 3u) << 4)) - 32) * x[xb];
+                acc += sc1 * float(int((ql1 & 0xFu) | (((qh >> 2) & 3u) << 4)) - 32) * x[xb + 32u];
+                acc += sc2 * float(int((ql0 >> 4) | (((qh >> 4) & 3u) << 4)) - 32) * x[xb + 64u];
+                acc += sc3 * float(int((ql1 >> 4) | (((qh >> 6) & 3u) << 4)) - 32) * x[xb + 96u];
             }
-            acc += sc0 * s0 + sc1 * s1;
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);

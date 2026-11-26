@@ -293,6 +293,10 @@ impl NativeEngine {
         let mut mtp_accepted = 0usize;
         let mut mtp_pos = 0usize;
         let mut forced_tok: Option<u32> = None;
+        let pure_greedy = req.sampler.temperature <= 0.0
+            && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
+            && json_g.is_none()
+            && !use_mtp;
         let prof_mtp = std::env::var("OCAK_MTP_PROFILE").is_ok();
         let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
 
@@ -407,6 +411,15 @@ impl NativeEngine {
             }
 
             ensure_page(&mut self.pager, &mut pages, pos)?;
+            if pure_greedy {
+                if let Some(tok) = self.exec.forward_argmax(next_tok, pos, &pages).map_err(|e| {
+                    self.pager.release(&pages);
+                    e
+                })? {
+                    forced_tok = Some(tok);
+                    continue;
+                }
+            }
             if let Err(e) = self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: use_mtp }) {
                 self.pager.release(&pages);
                 return Err(e);

@@ -35,6 +35,10 @@ pub trait Executor: Send {
     }
     /// Processes `token` at position `pos`; `page_table[p]` maps logical page p to a physical page.
     fn forward(&mut self, token: u32, pos: usize, page_table: &[u32], out: Out) -> Result<(), EngineError>;
+    /// Fast greedy forward pass that computes argmax on-device and downloads only 4 bytes instead of full logits.
+    fn forward_argmax(&mut self, _token: u32, _pos: usize, _page_table: &[u32]) -> Result<Option<u32>, EngineError> {
+        Ok(None)
+    }
     /// Processes a contiguous batch of `tokens` starting at `pos0`, returning `out` for the final token.
     fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
         for (i, &tok) in tokens.iter().enumerate() {

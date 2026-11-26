@@ -182,6 +182,7 @@ struct Pipelines {
     qmm2_q4_k: PipelineBundle,
     qmm2_q5_k: PipelineBundle,
     qmm2_iq3_s: PipelineBundle,
+    argmax: PipelineBundle,
 }
 
 impl Pipelines {
@@ -202,6 +203,7 @@ impl Pipelines {
             &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
             &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_s,
             &self.qmm2_iq2_xs, &self.qmm2_q4_k, &self.qmm2_q5_k, &self.qmm2_iq3_s,
+            &self.argmax,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -457,6 +459,7 @@ impl VkContext {
                 qmm2_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), 3, 28)?,
                 qmm2_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), 3, 28)?,
                 qmm2_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), 4, 28)?,
+                argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), 2, 8)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -992,6 +995,11 @@ impl<'a> Recorder<'a> {
     pub fn add_rms_norm(&mut self, x: &Buffer, x_off: u64, r: &Buffer, r_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
         let pc = [x_off as u32, r_off as u32, w_off as u32, out_off as u32, n, eps.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.add_rms_norm, &[x.buf, r.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+    }
+
+    pub fn argmax(&mut self, x: &Buffer, x_off: u64, out: &Buffer, n: u32) {
+        let pc = [x_off as u32, n];
+        self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
     }
 
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {

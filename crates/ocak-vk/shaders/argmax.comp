@@ -1,0 +1,41 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { uint out_idx[]; };
+layout(push_constant) uniform PC { uint x_off; uint n; } pc;
+shared float sm_val[8];
+shared uint sm_idx[8];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    float best_v = -3.402823466e38;
+    uint best_i = 0u;
+    for (uint i = tid; i < pc.n; i += 256u) {
+        float v = x[pc.x_off + i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    float sg_max = subgroupMax(best_v);
+    uint sg_idx = subgroupMin((best_v == sg_max) ? best_i : 0xFFFFFFFFu);
+    if (gl_SubgroupInvocationID == 0u) {
+        sm_val[gl_SubgroupID] = sg_max;
+        sm_idx[gl_SubgroupID] = sg_idx;
+    }
+    barrier();
+    if (tid == 0u) {
+        float bv = sm_val[0];
+        uint bi = sm_idx[0];
+        uint n_sg = gl_NumSubgroups;
+        for (uint s = 1u; s < n_sg; s++) {
+            float v = sm_val[s];
+            uint idx = sm_idx[s];
+            if (v > bv || (v == bv && idx < bi)) {
+                bv = v;
+                bi = idx;
+            }
+        }
+        out_idx[0] = bi;
+    }
+}

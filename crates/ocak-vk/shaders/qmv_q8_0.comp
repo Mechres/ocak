@@ -14,17 +14,11 @@ void main() {
     if (row < pc.m) {
         uint rbase = pc.w_off + row * pc.row_bytes;
         uint nblk = pc.k / 32u;
-        for (uint blk = tid; blk < nblk; blk += 32u) {
+        for (uint blk = 0u; blk < nblk; blk++) {
             uint b = rbase + blk * 34u;
-            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b+1]) << 8)).x;
-            uint xb = pc.x_off + blk * 32u;
-            float s = 0.0;
-            for (uint j = 0; j < 32u; j++) {
-                int q = int(w[b + 2u + j]);
-                if (q >= 128) q -= 256;
-                s += float(q) * x[xb + j];
-            }
-            acc += d * s;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+            int q = bitfieldExtract(int(w[b + 2u + tid]), 0, 8);
+            acc += d * float(q) * x[pc.x_off + blk * 32u + tid];
         }
     }
     float s_out = subgroupClusteredAdd(acc, 32u);
