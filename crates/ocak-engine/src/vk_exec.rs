@@ -136,9 +136,9 @@ fn req_tensor<'a>(g: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, EngineE
 
 impl VkExec {
     pub fn new(g: Arc<GgufFile>, cfg: ModelConfig, n_pages: usize) -> Result<Self, EngineError> {
-        if cfg.head_dim > 128 {
+        if cfg.head_dim > 256 {
             return Err(EngineError::Unsupported(format!(
-                "attention.comp shader supports head_dim <= 128 (got {})",
+                "attention.comp shader supports head_dim <= 256 (got {})",
                 cfg.head_dim
             )));
         }
