@@ -573,6 +573,7 @@ struct ChatReq {
     #[serde(default)]
     stop: Vec<String>,
     reasoning_max_tokens: Option<usize>,
+    chat_template_kwargs: Option<Value>,
     response_format: Option<Value>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -661,7 +662,13 @@ async fn chat_completions(
     let has_tools = !tool_defs.is_empty();
     let chat_msgs = tools::openai_to_chat(&req.messages, &tool_defs);
 
-    let prompt = render(fam, &chat_msgs, true, true);
+    let enable_thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|v| v.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let prompt = render(fam, &chat_msgs, true, enable_thinking);
     let greq = GenRequest {
         prompt,
         parse_special: true,
@@ -924,6 +931,7 @@ struct AnthropicReq {
     tools: Vec<Value>,
     #[allow(dead_code)]
     tool_choice: Option<Value>,
+    thinking: Option<Value>,
 }
 
 fn anthropic_to_chat(req: &AnthropicReq) -> Vec<ChatMessage> {
@@ -940,6 +948,13 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "type": "error", "error": { "type": "api_error", "message": e } }))).into_response();
     }
     let has_tools = !req.tools.is_empty();
+    let enable_thinking = req
+        .thinking
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|t| t != "disabled")
+        .unwrap_or(true);
     let chat_msgs = anthropic_to_chat(&req);
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
     let model_id = entry.id.clone();
@@ -962,7 +977,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             match guard.as_mut() {
                 Some(active) if active.id == model_id => {
                     let fam = detect_family(active.engine.tokenizer.chat_template());
-                    let prompt = render(fam, &chat_msgs, true, true);
+                    let prompt = render(fam, &chat_msgs, true, enable_thinking);
                     let greq = GenRequest {
                         prompt,
                         parse_special: true,
@@ -1054,7 +1069,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             return Err(format!("model mismatch: requested '{model_id_c}' but '{}' is loaded", active.id));
         }
         let fam = detect_family(active.engine.tokenizer.chat_template());
-        let prompt = render(fam, &chat_msgs, true, true);
+        let prompt = render(fam, &chat_msgs, true, enable_thinking);
         let greq = GenRequest {
             prompt,
             parse_special: true,

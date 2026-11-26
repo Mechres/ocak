@@ -100,6 +100,12 @@ mod tests {
         let xing = template::render(TemplateFamily::Xing, &[ChatMessage { role: "user".into(), content: "2+2?".into() }], true, true);
         assert!(xing.contains("<_user>2+2?<_bot><think>\n"));
 
+        let xing_no_think = template::render(TemplateFamily::Xing, &[ChatMessage { role: "user".into(), content: "2+2?".into() }], true, false);
+        assert!(xing_no_think.ends_with("</think>"), "got: {xing_no_think}");
+
+        let chatml_no_think = template::render(TemplateFamily::ChatMl, &[ChatMessage { role: "user".into(), content: "2+2?".into() }], true, false);
+        assert!(chatml_no_think.trim_end().ends_with("</think>"), "got: {chatml_no_think}");
+
         let ink = template::render(TemplateFamily::Inkling, &[ChatMessage { role: "user".into(), content: "2+2?".into() }], true, false);
         assert!(ink.contains("Thinking effort level: 0<|end_message|><|message_user|><|content_text|>2+2?<|end_message|>"));
     }
