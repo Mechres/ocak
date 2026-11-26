@@ -56,6 +56,7 @@ fn main() {
         "qmv_iq3_s_id",
         "qmv_nvfp4_id",
         "qmv_q8_0_id",
+        "qmv_q4_k_id",
         "situ_id",
         "add_scaled_id",
         "add_scaled_exp_id",

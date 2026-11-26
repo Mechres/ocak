@@ -1,0 +1,49 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Ids { uint ids[]; };
+layout(push_constant) uniform PC { uint slot; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint slice_bytes; uint x_stride; } pc;
+void get_scale_min_k4(uint j, uint sb, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = uint(w[sb + j]) & 63u;
+        mn = uint(w[sb + j + 4u]) & 63u;
+    } else {
+        sc = (uint(w[sb + j + 4u]) & 0xFu) | ((uint(w[sb + j - 4u]) >> 6) << 4);
+        mn = (uint(w[sb + j + 4u]) >> 4) | ((uint(w[sb + j]) >> 6) << 4);
+    }
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    uint s_idx = gl_WorkGroupID.y;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint exp_id = ids[pc.slot + s_idx];
+        uint rbase = exp_id * pc.slice_bytes + row * pc.row_bytes;
+        uint xbase_tok = pc.x_off + s_idx * pc.x_stride;
+        uint nb = pc.k / 256u;
+        for (uint blk = 0u; blk < nb; blk++) {
+            uint b = rbase + blk * 144u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+            float dmin = unpackHalf2x16(uint(w[b + 2u]) | (uint(w[b + 3u]) << 8)).x;
+            uint xbase = xbase_tok + blk * 256u + tid;
+            for (uint pair = 0u; pair < 4u; pair++) {
+                uint j0 = pair * 2u;
+                uint j1 = j0 + 1u;
+                uint sc0, mn0, sc1, mn1;
+                get_scale_min_k4(j0, b + 4u, sc0, mn0);
+                get_scale_min_k4(j1, b + 4u, sc1, mn1);
+                uint qb = uint(w[b + 16u + pair * 32u + tid]);
+                acc += (d * float(sc0) * float(qb & 0xFu) - dmin * float(mn0)) * x[xbase + j0 * 32u];
+                acc += (d * float(sc1) * float(qb >> 4) - dmin * float(mn1)) * x[xbase + j1 * 32u];
+            }
+        }
+    }
+    float s_out = subgroupClusteredAdd(acc, 32u);
+    if (tid == 0u && row < pc.m) y[pc.y_off + s_idx * pc.m + row] = s_out;
+}

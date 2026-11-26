@@ -161,6 +161,7 @@ struct Pipelines {
     qmv_iq3_s_id: PipelineBundle,
     qmv_nvfp4_id: PipelineBundle,
     qmv_q8_0_id: PipelineBundle,
+    qmv_q4_k_id: PipelineBundle,
     situ_id: PipelineBundle,
     add_scaled_id: PipelineBundle,
     add_scaled_exp_id: PipelineBundle,
@@ -197,7 +198,7 @@ impl Pipelines {
             &self.qmv_iq2_xxs, &self.qmv_iq2_xs, &self.qmv_iq2_s, &self.qmv_iq3_xxs, &self.qmv_iq3_s,
             &self.qmv_iq1_s, &self.qmv_iq1_m, &self.qmv_iq4_nl, &self.qmv_iq4_xs, &self.qmv_nvfp4,
             &self.hc_sinkhorn, &self.hc_mix, &self.rope_yarn_mla, &self.mla_attn, &self.moe_topk,
-            &self.qmv_iq3_xxs_id, &self.qmv_iq3_s_id, &self.qmv_nvfp4_id, &self.qmv_q8_0_id, &self.situ_id,
+            &self.qmv_iq3_xxs_id, &self.qmv_iq3_s_id, &self.qmv_nvfp4_id, &self.qmv_q8_0_id, &self.qmv_q4_k_id, &self.situ_id,
             &self.add_scaled_id, &self.add_scaled_exp_id,
             &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
             &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
@@ -447,6 +448,7 @@ impl VkContext {
                 qmv_iq3_s_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), 5, 32)?,
                 qmv_nvfp4_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), 4, 32)?,
                 qmv_q8_0_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), 4, 32)?,
+                qmv_q4_k_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k_id.spv")), 4, 32)?,
                 situ_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
                 add_scaled_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 24)?,
                 add_scaled_exp_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 16)?,
@@ -1207,6 +1209,7 @@ impl<'a> Recorder<'a> {
             WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             WType::NVFP4 => self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmv_q8_0_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
+            WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmv_q4_k_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             _ => panic!("qmv_id: unsupported type {ty:?}"),
         }
     }
