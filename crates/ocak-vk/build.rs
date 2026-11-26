@@ -83,11 +83,16 @@ fn main() {
         let src = format!("shaders/{name}.comp");
         println!("cargo:rerun-if-changed={src}");
         let dst = out_dir.join(format!("{name}.spv"));
-        let status = Command::new("/usr/bin/glslc")
+        let glslc = if Command::new("glslc").arg("--version").output().is_ok() {
+            "glslc"
+        } else {
+            "/usr/bin/glslc"
+        };
+        let status = Command::new(glslc)
             .args(["--target-env=vulkan1.3", "-O", &src, "-o"])
             .arg(&dst)
             .status()
-            .expect("failed to invoke /usr/bin/glslc");
+            .expect("failed to invoke glslc");
         assert!(status.success(), "glslc failed on {src}");
         let _ = fs::metadata(&dst).expect("spv missing");
     }

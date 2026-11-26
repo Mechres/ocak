@@ -78,7 +78,14 @@ impl BatchCoordinator {
                 let _ = first_job.done_tx.send(Err("native engine not loaded".into()));
                 continue;
             };
-            if active.id != target_model || !active.engine.supports_multi_slot() {
+            if active.id != target_model {
+                let _ = first_job.done_tx.send(Err(format!(
+                    "model mismatch: requested '{target_model}' but '{}' is currently loaded",
+                    active.id
+                )));
+                continue;
+            }
+            if !active.engine.supports_multi_slot() {
                 let mut token_tx = first_job.token_tx;
                 let res = active.engine.generate(&first_job.greq, |_, piece| {
                     if piece.is_empty() {

@@ -1,6 +1,6 @@
 # Ocak
 
-**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 69 custom GLSL/SPIR-V shaders with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & GTT sparse paging)** and **x86-64 AVX2/FMA** (plus an optional runtime-loaded `ocak-hip` HSACO launcher) — with zero CUDA or ROCm SDK required to build or run.
+**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 71 custom GLSL/SPIR-V shaders with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & host-memory GTT overflow)** and an **x86-64 CPU fallback** (compiled with AVX2/FMA target flags) — with zero CUDA or ROCm SDK required to build or run.
 
 Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Radeon RX 6700 XT 12 GiB VRAM, Mesa RADV Vulkan 1.4**), Ocak runs dense, hybrid-recurrent, looped MoE, and hybrid GPU+CPU Mixture-of-Experts GGUF models natively from 1B up to 29B parameters while automatically curing AMD RDNA 2's 54W idle compute clock-lock bug.
 
@@ -8,23 +8,23 @@ Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Rade
 
 ## Highlights
 
-- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 69 hand-written GLSL shaders compiled at build time via `glslc` — zero graphics/render middleware, `VK_KHR_push_descriptor` zero-allocation dispatch, hardware `subgroupClusteredAdd(32)` reductions, 100% coalesced super-block `qmv` decode & Wave32 GPU `argmax` (4-byte greedy readback), fused `add_rms_norm`, 8-row LDS shared-memory tiled `qmm` prefill across 7 formats & 4-row-per-lane `qmm2` speculative verify shaders, `HOST_VISIBLE` GTT sparse paging for >12 GiB MoE models, deferred parallel barriers with single `vkQueueSubmit` forward pass per token across dense, hybrid-recurrent, and MoE architectures, and full `VkDevice` teardown on idle sleep.
-- **Zero-copy GGUF v2/v3 & 20 quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
-  - Supported formats: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `NVFP4`.
+- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 71 hand-written GLSL shaders compiled at build time via `glslc` — zero graphics/render middleware, `VK_KHR_push_descriptor` zero-allocation dispatch, hardware `subgroupClusteredAdd(32)` reductions, 100% coalesced super-block `qmv` decode & Wave32 GPU `argmax` (4-byte greedy readback), fused `add_rms_norm`, 8-row LDS shared-memory tiled `qmm` prefill across 7 formats & 4-row-per-lane `qmm2` speculative verify shaders, `HOST_VISIBLE` GTT tensor placement for >12 GiB MoE models, deferred parallel barriers with single `vkQueueSubmit` forward pass per token across dense, hybrid-recurrent, and MoE architectures, and full `VkDevice` teardown on idle sleep.
+- **Zero-copy GGUF v2/v3 & 20 Vulkan / 23 CPU quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
+  - Vulkan + CPU (20): `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `NVFP4` (plus `Q4_1`, `Q5_0`, `Q5_1` on CPU).
 - **Native architectures (`ocak-engine`)**:
-  - **Llama / MiniCPM / Qwen2** (dense GQA + NeoX / adjacent RoPE)
+  - **Llama / Qwen2** (dense GQA + NeoX / adjacent RoPE; also runs `llama`-architecture MiniCPM GGUFs)
   - **Liquid LFM2 / LFM2.5** (causal `ShortConv` + QK-norm GQA)
   - **Liquid LFM3** (`ShortConv` + per-head sigmoid attention gate + sliding-window attention + `rope_freqs` + post-attention/FFW norms)
   - **Qwen3.5 / Qwen3.8 / RVN** (3:1 hybrid **Gated DeltaNet** linear recurrence + **Gated Full Attention** + partial NeoX RoPE + native **NextN MTP** draft head `MtpDrafter`)
-  - **Xing4.0 MoE (29B-A4B)** (4-stream Sinkhorn **Hyper-Connections** + **YaRN MLA** latent KV cache + 64-expert / 4-active MoE + shared expert with fused GPU MoE dispatch, parallel MLA, and automatic hybrid GPU+CPU expert offloading `n_cpu_moe`)
-  - **Inkling-2-Mini (26.4B Looped MoE)** (24 physical layers with middle 12 looped 3× = 48 logical layers, depth-wise Attention Residuals, cross-pass gain/forget controllers, dynamic `ShortConv`, relative-position bias + attention sinks, GPU `situ.comp` activation, 128-expert / 8-active `NVFP4` MoE on VRAM + GTT sparse paging)
+  - **Xing4.0 MoE (29B-A4B)** (4-stream Sinkhorn **Hyper-Connections** + **YaRN MLA** latent KV cache + 64-expert / 4-active MoE + shared expert with fused GPU MoE dispatch, parallel MLA, native `<_user>`/`<_bot>` chat template, and automatic hybrid GPU+CPU expert offloading `n_cpu_moe`)
+  - **Inkling-2-Mini (26.4B Looped MoE)** (24 physical layers with middle 12 looped 3× = 48 logical layers, depth-wise Attention Residuals, cross-pass gain/forget controllers, dynamic `ShortConv`, relative-position bias + attention sinks, GPU `situ.comp` activation, native `<|message_user|>`/`<|message_model|>` chat template, 128-expert / 8-active `NVFP4` MoE on VRAM + GTT overflow)
   - **Qwen3-ASR-1.7B (Native Audio)** (zero-dep WAV/16 kHz resampler + 128-bin Slaney log-mel spectrogram + `qwen3a` 3×Conv2D + 24-layer Transformer audio encoder + `qwen3vl` Vulkan decoder for `/v1/audio/transcriptions` and `ocak asr`)
-- **Radix Prefix Paged FP16 KV Cache, Continuous Multi-Slot Batching & Q8 Compression (`ocak-kv`, `ocak-vk`, `ocak-server`)**: 16-token packed `F16` (`packHalf2x16`) physical KV pages across all GPU executors (`VkExec`, `MtpDrafter`, `XingExec` MLA, `InklingExec`) with hardware Wave32 `subgroupClusteredAdd` attention (2× longer context & half KV bandwidth on 12 GiB VRAM), continuous multi-slot request batching (`BatchCoordinator` + `forward_multi_slot` up to 8 concurrent slots), Copy-on-Write Radix prefix tree with LRU eviction, and `CompressedKvStore` (3.55× Q8 host-RAM spill).
+- **Radix Prefix Paged FP16 KV Cache & Continuous Multi-Slot Batching (`ocak-kv`, `ocak-vk`, `ocak-server`)**: 16-token packed `F16` (`packHalf2x16`) physical KV pages across all GPU executors (`VkExec`, `MtpDrafter`, `XingExec` MLA, `InklingExec`) with hardware Wave32 `subgroupClusteredAdd` attention, continuous multi-slot request batching (`BatchCoordinator` + `forward_multi_slot` up to 8 concurrent slots), and Radix prefix tree with LRU eviction.
 - **RX 6700 XT 12 GiB VRAM & `WarmSleep` Power Governor (`ocak-sysfs`)**: Auto-discovers `amdgpu` DRM/hwmon sensors (VRAM, GTT, wattage, temperature, busy %) and destroys active Vulkan compute contexts after `sleep-idle-seconds`, dropping GPU idle draw back to desktop idle (~29 W) while waking from Linux page cache in ~300 ms.
 - **Multi-Protocol Server (`ocak-server`)**:
   - **OpenAI API**: `GET /v1/models`, `POST /v1/chat/completions` (sync + streaming SSE + native `tools`/`tool_calls` function calling + JSON grammar mode + `<think>` token budget), `POST /v1/completions`, `POST /v1/embeddings` (L2-normalized), `POST /v1/audio/transcriptions`
-  - **Anthropic Messages API**: `POST /v1/messages` (streaming SSE `message_start` / `content_block_delta` / `tool_use` + `input_json_delta` / `message_stop`) & `POST /v1/messages/count_tokens` — compatible with Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8090`)
-  - **Observability & UI**: Prometheus `GET /metrics`, live SSE `GET /v1/ocak/events`, embedded dark-mode Web dashboard at `GET /ui`, and zero-dependency ANSI terminal monitor (`ocak top`).
+  - **Anthropic Messages API**: `POST /v1/messages` (streaming SSE `message_start` / `content_block_delta` / `tool_use` + `input_json_delta` / `max_tokens` / `message_stop`) & `POST /v1/messages/count_tokens` — compatible with Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8090`)
+  - **Security & Observability**: Loopback `Host`-header DNS-rebinding protection, optional `--api-key` / `OCAK_API_KEY` bearer & `x-api-key` auth on `/v1/*`, Prometheus `GET /metrics`, live SSE `GET /v1/ocak/events`, embedded dark-mode Web dashboard at `GET /ui`, and zero-dependency ANSI terminal monitor (`ocak top`).
 - **Tiered Federation & Parity Harness (`ocak-federation`)**: Optional `libllama.so` C logit parity oracle (`ocak parity-test`), managed `llama-server` fallback bridge (for exotic/multimodal audio models like `Qwen3-ASR-1.7B`), `mergen` distributed fleet bridge, and runtime `dlopen` HIP probe.
 
 ---
@@ -39,9 +39,8 @@ flowchart TD
     Server --> Fed["ocak-federation (libllama parity/ASR bridge, Mergen fleet, HIP probe)"]
     Engine --> KV["ocak-kv (16-tok Paged Radix Prefix Tree)"]
     Engine --> Tok["ocak-tok (SentencePiece, Byte-BPE, Templates, Thinking Cap, JSON Grammar)"]
-    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 69 GLSL/SPIR-V Shaders)"]
-    Engine --> HIP["ocak-hip (Dynamic dlopen libamdhip64 HSACO Runtime)"]
-    Engine --> CPU["ocak-cpu (x86-64 AVX2/FMA + Hybrid CPU MoE)"]
+    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 71 GLSL/SPIR-V Shaders)"]
+    Engine --> CPU["ocak-cpu (x86-64 CPU Fallback + Hybrid CPU MoE)"]
     Engine --> GGUF["ocak-gguf (Zero-Copy mmap GGUF v2/v3, Presets, .digest)"]
 ```
 
@@ -140,11 +139,11 @@ cargo test --release --workspace
 | :--- | :--- |
 | `crates/ocak-sysfs` | Linux `amdgpu` DRM/hwmon telemetry + 12 GiB VRAM/power governor |
 | `crates/ocak-gguf` | Zero-copy `mmap` GGUF v2/v3 parser, quant reference math, IQ lookup tables, presets, `.digest` |
-| `crates/ocak-kv` | 16-token paged KV allocator + Copy-on-Write Radix prefix tree |
-| `crates/ocak-tok` | SentencePiece & byte-level BPE tokenizers, chat templates, `<think>` budget, JSON grammar |
-| `crates/ocak-cpu` | x86-64 AVX2/FMA quantized GEMV and hybrid transformer ops |
-| `crates/ocak-vk` | Raw `ash` Vulkan 1.4 compute runtime + 67 GLSL/SPIR-V shaders (20 weight quant formats + `qmm`/`qmm2`) |
-| `crates/ocak-hip` | Dynamic `dlopen("libamdhip64.so")` runtime + HSACO module/kernel launcher |
+| `crates/ocak-kv` | 16-token paged KV allocator + Radix prefix tree (plus standalone `CompressedKvStore` module) |
+| `crates/ocak-tok` | SentencePiece & byte-level BPE tokenizers, chat templates (ChatML/Llama2/3/Zephyr/Xing/Inkling), `<think>` budget, JSON grammar |
+| `crates/ocak-cpu` | x86-64 CPU quantized GEMV (compiled with AVX2/FMA target flags) and hybrid transformer ops |
+| `crates/ocak-vk` | Raw `ash` Vulkan 1.3/1.4 compute runtime + 71 GLSL/SPIR-V shaders (20 GPU weight quant formats + `qmm`/`qmm2`) |
+| `crates/ocak-hip` | Experimental standalone `dlopen("libamdhip64.so")` HSACO probe/launcher crate (not wired into engine) |
 | `crates/ocak-engine` | Native executors (`VkExec`, `CpuExec`, `XingExec`, `InklingExec`), `MtpDrafter`, sampler & generator |
 | `crates/ocak-federation` | `libllama.so` parity oracle, managed bridge, `mergen` fleet bridge, HIP `dlopen` probe |
 | `crates/ocak-server` | `axum` OpenAI + Anthropic + Embeddings + Audio + Prometheus + embedded `/ui` |

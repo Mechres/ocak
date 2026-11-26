@@ -3,13 +3,14 @@
 pub mod batch;
 pub mod tools;
 use axum::body::Bytes;
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Request as AxRequest, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ocak_engine::{BackendKind, EngineOptions, GenRequest, NativeEngine, SamplerParams, ThinkingCfg};
+use ocak_engine::{BackendKind, EngineOptions, FinishReason, GenRequest, NativeEngine, SamplerParams, ThinkingCfg};
 use ocak_federation::{
     hip_probe, HipProbe, LlamaBridgeHandle, ManagedLlamaBridge, MergenBridge, StrataBridge,
 };
@@ -40,6 +41,7 @@ pub struct ServerConfig {
     pub sleep_idle_seconds: u64,
     pub backend: BackendKind,
     pub max_ctx: usize,
+    pub api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +55,7 @@ impl Default for ServerConfig {
             sleep_idle_seconds: 120,
             backend: BackendKind::Vulkan,
             max_ctx: 2048,
+            api_key: std::env::var("OCAK_API_KEY").ok().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -72,6 +75,7 @@ pub struct AppState {
     pub mergen: MergenBridge,
     pub llama_bridge: ManagedLlamaBridge,
     governor: Mutex<VramGovernor>,
+    load_lock: Mutex<()>,
     native: Mutex<Option<ActiveNative>>,
     active_meta: std::sync::RwLock<Option<(String, ocak_tok::TemplateFamily, bool)>>,
     batcher: Arc<batch::BatchCoordinator>,
@@ -120,6 +124,7 @@ impl AppState {
             mergen: MergenBridge::default(),
             llama_bridge: ManagedLlamaBridge::default(),
             governor: Mutex::new(gov),
+            load_lock: Mutex::new(()),
             native: Mutex::new(None),
             active_meta: std::sync::RwLock::new(None),
             batcher: Arc::new(batch::BatchCoordinator::new()),
@@ -182,6 +187,13 @@ impl AppState {
                 return Ok((fam, multi));
             }
         }
+        // Serialize model loads so two cold requests never double-load and OOM VRAM
+        let _load_guard = self.load_lock.lock().await;
+        if let Some((ref id, fam, multi)) = *self.active_meta.read().unwrap() {
+            if id == &entry.id {
+                return Ok((fam, multi));
+            }
+        }
         {
             let nat = self.native.lock().await;
             if let Some(a) = nat.as_ref() {
@@ -218,7 +230,7 @@ impl AppState {
         let opts = EngineOptions {
             backend: self.cfg.backend,
             max_ctx: self.cfg.max_ctx,
-            kv_pages: (self.cfg.max_ctx / 16).max(128),
+            kv_pages: (self.cfg.max_ctx / 16 * 4).max(512),
         };
         let eng = tokio::task::spawn_blocking(move || NativeEngine::load(&path, opts))
             .await
@@ -325,6 +337,47 @@ pub struct StatusSnapshot {
     pub models: Vec<ModelStatus>,
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end] == "::1";
+        }
+        return false;
+    }
+    let bare = h.split(':').next().unwrap_or("");
+    matches!(bare, "localhost" | "127.0.0.1" | "::1")
+}
+
+async fn security_middleware(
+    State(st): State<Arc<AppState>>,
+    req: AxRequest,
+    next: Next,
+) -> Response {
+    if std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() != Some("1") {
+        if let Some(host) = req.headers().get("host").and_then(|v| v.to_str().ok()) {
+            if !is_loopback_host(host) {
+                return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid Host header" }))).into_response();
+            }
+        }
+    }
+    if let Some(ref expected) = st.cfg.api_key {
+        let path = req.uri().path();
+        if path.starts_with("/v1/") {
+            let bearer = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            let x_api = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+            if bearer != Some(expected.as_str()) && x_api != Some(expected.as_str()) {
+                return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(ui_page))
@@ -342,6 +395,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/ocak/events", get(ocak_events))
         .route("/v1/ocak/models/{id}/load", post(ocak_load))
         .route("/v1/ocak/models/{id}/sleep", post(ocak_sleep))
+        .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -701,8 +755,6 @@ async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<CompReq>) 
     if let Err(e) = st.ensure_native(&entry).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response();
     }
-    let mut guard = st.native.lock().await;
-    let active = guard.as_mut().unwrap();
     let greq = GenRequest {
         prompt: req.prompt,
         parse_special: false,
@@ -712,8 +764,23 @@ async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<CompReq>) 
         json_mode: false,
         thinking: None,
     };
-    match active.engine.generate(&greq, |_, _| true) {
-        Ok(gr) => {
+    let st_c = Arc::clone(&st);
+    let model_id = entry.id.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut guard = st_c.native.blocking_lock();
+        let Some(active) = guard.as_mut() else {
+            return Err("native engine unloaded before request ran".to_string());
+        };
+        if active.id != model_id {
+            return Err(format!("model mismatch: requested '{model_id}' but '{}' is loaded", active.id));
+        }
+        let out = active.engine.generate(&greq, |_, _| true).map_err(|e| e.to_string());
+        st_c.governor.blocking_lock().touch(&model_id, Instant::now());
+        out
+    })
+    .await;
+    match res {
+        Ok(Ok(gr)) => {
             st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
             st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
             Json(json!({
@@ -725,6 +792,7 @@ async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<CompReq>) 
             }))
             .into_response()
         }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
@@ -748,17 +816,30 @@ async fn embeddings(State(st): State<Arc<AppState>>, Json(req): Json<EmbReq>) ->
         Value::Array(a) => a.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
         _ => Vec::new(),
     };
-    let mut guard = st.native.lock().await;
-    let active = guard.as_mut().unwrap();
-    let mut data = Vec::new();
-    for (idx, txt) in inputs.iter().enumerate() {
-        match active.engine.embed_text(txt) {
-            Ok(vec) => data.push(json!({ "object": "embedding", "index": idx, "embedding": vec })),
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    let st_c = Arc::clone(&st);
+    let model_id = entry.id.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut guard = st_c.native.blocking_lock();
+        let Some(active) = guard.as_mut() else {
+            return Err("native engine unloaded before request ran".to_string());
+        };
+        if active.id != model_id {
+            return Err(format!("model mismatch: requested '{model_id}' but '{}' is loaded", active.id));
         }
+        let mut data = Vec::with_capacity(inputs.len());
+        for (idx, txt) in inputs.iter().enumerate() {
+            let vec = active.engine.embed_text(txt).map_err(|e| e.to_string())?;
+            data.push(json!({ "object": "embedding", "index": idx, "embedding": vec }));
+        }
+        st_c.governor.blocking_lock().touch(&model_id, Instant::now());
+        Ok(data)
+    })
+    .await;
+    match res {
+        Ok(Ok(data)) => Json(json!({ "object": "list", "model": entry.id, "data": data })).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }
-    st.governor.lock().await.touch(&entry.id, Instant::now());
-    Json(json!({ "object": "list", "model": entry.id, "data": data })).into_response()
 }
 
 /// Anthropic Messages API (`/v1/messages`) with streaming SSE + tool_use for Claude Code compatibility.
@@ -811,66 +892,81 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             }
 
             let mut guard = st_c.native.blocking_lock();
-            if let Some(active) = guard.as_mut() {
-                let fam = detect_family(active.engine.tokenizer.chat_template());
-                let prompt = render(fam, &chat_msgs, true, true);
-                let greq = GenRequest {
-                    prompt,
-                    parse_special: true,
-                    max_tokens: req.max_tokens,
-                    sampler: SamplerParams { temperature: req.temperature.unwrap_or(0.7), ..Default::default() },
-                    stop: Vec::new(),
-                    json_mode: false,
-                    thinking: None,
-                };
-                let tx_c = tx.clone();
-                if let Ok(gr) = active.engine.generate(&greq, |_, piece| {
-                    if piece.is_empty() || has_tools { return true; }
-                    let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": piece } });
-                    tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_ok()
-                }) {
-                    st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
-                    st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
-                    let mut stop_reason = "end_turn";
-                    if has_tools {
-                        let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
-                        let mut idx = 0usize;
-                        if !clean.is_empty() || calls.is_empty() {
-                            let blk = json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "text", "text": "" } });
-                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
-                            let txt = if calls.is_empty() { &gr.text } else { &clean };
-                            if !txt.is_empty() {
-                                let d = json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "text_delta", "text": txt } });
-                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+            match guard.as_mut() {
+                Some(active) if active.id == model_id => {
+                    let fam = detect_family(active.engine.tokenizer.chat_template());
+                    let prompt = render(fam, &chat_msgs, true, true);
+                    let greq = GenRequest {
+                        prompt,
+                        parse_special: true,
+                        max_tokens: req.max_tokens,
+                        sampler: SamplerParams { temperature: req.temperature.unwrap_or(0.7), ..Default::default() },
+                        stop: Vec::new(),
+                        json_mode: false,
+                        thinking: None,
+                    };
+                    let tx_c = tx.clone();
+                    match active.engine.generate(&greq, |_, piece| {
+                        if piece.is_empty() || has_tools { return true; }
+                        let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": piece } });
+                        tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_ok()
+                    }) {
+                        Ok(gr) => {
+                            st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
+                            st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+                            let mut stop_reason = match gr.finish_reason {
+                                FinishReason::Length => "max_tokens",
+                                _ => "end_turn",
+                            };
+                            if has_tools {
+                                let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
+                                let mut idx = 0usize;
+                                if !clean.is_empty() || calls.is_empty() {
+                                    let blk = json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "text", "text": "" } });
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                    let txt = if calls.is_empty() { &gr.text } else { &clean };
+                                    if !txt.is_empty() {
+                                        let d = json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "text_delta", "text": txt } });
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                    }
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
+                                    idx += 1;
+                                }
+                                if !calls.is_empty() {
+                                    stop_reason = "tool_use";
+                                    for tc in &calls {
+                                        let blk = json!({
+                                            "type": "content_block_start",
+                                            "index": idx,
+                                            "content_block": { "type": "tool_use", "id": tc.id, "name": tc.name, "input": {} }
+                                        });
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                        let d = json!({
+                                            "type": "content_block_delta",
+                                            "index": idx,
+                                            "delta": { "type": "input_json_delta", "partial_json": tc.arguments.to_string() }
+                                        });
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
+                                        idx += 1;
+                                    }
+                                }
+                            } else {
+                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": 0 }).to_string())));
                             }
-                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
-                            idx += 1;
+                            let md = json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason }, "usage": { "output_tokens": gr.timings.predicted_n } });
+                            let _ = tx.blocking_send(Ok(Event::default().event("message_delta").data(md.to_string())));
+                            let _ = tx.blocking_send(Ok(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string())));
                         }
-                        if !calls.is_empty() {
-                            stop_reason = "tool_use";
-                            for tc in &calls {
-                                let blk = json!({
-                                    "type": "content_block_start",
-                                    "index": idx,
-                                    "content_block": { "type": "tool_use", "id": tc.id, "name": tc.name, "input": {} }
-                                });
-                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
-                                let d = json!({
-                                    "type": "content_block_delta",
-                                    "index": idx,
-                                    "delta": { "type": "input_json_delta", "partial_json": tc.arguments.to_string() }
-                                });
-                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
-                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
-                                idx += 1;
-                            }
+                        Err(e) => {
+                            let err = json!({ "type": "error", "error": { "type": "api_error", "message": e.to_string() } });
+                            let _ = tx.blocking_send(Ok(Event::default().event("error").data(err.to_string())));
                         }
-                    } else {
-                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": 0 }).to_string())));
                     }
-                    let md = json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason }, "usage": { "output_tokens": gr.timings.predicted_n } });
-                    let _ = tx.blocking_send(Ok(Event::default().event("message_delta").data(md.to_string())));
-                    let _ = tx.blocking_send(Ok(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string())));
+                }
+                _ => {
+                    let err = json!({ "type": "error", "error": { "type": "api_error", "message": "model unloaded or swapped before generation" } });
+                    let _ = tx.blocking_send(Ok(Event::default().event("error").data(err.to_string())));
                 }
             }
             st_c.governor.blocking_lock().touch(&model_id, Instant::now());
@@ -878,23 +974,42 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         return Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response();
     }
 
-    let mut guard = st.native.lock().await;
-    let active = guard.as_mut().unwrap();
-    let fam = detect_family(active.engine.tokenizer.chat_template());
-    let prompt = render(fam, &chat_msgs, true, true);
-    let greq = GenRequest {
-        prompt,
-        parse_special: true,
-        max_tokens: req.max_tokens,
-        sampler: SamplerParams { temperature: req.temperature.unwrap_or(0.7), ..Default::default() },
-        stop: Vec::new(),
-        json_mode: false,
-        thinking: None,
-    };
-    match active.engine.generate(&greq, |_, _| true) {
-        Ok(gr) => {
+    let st_c = Arc::clone(&st);
+    let model_id_c = model_id.clone();
+    let max_tokens = req.max_tokens;
+    let temp = req.temperature.unwrap_or(0.7);
+    let res = tokio::task::spawn_blocking(move || {
+        let mut guard = st_c.native.blocking_lock();
+        let Some(active) = guard.as_mut() else {
+            return Err("native engine unloaded before request ran".to_string());
+        };
+        if active.id != model_id_c {
+            return Err(format!("model mismatch: requested '{model_id_c}' but '{}' is loaded", active.id));
+        }
+        let fam = detect_family(active.engine.tokenizer.chat_template());
+        let prompt = render(fam, &chat_msgs, true, true);
+        let greq = GenRequest {
+            prompt,
+            parse_special: true,
+            max_tokens,
+            sampler: SamplerParams { temperature: temp, ..Default::default() },
+            stop: Vec::new(),
+            json_mode: false,
+            thinking: None,
+        };
+        let out = active.engine.generate(&greq, |_, _| true).map_err(|e| e.to_string());
+        st_c.governor.blocking_lock().touch(&model_id_c, Instant::now());
+        out
+    })
+    .await;
+    match res {
+        Ok(Ok(gr)) => {
             st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
             st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+            let default_stop = match gr.finish_reason {
+                FinishReason::Length => "max_tokens",
+                _ => "end_turn",
+            };
             let (content, stop_reason) = if has_tools {
                 let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
                 if !calls.is_empty() {
@@ -907,10 +1022,10 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                     }
                     (blocks, "tool_use")
                 } else {
-                    (vec![json!({ "type": "text", "text": gr.text })], "end_turn")
+                    (vec![json!({ "type": "text", "text": gr.text })], default_stop)
                 }
             } else {
-                (vec![json!({ "type": "text", "text": gr.text })], "end_turn")
+                (vec![json!({ "type": "text", "text": gr.text })], default_stop)
             };
             Json(json!({
                 "id": msg_id,
@@ -923,7 +1038,8 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "type": "error", "error": { "type": "api_error", "message": e } }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "type": "error", "error": { "type": "api_error", "message": e.to_string() } }))).into_response(),
     }
 }
 
@@ -1114,6 +1230,28 @@ mod tests {
         assert!(ant_body.contains("event: message_start"));
         assert!(ant_body.contains("event: content_block_delta"));
         assert!(ant_body.contains("event: message_stop"));
+
+        // 5b. Security: Host-header DNS rebinding guard + optional API key check
+        let bad_host = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("host", "evil.example.com:8090")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad_host).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let mut auth_cfg = ServerConfig::default();
+        auth_cfg.api_key = Some("secret-test-key".into());
+        let auth_app = build_router(AppState::new(auth_cfg));
+        let no_key = Request::builder().method("GET").uri("/v1/models").body(Body::empty()).unwrap();
+        assert_eq!(auth_app.clone().oneshot(no_key).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let ok_key = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer secret-test-key")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(auth_app.clone().oneshot(ok_key).await.unwrap().status(), StatusCode::OK);
 
         // 6. /v1/embeddings L2 norm == 1.0
         let (st_emb, emb_body) = call(

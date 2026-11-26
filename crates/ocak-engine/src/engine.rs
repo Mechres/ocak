@@ -251,7 +251,10 @@ impl NativeEngine {
         let t_prefill = Instant::now();
         let prompt_len = tokens.len();
         if prompt_len > 0 {
-            ensure_page(&mut self.pager, &mut pages, prompt_len - 1)?;
+            if let Err(e) = ensure_page(&mut self.pager, &mut pages, prompt_len - 1) {
+                self.pager.release(&pages);
+                return Err(e);
+            }
         }
         if cache_n < prompt_len {
             if let Err(e) = self.exec.forward_batch(
@@ -264,6 +267,7 @@ impl NativeEngine {
                 return Err(e);
             }
         }
+        let mut eval_len = prompt_len;
         let prompt_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         let prefill_eval_n = prompt_len - cache_n;
 
@@ -296,6 +300,7 @@ impl NativeEngine {
         let pure_greedy = req.sampler.temperature <= 0.0
             && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
             && json_g.is_none()
+            && think_gov.is_none()
             && !use_mtp;
         let prof_mtp = std::env::var("OCAK_MTP_PROFILE").is_ok();
         let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
@@ -358,7 +363,10 @@ impl NativeEngine {
                 ms_draft += t0.elapsed().as_secs_f64() * 1000.0;
                 if let Some(dt) = draft_tok {
                     mtp_drafted += 1;
-                    ensure_page(&mut self.pager, &mut pages, pos + 1)?;
+                    if let Err(e) = ensure_page(&mut self.pager, &mut pages, pos + 1) {
+                        self.pager.release(&pages);
+                        return Err(e);
+                    }
                     let t2 = Instant::now();
                     match self.exec.forward_verify2([next_tok, dt], pos, &pages) {
                         Ok(Some(([mut l0, l1], [h0, h1]))) => {
@@ -367,6 +375,7 @@ impl NativeEngine {
                             if v1 == dt {
                                 // ACCEPTED! Emit draft token immediately and carry forward (l1, h1)!
                                 mtp_accepted += 1;
+                                eval_len = pos + 2;
                                 if self.tokenizer.is_eog(dt) {
                                     finish = FinishReason::Stop;
                                     break;
@@ -390,6 +399,7 @@ impl NativeEngine {
                                 continue;
                             } else {
                                 // REJECTED: restore exact post-next_tok recurrent state (zero re-forward!)
+                                eval_len = pos + 1;
                                 let t3 = Instant::now();
                                 if let Err(e) = self.exec.restore_recurrent() {
                                     self.pager.release(&pages);
@@ -410,12 +420,16 @@ impl NativeEngine {
                 }
             }
 
-            ensure_page(&mut self.pager, &mut pages, pos)?;
+            if let Err(e) = ensure_page(&mut self.pager, &mut pages, pos) {
+                self.pager.release(&pages);
+                return Err(e);
+            }
             if pure_greedy {
                 if let Some(tok) = self.exec.forward_argmax(next_tok, pos, &pages).map_err(|e| {
                     self.pager.release(&pages);
                     e
                 })? {
+                    eval_len = pos + 1;
                     forced_tok = Some(tok);
                     continue;
                 }
@@ -424,6 +438,7 @@ impl NativeEngine {
                 self.pager.release(&pages);
                 return Err(e);
             }
+            eval_len = pos + 1;
             logits_buf.copy_from_slice(self.exec.logits());
             if use_mtp {
                 hidden_buf.copy_from_slice(self.exec.hidden());
@@ -436,8 +451,8 @@ impl NativeEngine {
             let _ = on_chunk(0, &tail);
         }
 
-        // Cache generated full pages too, then release active references
-        self.pager.insert_prefix(&tokens, &pages);
+        // Only cache tokens whose forward pass actually populated the KV cache!
+        self.pager.insert_prefix(&tokens[..eval_len.min(tokens.len())], &pages);
         self.pager.release(&pages);
 
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
@@ -544,7 +559,13 @@ impl NativeEngine {
         let prompt_len = tokens.len();
         let need_pages = (prompt_len - 1) / PAGE_TOKENS + 1;
         while pages.len() < need_pages {
-            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
+            match self.pager.alloc_page() {
+                Some(p) => pages.push(p),
+                None => {
+                    self.pager.release(&pages);
+                    return Err(EngineError::KvExhausted);
+                }
+            }
         }
         let t_prefill = Instant::now();
         if cache_n < prompt_len {
@@ -571,6 +592,7 @@ impl NativeEngine {
             max_tokens: req.max_tokens,
             stop: req.stop,
             tokens,
+            eval_len: prompt_len,
             pages,
             logits: self.exec.logits().to_vec(),
             sampler,
@@ -669,30 +691,33 @@ impl NativeEngine {
             if let Some(all_logits) = self.exec.forward_multi_slot(&steps)? {
                 for (&idx, l) in need_fwd.iter().zip(all_logits) {
                     slots[idx].logits = l;
+                    slots[idx].eval_len = slots[idx].tokens.len();
                 }
             } else {
                 for &idx in &need_fwd {
                     let s = &mut slots[idx];
                     self.exec.forward(*s.tokens.last().unwrap(), s.tokens.len() - 1, &s.pages, Out { logits: true, hidden: false })?;
                     s.logits.copy_from_slice(self.exec.logits());
+                    s.eval_len = s.tokens.len();
                 }
             }
         } else if let Some(&idx) = need_fwd.first() {
             let s = &mut slots[idx];
             self.exec.forward(*s.tokens.last().unwrap(), s.tokens.len() - 1, &s.pages, Out { logits: true, hidden: false })?;
             s.logits.copy_from_slice(self.exec.logits());
+            s.eval_len = s.tokens.len();
         }
 
         Ok(slots.iter().map(|s| s.done).collect())
     }
 
-    /// Finalizes an `ActiveSlot`, registering its pages in the Radix KV tree and releasing active refs.
+    /// Finalizes an `ActiveSlot`, registering its evaluated pages in the Radix KV tree and releasing active refs.
     pub fn close_slot(&mut self, mut slot: ActiveSlot) -> GenResult {
         let tail = slot.detok.flush();
         if !tail.is_empty() {
             slot.full_text.push_str(&tail);
         }
-        self.pager.insert_prefix(&slot.tokens, &slot.pages);
+        self.pager.insert_prefix(&slot.tokens[..slot.eval_len.min(slot.tokens.len())], &slot.pages);
         self.pager.release(&slot.pages);
         let dec_ms = slot.t_dec.elapsed().as_secs_f64() * 1000.0;
         let timings = Timings {
@@ -714,6 +739,7 @@ pub struct ActiveSlot {
     max_tokens: usize,
     stop: Vec<String>,
     tokens: Vec<u32>,
+    eval_len: usize,
     pages: Vec<u32>,
     logits: Vec<f32>,
     sampler: Sampler,

@@ -329,6 +329,15 @@ impl VkContext {
                 let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
                 instance.get_physical_device_properties2(pd, &mut props2);
                 let props = props2.properties;
+                if props.api_version < vk::make_api_version(0, 1, 3, 0) || sg.subgroup_size < 32 {
+                    continue;
+                }
+                let mut avail12 = vk::PhysicalDeviceVulkan12Features::default();
+                let mut avail2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut avail12);
+                instance.get_physical_device_features2(pd, &mut avail2);
+                if avail12.storage_buffer8_bit_access == 0 || avail12.shader_int8 == 0 {
+                    continue;
+                }
                 let qfs = instance.get_physical_device_queue_family_properties(pd);
                 let qf = match qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE)) {
                     Some(i) => i as u32,
@@ -639,6 +648,18 @@ impl VkContext {
                     .dst_offset(0)
                     .size(chunk as u64)];
                 self.device.cmd_copy_buffer(exec.cmd_buf, src.buf, exec.staging_buf, &region);
+                let host_bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                self.device.cmd_pipeline_barrier(
+                    exec.cmd_buf,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &host_bar,
+                    &[],
+                    &[],
+                );
                 self.device.end_command_buffer(exec.cmd_buf)?;
                 self.submit_wait(&exec)?;
                 std::ptr::copy_nonoverlapping(exec.staging_ptr, out.as_mut_ptr().add(off), chunk);

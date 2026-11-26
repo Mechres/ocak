@@ -53,9 +53,15 @@ pub fn parse_wav_mono_16k(data: &[u8]) -> Result<Vec<f32>, EngineError> {
         let body_end = (body_start + sz).min(data.len());
         if id == b"fmt " && body_end >= body_start + 16 {
             audio_fmt = u16::from_le_bytes(data[body_start..body_start + 2].try_into().unwrap());
-            channels = u16::from_le_bytes(data[body_start + 2..body_start + 4].try_into().unwrap()).max(1);
-            sample_rate = u32::from_le_bytes(data[body_start + 4..body_start + 8].try_into().unwrap()).max(1);
+            channels = u16::from_le_bytes(data[body_start + 2..body_start + 4].try_into().unwrap());
+            sample_rate = u32::from_le_bytes(data[body_start + 4..body_start + 8].try_into().unwrap());
             bits_per_sample = u16::from_le_bytes(data[body_start + 14..body_start + 16].try_into().unwrap());
+            if !(1..=8).contains(&channels) {
+                return Err(EngineError::Unsupported(format!("invalid WAV channels={channels} (expected 1..=8)")));
+            }
+            if !(8000..=192000).contains(&sample_rate) {
+                return Err(EngineError::Unsupported(format!("invalid WAV sample_rate={sample_rate} (expected 8000..=192000)")));
+            }
         } else if id == b"data" {
             pcm = Some(&data[body_start..body_end]);
             break;
@@ -93,8 +99,12 @@ pub fn parse_wav_mono_16k(data: &[u8]) -> Result<Vec<f32>, EngineError> {
     if sample_rate == 16000 || mono.is_empty() {
         return Ok(mono);
     }
+    const MAX_OUT_SAMPLES: usize = 16000 * 600; // 10 min max audio
     let ratio = sample_rate as f64 / 16000.0;
     let out_len = ((mono.len() as f64) / ratio).round() as usize;
+    if out_len > MAX_OUT_SAMPLES {
+        return Err(EngineError::Unsupported(format!("WAV audio too long ({out_len} samples > {MAX_OUT_SAMPLES})")));
+    }
     let mut resampled = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src = i as f64 * ratio;

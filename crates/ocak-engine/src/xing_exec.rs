@@ -281,6 +281,12 @@ pub struct XingExec {
 
 impl XingExec {
     pub fn new(g: Arc<GgufFile>, use_vulkan: bool, max_ctx: usize, n_cpu_moe: usize) -> Result<Self, EngineError> {
+        const MAX_MLA_CTX: usize = 4096;
+        if use_vulkan && max_ctx > MAX_MLA_CTX {
+            return Err(EngineError::Context(format!(
+                "xing4_0 Vulkan mla_attn shader supports max_ctx <= {MAX_MLA_CTX} (got {max_ctx})"
+            )));
+        }
         let cfg = XingConfig::from_gguf(&g)?;
         #[cfg(feature = "vulkan")]
         let vk = if use_vulkan { VkContext::new().ok() } else { None };

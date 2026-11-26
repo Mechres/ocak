@@ -166,7 +166,7 @@ impl StrataBridge {
     }
 }
 
-/// Minimal async HTTP/1.1 client over loopback `TcpStream` (no TLS/reqwest bloat).
+/// Minimal async HTTP/1.1 client over loopback `TcpStream` with 30s timeout (no TLS/reqwest bloat).
 pub async fn http_request(
     addr: &str,
     method: &str,
@@ -174,29 +174,41 @@ pub async fn http_request(
     content_type: &str,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = TcpStream::connect(addr).await.map_err(|e| format!("connect {addr}: {e}"))?;
+    let io_timeout = Duration::from_secs(30);
+    let mut stream = tokio::time::timeout(io_timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect {addr}: timed out"))?
+        .map_err(|e| format!("connect {addr}: {e}"))?;
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
-    if !body.is_empty() {
-        stream.write_all(body).await.map_err(|e| e.to_string())?;
-    }
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.map_err(|e| e.to_string())?;
-    let split = resp
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
-    let head = String::from_utf8_lossy(&resp[..split]);
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(500);
-    Ok((status, resp[split + 4..].to_vec()))
+    tokio::time::timeout(io_timeout, async {
+        stream.write_all(req.as_bytes()).await?;
+        if !body.is_empty() {
+            stream.write_all(body).await?;
+        }
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await?;
+        Ok::<Vec<u8>, std::io::Error>(resp)
+    })
+    .await
+    .map_err(|_| format!("http {method} {addr}{path}: timed out"))?
+    .map_err(|e| e.to_string())
+    .and_then(|resp| {
+        let split = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| "malformed HTTP response".to_string())?;
+        let head = String::from_utf8_lossy(&resp[..split]);
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(500);
+        Ok((status, resp[split + 4..].to_vec()))
+    })
 }
 
 #[cfg(test)]

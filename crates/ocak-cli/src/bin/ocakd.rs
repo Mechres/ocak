@@ -25,6 +25,8 @@ struct Args {
     max_ctx: usize,
     #[arg(long, default_value = "vk")]
     backend: String,
+    #[arg(long, env = "OCAK_API_KEY")]
+    api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         sleep_idle_seconds: args.sleep_idle_seconds,
         backend,
         max_ctx: args.max_ctx,
+        api_key: args.api_key.filter(|s| !s.is_empty()),
     };
     let state = AppState::new(cfg);
     state.spawn_watchdog();
@@ -49,9 +52,15 @@ async fn main() -> anyhow::Result<()> {
         let addr: SocketAddr = format!("{}:{cp}", args.host).parse()?;
         let router = build_router(state.clone());
         tokio::spawn(async move {
-            tracing::info!(%addr, "ocakd compat listener online");
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            let _ = axum::serve(listener, router).await;
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!(%addr, "ocakd compat listener online");
+                    let _ = axum::serve(listener, router).await;
+                }
+                Err(e) => {
+                    tracing::warn!(%addr, error = %e, "ocakd compat listener failed to bind; continuing on primary port");
+                }
+            }
         });
     }
 
