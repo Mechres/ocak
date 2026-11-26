@@ -152,6 +152,28 @@ void dq8(uint rb, uint k0, out float v[8]) {
 #elif defined(F16)
     uint o = rb + k0 * 2u;
     for (uint i = 0u; i < 8u; i++) v[i] = f16at(o + 2u * i);
+#elif defined(BF16)
+    uint o = rb + k0 * 2u;
+    for (uint i = 0u; i < 8u; i++) v[i] = uintBitsToFloat(u16at(o + 2u * i) << 16);
+#elif defined(NVFP4)
+    // 36-byte blocks of 64: 4 UE4M3 scales (one per 16) + 32 bytes of E2M1 nibbles; in each
+    // 16-weight sub-block, byte j holds weight j (low nibble) and weight j + 8 (high nibble).
+    uint b = rb + (k0 >> 6) * 36u;
+    uint sbk = (k0 >> 4) & 3u;
+    uint sh = ((k0 >> 3) & 1u) * 4u;
+    uint sv = uint(w[b + sbk]);
+    float d = 0.0;
+    if (sv != 0u && sv != 0x7Fu) {
+        int e = int((sv >> 3) & 0xFu);
+        float mm = float(sv & 7u);
+        d = ((e == 0) ? (mm * exp2(-9.0)) : ((1.0 + mm * 0.125) * exp2(float(e - 7)))) * 0.5;
+    }
+    uint qo = b + 4u + sbk * 8u;
+    for (uint i = 0u; i < 8u; i++) {
+        uint q = (uint(w[qo + i]) >> sh) & 0xFu;
+        float mag = float[8](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)[q & 7u];
+        v[i] = d * ((q >= 8u) ? -mag : mag);
+    }
 #elif defined(F32)
     uint o = rb + k0 * 4u;
     for (uint i = 0u; i < 8u; i++) {

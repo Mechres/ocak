@@ -1,0 +1,140 @@
+#version 460
+// Batched Inkling prefill, pass 2 (after inkling_kv_store.comp): attention for query tokens
+// pos .. pos + n_tok - 1, all keys/values read from the FP16 cache. Same math as inkling_attn.comp
+// (Q/R clipping, relative-position bias, zero-logit sink, sigmoid output gate); the log-scale
+// temperature tau is computed per token from its position. Grid = (n_head, n_tok).
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer R { float r[]; };
+layout(set = 0, binding = 2) readonly buffer Sinks { float sinks[]; };
+layout(set = 0, binding = 3) readonly buffer Gate { float gate[]; };
+layout(set = 0, binding = 4) readonly buffer QClip { float qclip[]; };
+layout(set = 0, binding = 5) readonly buffer RClip { float rclip[]; };
+layout(set = 0, binding = 6) readonly buffer RelBias { float rbias[]; };
+layout(set = 0, binding = 7) readonly buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 8) readonly buffer VCache { uint vcache[]; };
+layout(set = 0, binding = 9) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint q_off; uint q_stride;
+    uint r_off; uint r_stride;
+    uint s_off; uint s_stride;
+    uint g_off; uint g_stride;
+    uint n_head;
+    uint n_head_kv;
+    uint hd;
+    uint n_rel;
+    uint n_extent;
+    uint n_swa;
+    uint is_swa;
+    uint cap;
+    uint pos;
+    uint kv_slot_off;
+    float qk_clip;
+    float rel_clip;
+    float log_alpha;
+    float log_floor;
+} pc;
+shared float sq[128];
+shared float sr[32];
+shared float sk_tmp[128];
+shared float smax[128];
+shared float ssum[128];
+shared float tile_p[128];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tk = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint tpos = pc.pos + tk;
+    float tau = 1.0 + pc.log_alpha * log(max((float(tpos) + 1.0) / pc.log_floor, 1.0));
+    uint gqa = pc.n_head / pc.n_head_kv;
+    uint kvh = h / gqa;
+    uint half_hd = pc.hd >> 1;
+    uint half_kv_dim = pc.n_head_kv * half_hd;
+
+    // 2. Clip Q (with qclip) and R (with rclip)
+    float qv = q[pc.q_off + tk * pc.q_stride + h * pc.hd + tid] * qclip[h * pc.hd + tid];
+    sq[tid] = qv * qv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sq[tid] += sq[tid + s]; barrier(); }
+    float qnorm = sqrt(sq[0]);
+    barrier();
+    float qf = ((qnorm > pc.qk_clip) ? (pc.qk_clip / qnorm) : 1.0) * ((pc.is_swa == 0u) ? tau : 1.0);
+    sq[tid] = qv * qf;
+
+    if (tid < pc.n_rel) {
+        float rv = r[pc.r_off + tk * pc.r_stride + h * pc.n_rel + tid] * rclip[h * pc.n_rel + tid];
+        sr[tid] = rv;
+        sk_tmp[tid] = rv * rv;
+    } else {
+        sk_tmp[tid] = 0.0;
+    }
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sk_tmp[tid] += sk_tmp[tid + s]; barrier(); }
+    float rnorm = sqrt(sk_tmp[0]);
+    barrier();
+    float rf = ((rnorm > pc.rel_clip) ? (pc.rel_clip / rnorm) : 1.0) * ((pc.is_swa == 0u) ? tau : 1.0);
+    if (tid < pc.n_rel) sr[tid] *= rf;
+    barrier();
+
+    // 3. Attention scores over t_start..=pos + zero sink
+    uint t_start = (pc.is_swa != 0u && tpos + 1u > pc.n_swa) ? (tpos + 1u - pc.n_swa) : 0u;
+    uint t_len = tpos - t_start + 1u;
+    float scale = inversesqrt(float(pc.hd));
+    float sink_t = sinks[pc.s_off + tk * pc.s_stride + h];
+
+    // Online softmax over 128-token tiles (no context-length cap). The zero-logit sink is the
+    // initial state: m = 0, l = exp(0 - 0) = 1, contributing to the normalizer but not to V.
+    uint d2 = tid >> 1;
+    uint lane = tid & 1u;
+    float m_run = 0.0;
+    float l_run = 1.0;
+    float acc = 0.0;
+    for (uint base = 0u; base < t_len; base += 128u) {
+        uint tile_len = min(128u, t_len - base);
+        uint idx = base + tid;
+        float sc = -3.402823466e38;
+        if (tid < tile_len) {
+            uint t = t_start + idx;
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+            float dot = 0.0;
+            {
+                uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd;
+                for (uint e2 = 0u; e2 < half_hd; e2++) {
+                    vec2 kv = unpackHalf2x16(kcache[kb + e2]);
+                    dot += sq[2u * e2] * kv.x + sq[2u * e2 + 1u] * kv.y;
+                }
+            }
+            uint dist = tpos - t;
+            float rb = 0.0;
+            if (dist < pc.n_extent) {
+                uint rbo = dist * pc.n_rel;
+                for (uint j = 0u; j < pc.n_rel; j++) rb += rbias[rbo + j] * sr[j];
+            }
+            sc = dot * scale + rb - sink_t;
+        }
+        smax[tid] = sc;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]); barrier(); }
+        float m_new = max(m_run, smax[0]);
+        float p = (tid < tile_len) ? exp(sc - m_new) : 0.0;
+        tile_p[tid] = p;
+        ssum[tid] = p;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) ssum[tid] += ssum[tid + s]; barrier(); }
+        float alpha = exp(m_run - m_new);
+        l_run = l_run * alpha + ssum[0];
+        m_run = m_new;
+        acc *= alpha;
+        for (uint j = 0u; j < tile_len; j++) {
+            uint t = t_start + base + j;
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+            vec2 vp = unpackHalf2x16(vcache[pc.kv_slot_off + sp * half_kv_dim + kvh * half_hd + d2]);
+            float vv = (lane == 0u) ? vp.x : vp.y;
+            acc += tile_p[j] * vv;
+        }
+        barrier(); // smax/ssum/tile_p are reused by the next tile
+    }
+    acc /= l_run;
+    float gv = 1.0 / (1.0 + exp(-gate[pc.g_off + tk * pc.g_stride + h * pc.hd + tid]));
+    o[(tk * pc.n_head + h) * pc.hd + tid] = acc * gv;
+}

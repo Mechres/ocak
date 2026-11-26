@@ -9,14 +9,15 @@ layout(push_constant) uniform PC {
     uint out_off;
     uint n;
     float eps;
-    uint stride;   // floats between consecutive rows (batched: workgroup y = row)
+    uint stride;      // floats between consecutive input rows (batched: workgroup y = row)
+    uint out_stride;  // floats between consecutive output rows
 } pc;
 shared float ssum[256];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     // Batched: workgroup y = token, rows of n floats.
     uint xo = pc.x_off + gl_WorkGroupID.y * pc.stride;
-    uint oo = pc.out_off + gl_WorkGroupID.y * pc.stride;
+    uint oo = pc.out_off + gl_WorkGroupID.y * pc.out_stride;
     float acc = 0.0;
     for (uint i = tid; i < pc.n; i += 256) {
         float v = x[xo + i];

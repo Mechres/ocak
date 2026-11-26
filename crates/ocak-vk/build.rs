@@ -83,6 +83,8 @@ fn main() {
         "qmm2_iq3_s",
         "argmax",
         "moe_group",
+        "inkling_kv_store",
+        "inkling_attn_batch",
     ];
     let has_glslc = Command::new("glslc").arg("--version").output().is_ok();
     let has_usr_glslc = !has_glslc && Command::new("/usr/bin/glslc").arg("--version").output().is_ok();
@@ -120,6 +122,7 @@ fn main() {
         ("q8_0", "Q8_0"), ("q4_0", "Q4_0"), ("f16", "F16"), ("f32", "F32"),
         ("iq3_s", "IQ3_S"), ("iq3_xxs", "IQ3_XXS"), ("iq2_xs", "IQ2_XS"), ("iq2_s", "IQ2_S"),
         ("iq2_xxs", "IQ2_XXS"), ("iq1_s", "IQ1_S"), ("iq1_m", "IQ1_M"), ("iq4_xs", "IQ4_XS"), ("iq4_nl", "IQ4_NL"),
+        ("bf16", "BF16"), ("nvfp4", "NVFP4"),
     ];
     let src = "shaders/qmm_tiled.comp";
     println!("cargo:rerun-if-changed={src}");

@@ -31,6 +31,47 @@ struct MoEExps {
     dn_scale: Vec<f32>,
     gpu_gu: Option<(Buffer, WType)>,
     gpu_dn: Option<(Buffer, WType)>,
+    /// Expert tensors live in host memory (GTT) because VRAM ran out.
+    gtt: bool,
+}
+
+/// Tokens per batched-prefill chunk.
+const INK_PB: usize = 256;
+/// Layer passes recorded per queue submit during batched prefill (TDR safety).
+const INK_LAYERS_PER_SUBMIT: usize = 4;
+
+/// Activation buffers for batched prefill, sized for INK_PB tokens. Multi-part buffers are
+/// laid out part-major ([part][INK_PB][dim]) so every part is a contiguous token batch.
+struct InklingBatch {
+    cur: Buffer,
+    inp_sa: Buffer,
+    prelude_cur: Buffer,
+    bank_out: Buffer,
+    ffn_inp: Buffer,
+    blocks_norm: Buffer, // [16][PB][ne]
+    bank_norm: Buffer,   // [16][PB][ne]
+    inputs: Buffer,      // [3][PB][ne]
+    in_norm: Buffer,     // [3][PB][ne]
+    msgs: Buffer,        // [4][PB][ne]
+    ctrl_cat: Buffer,    // [3][PB][2ne]
+    ctrl_gate: Buffer,   // [3][PB][rank]
+    ctrl_gf: Buffer,     // [3][2][PB][ne] (gain block, then forget block)
+    proj: Buffer,        // per-projection regions [PB][m]
+    k_conv: Buffer,      // [PB][kv_dim]
+    v_conv: Buffer,
+    attn_cat: Buffer,    // [PB][n_head * hd]
+    o_proj: Buffer,      // [PB][ne]
+    x_moe: Buffer,
+    router: Buffer,      // [PB][n_expert]
+    top_ids: Buffer,     // [PB * n_used]
+    top_w: Buffer,
+    moe_list: Buffer,    // moe_group layout
+    moe_gu: Buffer,      // [PB * n_used][2 * n_ff]
+    moe_mid: Buffer,     // [PB * n_used][n_ff]
+    moe_tmp: Buffer,     // [PB * n_used][ne]
+    moe_out: Buffer,     // [PB][ne]
+    /// VRAM staging for GTT-resident experts (gate_up, down), when it could be allocated.
+    stage: Option<(Buffer, Buffer)>,
 }
 
 struct LoopLayer {
@@ -230,6 +271,9 @@ pub struct InklingExec {
     gpu_moe_count: usize,
     cpu_moe_count: usize,
     gpu_pipe: Option<InklingGpuState>,
+    /// Batched-prefill buffers, allocated on first use (None if allocation failed).
+    batch: Option<InklingBatch>,
+    batch_tried: bool,
     hidden: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -508,7 +552,7 @@ impl InklingExec {
                 attn_norm, attn_q_inp_norm, attn_k_inp_norm, attn_v_inp_norm,
                 attn_k_conv_proj, attn_v_conv_proj,
                 attn_res_query, ffn_res_query, ffn_norm, ffn_gate_inp, exp_probs_b,
-                exps: MoEExps { gu_name, dn_name, gu_ty: t_gu.ty, dn_ty: t_dn.ty, gu_stride, dn_stride, gu_scale, dn_scale, gpu_gu: None, gpu_dn: None },
+                exps: MoEExps { gu_name, dn_name, gu_ty: t_gu.ty, dn_ty: t_dn.ty, gu_stride, dn_stride, gu_scale, dn_scale, gpu_gu: None, gpu_dn: None, gtt: false },
             });
         }
 
@@ -535,6 +579,7 @@ impl InklingExec {
                         (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                     } else if let (Ok(b_gu), Ok(b_dn)) = (c.create_gtt_buffer_from_slice(g.tensor_data(t_gu)), c.create_gtt_buffer_from_slice(g.tensor_data(t_dn))) {
                         gpu_moe_count += 1;
+                        ex.gtt = true;
                         (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                     } else {
                         cpu_moe_count += 1;
@@ -542,6 +587,7 @@ impl InklingExec {
                     }
                 } else if let (Ok(b_gu), Ok(b_dn)) = (c.create_gtt_buffer_from_slice(g.tensor_data(t_gu)), c.create_gtt_buffer_from_slice(g.tensor_data(t_dn))) {
                     gpu_moe_count += 1;
+                    ex.gtt = true;
                     (Some((b_gu, wt_gu)), Some((b_dn, wt_dn)))
                 } else {
                     cpu_moe_count += 1;
@@ -652,7 +698,9 @@ impl InklingExec {
                 let mut total_kv_u32 = 0usize;
                 for il in 0..n_slot {
                     let ip = if il < n_phys { il } else { core_start + (il - n_phys) % (core_end - core_start) };
-                    let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16) } else { max_ctx };
+                    // A batched prefill chunk writes INK_PB keys before attending, so the SWA ring
+                    // must hold the window plus a full chunk.
+                    let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16 + INK_PB) } else { max_ctx };
                     slot_kv_offsets.push(total_kv_u32 as u32);
                     slot_caps.push(cap as u32);
                     total_kv_u32 += cap * (kv_dim / 2);
@@ -731,6 +779,8 @@ impl InklingExec {
             tok_embd_name: "token_embd.weight".into(), tok_embd_ty,
             tok_norm, output_norm, output_res_query, output_w, phys, loop_layers, slots,
             gpu_x, gpu_y, gpu_gu, gpu_mid, gpu_sum, gpu_moe_count, cpu_moe_count, gpu_pipe,
+            batch: None,
+            batch_tried: false,
             hidden: vec![0f32; n_embd],
             logits: vec![0f32; n_vocab_unpadded],
         })
@@ -1283,7 +1333,457 @@ impl InklingExec {
     }
 }
 
+/// Float offsets of the per-projection regions in `InklingBatch::proj` for one physical layer:
+/// (q, k, v, r, sinks, gate, k_dyn, v_dyn), each region INK_PB rows of that projection's width.
+fn proj_regions(p: &PhysLayer) -> [u64; 8] {
+    let pbm = |m: usize| (INK_PB * m) as u64;
+    let o_q = 0u64;
+    let o_k = o_q + pbm(p.wq.m);
+    let o_v = o_k + pbm(p.wk.m);
+    let o_r = o_v + pbm(p.wv.m);
+    let o_s = o_r + pbm(p.attn_rel.m);
+    let o_g = o_s + pbm(p.attn_sink_proj.m);
+    let o_kd = o_g + pbm(p.wqkv_gate.m);
+    let o_vd = o_kd + p.attn_k_conv_proj.as_ref().map_or(0, |m| pbm(m.m));
+    let end = o_vd + p.attn_v_conv_proj.as_ref().map_or(0, |m| pbm(m.m));
+    let _ = end;
+    [o_q, o_k, o_v, o_r, o_s, o_g, o_kd, o_vd]
+}
+
+fn proj_total(p: &PhysLayer) -> usize {
+    p.wq.m + p.wk.m + p.wv.m + p.attn_rel.m + p.attn_sink_proj.m + p.wqkv_gate.m
+        + p.attn_k_conv_proj.as_ref().map_or(0, |m| m.m)
+        + p.attn_v_conv_proj.as_ref().map_or(0, |m| m.m)
+}
+
+impl InklingExec {
+    /// Allocate the batched-prefill buffers once; false if unavailable (falls back to per-token).
+    fn ensure_batch(&mut self) -> bool {
+        if self.batch.is_some() {
+            return true;
+        }
+        if self.batch_tried {
+            return false;
+        }
+        self.batch_tried = true;
+        let (Some(c), Some(gp)) = (&self.vk, &self.gpu_pipe) else { return false };
+        let pb = INK_PB;
+        let ne = self.n_embd;
+        let nu = self.n_expert_used;
+        let rank = gp.ctrl_rank as usize;
+        let kv_dim = gp.kv_dim;
+        let n_head_max = self.phys.iter().map(|p| p.n_head).max().unwrap_or(1);
+        let proj_max = self.phys.iter().map(proj_total).max().unwrap_or(1);
+        let mk = |n: usize| c.create_device_buffer((n.max(4) * 4) as u64).ok();
+        let bufs = (|| {
+            Some(InklingBatch {
+                cur: mk(pb * ne)?,
+                inp_sa: mk(pb * ne)?,
+                prelude_cur: mk(pb * ne)?,
+                bank_out: mk(pb * ne)?,
+                ffn_inp: mk(pb * ne)?,
+                blocks_norm: mk(16 * pb * ne)?,
+                bank_norm: mk(16 * pb * ne)?,
+                inputs: mk(3 * pb * ne)?,
+                in_norm: mk(3 * pb * ne)?,
+                msgs: mk(4 * pb * ne)?,
+                ctrl_cat: mk(3 * pb * 2 * ne)?,
+                ctrl_gate: mk(3 * pb * rank)?,
+                ctrl_gf: mk(3 * 2 * pb * ne)?,
+                proj: mk(pb * proj_max)?,
+                k_conv: mk(pb * kv_dim)?,
+                v_conv: mk(pb * kv_dim)?,
+                attn_cat: mk(pb * n_head_max * self.head_dim)?,
+                o_proj: mk(pb * ne)?,
+                x_moe: mk(pb * ne)?,
+                router: mk(pb * self.n_expert)?,
+                top_ids: mk(pb * nu)?,
+                top_w: mk(pb * nu)?,
+                moe_list: mk(self.n_expert * (pb + 1))?,
+                moe_gu: mk(pb * nu * 2 * self.n_ff_exp)?,
+                moe_mid: mk(pb * nu * self.n_ff_exp)?,
+                moe_tmp: mk(pb * nu * ne)?,
+                moe_out: mk(pb * ne)?,
+                stage: None,
+            })
+        })();
+        let Some(mut bb) = bufs else {
+            eprintln!("ocak: inkling batched prefill buffers unavailable; using per-token prefill");
+            return false;
+        };
+        // Staging for GTT-resident experts (sized for the largest such layer).
+        let (mut gu_max, mut dn_max) = (0u64, 0u64);
+        for p in self.phys.iter().filter(|p| p.exps.gtt) {
+            if let (Some(tg), Some(td)) = (self.gguf.tensor(&p.exps.gu_name), self.gguf.tensor(&p.exps.dn_name)) {
+                gu_max = gu_max.max(tg.n_bytes);
+                dn_max = dn_max.max(td.n_bytes);
+            }
+        }
+        if gu_max > 0 {
+            if let (Ok(a), Ok(b)) = (c.create_device_buffer(gu_max), c.create_device_buffer(dn_max)) {
+                bb.stage = Some((a, b));
+            } else {
+                eprintln!("ocak: no VRAM for inkling expert staging; GTT experts are read over PCIe during prefill");
+            }
+        }
+        self.batch = Some(bb);
+        true
+    }
+
+    /// Record one layer pass for `nb` tokens at positions pos0.. (batched mirror of record_layer_gpu).
+    fn record_layer_gpu_batch(
+        &self,
+        rec: &mut ocak_vk::Recorder<'_>,
+        gp: &InklingGpuState,
+        bb: &InklingBatch,
+        il: usize,
+        ip: usize,
+        pos0: usize,
+        nb: usize,
+        blk_count: &mut u32,
+        loop_idx: Option<usize>,
+    ) {
+        let p = &self.phys[ip];
+        let gph = &gp.phys[ip];
+        let ne = self.n_embd as u32;
+        let hd = self.head_dim as u32;
+        let kv_dim = gp.kv_dim as u32;
+        let nh_hist = (self.n_conv - 1) as u32;
+        let pb = INK_PB as u32;
+        let b = nb as u32;
+        let part = (pb * ne) as u64; // floats between parts of a multi-part buffer
+        let n = b * ne; // floats in the active token batch
+
+        // 1. Attention residual mix -> inputs [3][PB][ne]
+        rec.copy(&bb.cur, 0, &bb.inp_sa, 0, n);
+        if let Some(ref rq) = gph.attn_res_query {
+            let n_q = if p.is_swa { 1u32 } else { 3u32 };
+            rec.inkling_mix_batch(&bb.blocks_norm, &bb.cur, rq, &bb.inputs, ne, 0, *blk_count, n_q, pb * ne, pb * ne, b);
+            rec.barrier();
+            if p.is_swa {
+                rec.copy(&bb.inputs, 0, &bb.inputs, part, n);
+                rec.copy(&bb.inputs, 0, &bb.inputs, 2 * part, n);
+                rec.barrier();
+            }
+        } else {
+            for j in 0..3u64 {
+                rec.copy(&bb.cur, 0, &bb.inputs, j * part, n);
+            }
+            rec.barrier();
+        }
+
+        // 2. Cross-pass loop controllers for Q, K, V
+        let cc = (pb * 2 * ne) as u64;
+        let gfp = (2 * pb * ne) as u64;
+        if let Some(li) = loop_idx {
+            let gl = &gp.loops[li];
+            let gr = (pb * gp.ctrl_rank) as u64;
+            for j in 0..3u64 {
+                rec.rms_norm_batch_io(&bb.inputs, j * part, ne, &gp.ones, 0, &bb.ctrl_cat, j * cc, 2 * ne, ne, 1e-6, b);
+                rec.rms_norm_batch_io(&bb.msgs, j * part, ne, &gp.ones, 0, &bb.ctrl_cat, j * cc + ne as u64, 2 * ne, ne, 1e-6, b);
+            }
+            rec.barrier();
+            for j in 0..3usize {
+                let (ref bd, wtd, kd, md) = gl.ctrl_down[j];
+                rec.qmm(wtd, bd, 0, &bb.ctrl_cat, j as u64 * cc, &bb.ctrl_gate, j as u64 * gr, kd, md, b);
+            }
+            rec.barrier();
+            for j in 0..3usize {
+                let (ref bg, wtg, kg, mg) = gl.ctrl_gain[j];
+                let (ref bf, wtf, kf, mf) = gl.ctrl_forget[j];
+                rec.qmm(wtg, bg, 0, &bb.ctrl_gate, j as u64 * gr, &bb.ctrl_gf, j as u64 * gfp, kg, mg, b);
+                rec.qmm(wtf, bf, 0, &bb.ctrl_gate, j as u64 * gr, &bb.ctrl_gf, j as u64 * gfp + n as u64, kf, mf, b);
+            }
+            rec.barrier();
+            for j in 0..3u64 {
+                rec.inkling_ctrl(&bb.inputs, j * part, &bb.msgs, j * part, &bb.ctrl_gf, j * gfp, n);
+            }
+            rec.barrier();
+        }
+
+        // 3. Input RMSNorm -> in_norm [3][PB][ne]
+        if p.is_swa {
+            let nw = gph.attn_norm.as_ref().unwrap();
+            for j in 0..3u64 {
+                rec.rms_norm_batch(&bb.inputs, j * part, nw, 0, &bb.in_norm, j * part, ne, self.eps, b);
+            }
+        } else {
+            rec.rms_norm_batch(&bb.inputs, 0, gph.attn_q_inp_norm.as_ref().unwrap(), 0, &bb.in_norm, 0, ne, self.eps, b);
+            rec.rms_norm_batch(&bb.inputs, part, gph.attn_k_inp_norm.as_ref().unwrap(), 0, &bb.in_norm, part, ne, self.eps, b);
+            rec.rms_norm_batch(&bb.inputs, 2 * part, gph.attn_v_inp_norm.as_ref().unwrap(), 0, &bb.in_norm, 2 * part, ne, self.eps, b);
+        }
+        rec.barrier();
+
+        // 4. Projections (each into its own [PB][m] region)
+        let [o_q, o_k, o_v, o_r, o_s, o_g, o_kd, o_vd] = proj_regions(p);
+        let (bq, wtq) = p.wq.gpu.as_ref().unwrap();
+        let (bk, wtk) = p.wk.gpu.as_ref().unwrap();
+        let (bv, wtv) = p.wv.gpu.as_ref().unwrap();
+        let (br, wtr) = p.attn_rel.gpu.as_ref().unwrap();
+        let (bs, wts) = p.attn_sink_proj.gpu.as_ref().unwrap();
+        let (bg, wtg) = p.wqkv_gate.gpu.as_ref().unwrap();
+        rec.qmm(*wtq, bq, 0, &bb.in_norm, 0, &bb.proj, o_q, ne, p.wq.m as u32, b);
+        rec.qmm(*wtk, bk, 0, &bb.in_norm, part, &bb.proj, o_k, ne, p.wk.m as u32, b);
+        rec.qmm(*wtv, bv, 0, &bb.in_norm, 2 * part, &bb.proj, o_v, ne, p.wv.m as u32, b);
+        rec.qmm(*wtr, br, 0, &bb.in_norm, 0, &bb.proj, o_r, ne, p.attn_rel.m as u32, b);
+        rec.qmm(*wts, bs, 0, &bb.in_norm, 0, &bb.proj, o_s, ne, p.attn_sink_proj.m as u32, b);
+        rec.qmm(*wtg, bg, 0, &bb.in_norm, 0, &bb.proj, o_g, ne, p.wqkv_gate.m as u32, b);
+        let mut dyn_w = (0u32, 0u32);
+        if let (Some(kp), Some(vp)) = (&p.attn_k_conv_proj, &p.attn_v_conv_proj) {
+            let (bkd, wtkd) = kp.gpu.as_ref().unwrap();
+            let (bvd, wtvd) = vp.gpu.as_ref().unwrap();
+            rec.qmm(*wtkd, bkd, 0, &bb.in_norm, part, &bb.proj, o_kd, ne, kp.m as u32, b);
+            rec.qmm(*wtvd, bvd, 0, &bb.in_norm, 2 * part, &bb.proj, o_vd, ne, vp.m as u32, b);
+            dyn_w = (kp.m as u32, vp.m as u32);
+        }
+        let has_dyn = dyn_w.0 > 0;
+        rec.barrier();
+
+        // 5. ShortConv on K and V over the token batch
+        let kv_hist_off = (il as u32 * kv_dim * nh_hist) as u64;
+        let nconv = self.n_conv as u32;
+        let (kdb, kdo, kds) = if has_dyn { (&bb.proj, o_kd, dyn_w.0) } else { (&gp.dummy_dyn, 0, 0) };
+        let (vdb, vdo, vds) = if has_dyn { (&bb.proj, o_vd, dyn_w.1) } else { (&gp.dummy_dyn, 0, 0) };
+        rec.inkling_conv_batch(&bb.proj, o_k, p.wk.m as u32, &gph.attn_k_conv, kdb, kdo, kds, &gp.k_hist, kv_hist_off, &bb.k_conv, 0, kv_dim, kv_dim, nconv, has_dyn, hd, b);
+        rec.inkling_conv_batch(&bb.proj, o_v, p.wv.m as u32, &gph.attn_v_conv, vdb, vdo, vds, &gp.v_hist, kv_hist_off, &bb.v_conv, 0, kv_dim, kv_dim, nconv, has_dyn, hd, b);
+        rec.barrier();
+
+        // 6. Store K/V for the whole batch, then attend
+        let cap = gp.slot_caps[il];
+        let kv_off = gp.slot_kv_offsets[il];
+        rec.inkling_kv_store(&bb.k_conv, 0, &bb.v_conv, 0, &gp.k_cache, &gp.v_cache, kv_dim, p.n_head_kv as u32, hd, p.is_swa, cap, pos0 as u32, kv_off, self.qk_clip, self.eps, b);
+        rec.barrier();
+        rec.inkling_attn_batch(
+            &bb.proj, &bb.proj, &bb.proj, &bb.proj,
+            &gph.attn_q_clip, &gph.attn_rel_clip, &gph.attn_rel_bias, &gp.k_cache, &gp.v_cache, &bb.attn_cat,
+            (o_q as u32, p.wq.m as u32), (o_r as u32, p.attn_rel.m as u32), (o_s as u32, p.attn_sink_proj.m as u32), (o_g as u32, p.wqkv_gate.m as u32),
+            p.n_head as u32, p.n_head_kv as u32, hd, self.n_rel as u32, p.n_extent as u32, self.n_swa as u32, p.is_swa,
+            cap, pos0 as u32, kv_off, self.qk_clip, self.rel_clip, self.log_scale_alpha, self.log_scale_floor, b,
+        );
+        rec.barrier();
+
+        // 7. wo + attn_post_conv -> cur
+        let (bwo, wtwo) = p.wo.gpu.as_ref().unwrap();
+        rec.qmm(*wtwo, bwo, 0, &bb.attn_cat, 0, &bb.o_proj, 0, p.wo.k as u32, ne, b);
+        rec.barrier();
+        let post_hist_off = (il as u32 * ne * nh_hist) as u64;
+        rec.inkling_conv_batch(&bb.o_proj, 0, ne, &gph.attn_post_conv, &gp.dummy_dyn, 0, 0, &gp.attn_post_hist, post_hist_off, &bb.cur, 0, ne, ne, nconv, false, 1, b);
+
+        // 8. Block boundary vs residual add
+        if ip.is_multiple_of(self.block_size) {
+            rec.rms_norm_batch(&bb.inp_sa, 0, &gp.ones, 0, &bb.blocks_norm, *blk_count as u64 * part, ne, 1e-6, b);
+            *blk_count += 1;
+            rec.barrier();
+        } else {
+            rec.barrier();
+            rec.add(&bb.cur, 0, &bb.inp_sa, 0, n);
+            rec.barrier();
+        }
+
+        // 9. FFN residual mix + loop controller 3 + ffn_norm -> x_moe
+        rec.copy(&bb.cur, 0, &bb.ffn_inp, 0, n);
+        rec.inkling_mix_batch(&bb.blocks_norm, &bb.cur, &gph.ffn_res_query, &bb.o_proj, ne, 0, *blk_count, 1, pb * ne, pb * ne, b);
+        rec.barrier();
+        if let Some(li) = loop_idx {
+            let gl = &gp.loops[li];
+            rec.rms_norm_batch_io(&bb.o_proj, 0, ne, &gp.ones, 0, &bb.ctrl_cat, 0, 2 * ne, ne, 1e-6, b);
+            rec.rms_norm_batch_io(&bb.msgs, 3 * part, ne, &gp.ones, 0, &bb.ctrl_cat, ne as u64, 2 * ne, ne, 1e-6, b);
+            rec.barrier();
+            let (ref bd, wtd, kd, md) = gl.ctrl_down[3];
+            let (ref bgn, wtg2, kg, mg) = gl.ctrl_gain[3];
+            let (ref bf, wtf, kf, mf) = gl.ctrl_forget[3];
+            rec.qmm(wtd, bd, 0, &bb.ctrl_cat, 0, &bb.ctrl_gate, 0, kd, md, b);
+            rec.barrier();
+            rec.qmm(wtg2, bgn, 0, &bb.ctrl_gate, 0, &bb.ctrl_gf, 0, kg, mg, b);
+            rec.qmm(wtf, bf, 0, &bb.ctrl_gate, 0, &bb.ctrl_gf, n as u64, kf, mf, b);
+            rec.barrier();
+            rec.inkling_ctrl(&bb.o_proj, 0, &bb.msgs, 3 * part, &bb.ctrl_gf, 0, n);
+            rec.barrier();
+        }
+        rec.rms_norm_batch(&bb.o_proj, 0, &gph.ffn_norm, 0, &bb.x_moe, 0, ne, self.eps, b);
+        rec.barrier();
+
+        // 10. MoE: router, top-k, grouped gate_up / down over the token batch
+        let (bgi, wtgi) = p.ffn_gate_inp.gpu.as_ref().unwrap();
+        let n_exp = self.n_expert as u32;
+        let nu = self.n_expert_used as u32;
+        let n_ff = self.n_ff_exp as u32;
+        rec.qmm(*wtgi, bgi, 0, &bb.x_moe, 0, &bb.router, 0, ne, n_exp, b);
+        rec.barrier();
+        let (bias_b, has_b) = match &gph.exp_probs_b {
+            Some(bb_) => (bb_, true),
+            None => (&gp.dummy_bias, false),
+        };
+        rec.moe_topk_batch(&bb.router, bias_b, &bb.top_ids, &bb.top_w, n_exp, nu, has_b, true, self.exp_w_scale, b);
+        let (b_gu, wt_gu) = p.exps.gpu_gu.as_ref().unwrap();
+        let (b_dn, wt_dn) = p.exps.gpu_dn.as_ref().unwrap();
+        let (gu_buf, dn_buf) = match &bb.stage {
+            Some((sg, sd)) if p.exps.gtt => {
+                rec.copy_buf_bytes(b_gu, sg, (p.exps.gu_stride * self.n_expert) as u64);
+                rec.copy_buf_bytes(b_dn, sd, (p.exps.dn_stride * self.n_expert) as u64);
+                (sg, sd)
+            }
+            _ => (b_gu, b_dn),
+        };
+        rec.barrier();
+        rec.moe_group(&bb.top_ids, &bb.moe_list, b * nu, n_exp, b);
+        rec.barrier();
+        let ok_gu = rec.qmm_grouped(*wt_gu, gu_buf, 0, p.exps.gu_stride as u64, &bb.x_moe, 0, ne, nu, &bb.moe_gu, 0, ne, 2 * n_ff, n_exp, Some(&bb.moe_list), b);
+        if !ok_gu {
+            for t in 0..b {
+                rec.qmv_id_batch(*wt_gu, gu_buf, &bb.top_ids, t * nu, nu, &bb.x_moe, (t * ne) as u64, 0, &bb.moe_gu, (t * nu * 2 * n_ff) as u64, ne, 2 * n_ff, p.exps.gu_stride as u64);
+            }
+        }
+        rec.barrier();
+        rec.situ_id_batch(&bb.moe_gu, &bb.moe_mid, &bb.top_ids, &gph.gu_scale, n_ff, 0, b * nu, self.situ_beta, self.situ_lin_beta);
+        rec.barrier();
+        let ok_dn = rec.qmm_grouped(*wt_dn, dn_buf, 0, p.exps.dn_stride as u64, &bb.moe_mid, 0, n_ff, 1, &bb.moe_tmp, 0, n_ff, ne, n_exp, Some(&bb.moe_list), b);
+        if !ok_dn {
+            for t in 0..b {
+                rec.qmv_id_batch(*wt_dn, dn_buf, &bb.top_ids, t * nu, nu, &bb.moe_mid, (t * nu * n_ff) as u64, n_ff, &bb.moe_tmp, (t * nu * ne) as u64, n_ff, ne, p.exps.dn_stride as u64);
+            }
+        }
+        rec.barrier();
+        rec.add_scaled_exp_id_tokens(&bb.moe_out, &bb.moe_tmp, &bb.top_w, &bb.top_ids, &gph.dn_scale, ne, 0, nu, true, b);
+        rec.barrier();
+
+        // 11. FFN post ShortConv + residual add -> cur
+        rec.inkling_conv_batch(&bb.moe_out, 0, ne, &gph.ffn_post_conv, &gp.dummy_dyn, 0, 0, &gp.ffn_post_hist, post_hist_off, &bb.cur, 0, ne, ne, nconv, false, 1, b);
+        rec.barrier();
+        rec.add(&bb.cur, 0, &bb.ffn_inp, 0, n);
+        rec.barrier();
+    }
+
+    /// Batched GPU prefill of up to INK_PB tokens at positions pos0..
+    fn forward_batch_gpu(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+        let nb = chunk.len();
+        let ne = self.n_embd;
+        let te = self.gguf.tensor(&self.tok_embd_name).unwrap();
+        let rb = self.tok_embd_ty.row_bytes(ne).unwrap();
+        let data = self.gguf.tensor_data(te);
+        let mut emb = vec![0f32; nb * ne];
+        for (t, &tok) in chunk.iter().enumerate() {
+            let row = &data[tok as usize * rb..(tok as usize + 1) * rb];
+            dequantize_row(self.tok_embd_ty, row, &mut emb[t * ne..(t + 1) * ne], ne);
+        }
+        let be = |e: ocak_vk::VkError| EngineError::Backend(e.to_string());
+        let (Some(c), Some(gp), Some(bb)) = (&self.vk, &self.gpu_pipe, &self.batch) else {
+            return Err(EngineError::Backend("inkling batched prefill unavailable".into()));
+        };
+        let ne32 = ne as u32;
+        let b = nb as u32;
+        let part = (INK_PB * ne) as u64;
+        let n = b * ne32;
+        c.upload(&bb.cur, 0, bytemuck::cast_slice(&emb)).map_err(be)?;
+        let mut rec = c.begin();
+        rec.set_defer_barriers(true);
+        rec.rms_norm_batch(&bb.cur, 0, &gp.tok_norm, 0, &bb.cur, 0, ne32, self.eps, b);
+        rec.barrier();
+        let mut blk_count = 0u32;
+        let mut passes_recorded = 0usize;
+        macro_rules! layer {
+            ($il:expr, $ip:expr, $loop_idx:expr) => {{
+                self.record_layer_gpu_batch(&mut rec, gp, bb, $il, $ip, pos0, nb, &mut blk_count, $loop_idx);
+                passes_recorded += 1;
+                if passes_recorded % INK_LAYERS_PER_SUBMIT == 0 {
+                    rec.finish_and_wait().map_err(be)?;
+                    rec = c.begin();
+                    rec.set_defer_barriers(true);
+                }
+            }};
+        }
+        for il in 0..self.core_start {
+            layer!(il, il, None);
+        }
+        rec.copy(&bb.cur, 0, &bb.prelude_cur, 0, n);
+        rec.barrier();
+        let prelude_blk_count = blk_count;
+        for pass in 0..self.n_passes {
+            let mut bank_count = 0u32;
+            if pass > 0 {
+                let bank_start = prelude_blk_count + 1;
+                bank_count = blk_count.saturating_sub(bank_start);
+                if bank_count > 0 {
+                    rec.copy(&bb.blocks_norm, bank_start as u64 * part, &bb.bank_norm, 0, bank_count * part as u32);
+                }
+                rec.copy(&bb.cur, 0, &bb.bank_out, 0, n);
+                rec.barrier();
+                rec.copy(&bb.prelude_cur, 0, &bb.cur, 0, n);
+                rec.barrier();
+                blk_count = prelude_blk_count;
+            }
+            for ip in self.core_start..self.core_end {
+                let il = if pass == 0 { ip } else { self.n_phys + (pass - 1) * (self.core_end - self.core_start) + (ip - self.core_start) };
+                if pass == 0 {
+                    layer!(il, ip, None);
+                } else {
+                    let li = ip - self.core_start;
+                    rec.inkling_mix_batch(&bb.bank_norm, &bb.bank_out, &gp.loops[li].msg_query, &bb.msgs, ne32, 0, bank_count, 4, part as u32, part as u32, b);
+                    rec.barrier();
+                    layer!(il, ip, Some(li));
+                }
+            }
+        }
+        for il in self.core_end..self.n_phys {
+            layer!(il, il, None);
+        }
+        if out.logits || out.hidden {
+            rec.inkling_mix_batch(&bb.blocks_norm, &bb.cur, &gp.output_res_query, &bb.o_proj, ne32, 0, blk_count, 1, part as u32, part as u32, b);
+            rec.barrier();
+            rec.rms_norm(&bb.o_proj, ((nb - 1) * ne) as u64, &gp.output_norm, 0, &gp.hidden_buf, 0, ne32, self.eps);
+            rec.barrier();
+        }
+        if out.logits {
+            let (bo, wto) = self.output_w.gpu.as_ref().unwrap();
+            rec.qmv(*wto, bo, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, ne32, self.output_w.m as u32);
+            rec.barrier();
+        }
+        rec.finish_and_wait().map_err(be)?;
+        let mut hidden = Vec::new();
+        let mut full = Vec::new();
+        if out.hidden {
+            hidden = vec![0f32; ne];
+            c.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut hidden)).map_err(be)?;
+        }
+        if out.logits {
+            full = vec![0f32; self.n_vocab_unpadded];
+            c.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut full)).map_err(be)?;
+        }
+        if out.hidden {
+            self.hidden.copy_from_slice(&hidden);
+        }
+        if out.logits {
+            for i in 0..self.n_vocab_unpadded {
+                let v = full[i];
+                self.logits[i] = if self.softcap > 0.0 { self.softcap * (v / self.softcap).tanh() } else { v };
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Executor for InklingExec {
+    fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        if tokens.len() > 1 && self.gpu_pipe.is_some() && self.ensure_batch() {
+            if pos0 + tokens.len() > self.max_ctx {
+                return Err(EngineError::Context(format!("pos {} >= max_ctx {}", pos0 + tokens.len() - 1, self.max_ctx)));
+            }
+            let mut off = 0usize;
+            while off < tokens.len() {
+                let chunk = &tokens[off..(off + INK_PB).min(tokens.len())];
+                let is_last = off + chunk.len() == tokens.len();
+                self.forward_batch_gpu(chunk, pos0 + off, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
+                off += chunk.len();
+            }
+            return Ok(());
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            let is_last = i + 1 == tokens.len();
+            self.forward(tok, pos0 + i, page_table, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> String {
         if let Some(c) = &self.vk {
             format!("vulkan-inkling-1sub ({}, gpu_moe={}, cpu_moe={})", c.device_name(), self.gpu_moe_count, self.cpu_moe_count)

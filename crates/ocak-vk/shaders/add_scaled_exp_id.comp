@@ -9,10 +9,13 @@ layout(push_constant) uniform PC { uint n; uint slot; uint count; uint overwrite
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
-    float acc = (pc.overwrite != 0u) ? 0.0 : a[i];
+    // Batched: workgroup y = token t (a row t, slots/b rows t*count..).
+    uint t = gl_WorkGroupID.y;
+    uint ai = t * pc.n + i;
+    float acc = (pc.overwrite != 0u) ? 0.0 : a[ai];
     for (uint k = 0u; k < pc.count; k++) {
-        uint s = pc.slot + k;
-        acc += w[s] * dn_sc[ids[s]] * b[k * pc.n + i];
+        uint s = pc.slot + t * pc.count + k;
+        acc += w[s] * dn_sc[ids[s]] * b[(t * pc.count + k) * pc.n + i];
     }
-    a[i] = acc;
+    a[ai] = acc;
 }

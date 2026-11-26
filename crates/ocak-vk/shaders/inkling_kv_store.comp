@@ -1,0 +1,51 @@
+#version 460
+// Batched Inkling prefill, pass 1: clip K (L2 norm <= qk_clip), RMS-normalize V, and store both as
+// packed FP16 into the layer's KV cache for tokens pos .. pos + n_tok - 1 (SWA layers use a ring of
+// `cap` slots). Grid = (n_head_kv, n_tok); head_dim must be 128.
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer K { float kc[]; };
+layout(set = 0, binding = 1) readonly buffer V { float vc[]; };
+layout(set = 0, binding = 2) buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 3) buffer VCache { uint vcache[]; };
+layout(push_constant) uniform PC {
+    uint k_off;
+    uint v_off;
+    uint kv_dim;
+    uint n_head_kv;
+    uint hd;
+    uint is_swa;
+    uint cap;
+    uint pos;
+    uint kv_slot_off;
+    float qk_clip;
+    float eps;
+} pc;
+shared float sred[128];
+shared float sk[128];
+shared float sv[128];
+void main() {
+    uint kvh = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint tpos = pc.pos + t;
+    uint slot = (pc.is_swa != 0u) ? (tpos % pc.cap) : tpos;
+    uint half_hd = pc.hd >> 1;
+    float kv = kc[pc.k_off + t * pc.kv_dim + kvh * pc.hd + tid];
+    sred[tid] = kv * kv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sred[tid] += sred[tid + s]; barrier(); }
+    float knorm = sqrt(sred[0]);
+    barrier();
+    sk[tid] = kv * ((knorm > pc.qk_clip) ? (pc.qk_clip / knorm) : 1.0);
+    float vv = vc[pc.v_off + t * pc.kv_dim + kvh * pc.hd + tid];
+    sred[tid] = vv * vv;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (tid < s) sred[tid] += sred[tid + s]; barrier(); }
+    sv[tid] = vv * inversesqrt(sred[0] / float(pc.hd) + pc.eps);
+    barrier();
+    if (tid < half_hd) {
+        uint dst = pc.kv_slot_off + slot * (pc.n_head_kv * half_hd) + kvh * half_hd + tid;
+        kcache[dst] = packHalf2x16(vec2(sk[2u * tid], sk[2u * tid + 1u]));
+        vcache[dst] = packHalf2x16(vec2(sv[2u * tid], sv[2u * tid + 1u]));
+    }
+}

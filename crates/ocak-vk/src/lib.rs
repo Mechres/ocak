@@ -191,6 +191,8 @@ struct Pipelines {
     /// Grouped (MoE expert / per-head) variant of `qmmt`, same indexing.
     qmmg: Vec<PipelineBundle>,
     moe_group: PipelineBundle,
+    inkling_kv_store: PipelineBundle,
+    inkling_attn_batch: PipelineBundle,
     argmax: PipelineBundle,
 }
 
@@ -215,7 +217,8 @@ fn qmmt_index(ty: WType) -> Option<usize> {
         WType::IQ1M => 15,
         WType::IQ4XS => 16,
         WType::IQ4NL => 17,
-        _ => return None,
+        WType::BF16 => 18,
+        WType::NVFP4 => 19,
     })
 }
 
@@ -260,7 +263,7 @@ impl Pipelines {
         .into_iter()
         .chain(self.qmmt.iter())
         .chain(self.qmmg.iter())
-        .chain(std::iter::once(&self.moe_group))
+        .chain([&self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch])
         {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -469,7 +472,7 @@ impl VkContext {
 
             let bp = |spv: &[u8], nb: u32, pc: u32| build_pipeline(&device, spv, nb, pc, use_push_desc);
             let pipelines = Pipelines {
-                rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 24)?,
+                rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv")), 3, 28)?,
                 add_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_rms_norm.spv")), 4, 24)?,
                 add: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")), 2, 12)?,
                 add_scaled: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv")), 2, 16)?,
@@ -524,9 +527,9 @@ impl VkContext {
                 situ_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), 4, 16)?,
                 add_scaled_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), 3, 24)?,
                 add_scaled_exp_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_exp_id.spv")), 5, 16)?,
-                inkling_mix: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 16)?,
+                inkling_mix: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_mix.spv")), 4, 28)?,
                 inkling_ctrl: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), 3, 16)?,
-                inkling_conv: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 32)?,
+                inkling_conv: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), 5, 48)?,
                 inkling_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn.spv")), 12, 72)?,
                 qmm_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_k.spv")), 3, 28)?,
                 qmm_q6_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q6_k.spv")), 3, 28)?,
@@ -562,6 +565,8 @@ impl VkContext {
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_m.spv")), 4, 28)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_xs.spv")), 4, 28)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_nl.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_bf16.spv")), 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_nvfp4.spv")), 4, 28)?,
                 ],
                 qmmg: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q4_k.spv")), 5, 52)?,
@@ -582,8 +587,12 @@ impl VkContext {
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq1_m.spv")), 5, 52)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq4_xs.spv")), 5, 52)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_iq4_nl.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_bf16.spv")), 5, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_nvfp4.spv")), 5, 52)?,
                 ],
                 moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), 2, 12)?,
+                inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), 4, 44)?,
+                inkling_attn_batch: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_batch.spv")), 10, 88)?,
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), 2, 8)?,
             };
 
@@ -1188,7 +1197,11 @@ impl<'a> Recorder<'a> {
     }
     /// Like `rms_norm_batch`, but rows are `stride` floats apart (normalizes the first n of each).
     pub fn rms_norm_batch_strided(&mut self, x: &Buffer, x_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, stride: u32, eps: f32, batch: u32) {
-        let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits(), stride];
+        self.rms_norm_batch_io(x, x_off, stride, w, w_off, out, out_off, stride, n, eps, batch);
+    }
+    /// Batched RMS norm with independent input / output row strides (in floats).
+    pub fn rms_norm_batch_io(&mut self, x: &Buffer, x_off: u64, x_stride: u32, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, out_stride: u32, n: u32, eps: f32, batch: u32) {
+        let pc = [off_u32(x_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits(), x_stride, out_stride];
         self.dispatch_raw(&self.ctx.pipelines.rms_norm, &[x.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
@@ -1527,13 +1540,23 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_scaled_exp_id_batch(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool) {
+        self.add_scaled_exp_id_tokens(a, b, weights, ids, dn_scales, n, slot_base, count, overwrite, 1);
+    }
+    /// Token-batched `add_scaled_exp_id_batch`: token t accumulates into a row t from b rows
+    /// t*count.. with weights/ids at slot_base + t*count..
+    pub fn add_scaled_exp_id_tokens(&mut self, a: &Buffer, b: &Buffer, weights: &Buffer, ids: &Buffer, dn_scales: &Buffer, n: u32, slot_base: u32, count: u32, overwrite: bool, batch: u32) {
         let pc = [n, slot_base, count, overwrite as u32];
-        self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add_scaled_exp_id, &[a.buf, b.buf, weights.buf, ids.buf, dn_scales.buf], bytemuck::cast_slice(&pc), n.div_ceil(256), batch, 1);
     }
 
     pub fn inkling_mix(&mut self, blocks: &Buffer, cur: &Buffer, query: &Buffer, out: &Buffer, ne: u32, blk_start: u32, n_blk: u32, n_q: u32) {
-        let pc = [ne, blk_start, n_blk, n_q];
-        self.dispatch_raw(&self.ctx.pipelines.inkling_mix, &[blocks.buf, cur.buf, query.buf, out.buf], bytemuck::cast_slice(&pc), n_q, 1, 1);
+        self.inkling_mix_batch(blocks, cur, query, out, ne, blk_start, n_blk, n_q, ne, ne, 1);
+    }
+    /// Token-batched depth mix: token t's rows sit at t*ne in `cur`, block b at b*blk_stride + t*ne,
+    /// and query q's output at q*out_q_stride + t*ne.
+    pub fn inkling_mix_batch(&mut self, blocks: &Buffer, cur: &Buffer, query: &Buffer, out: &Buffer, ne: u32, blk_start: u32, n_blk: u32, n_q: u32, blk_stride: u32, out_q_stride: u32, batch: u32) {
+        let pc = [ne, blk_start, n_blk, n_q, blk_stride, ne, out_q_stride];
+        self.dispatch_raw(&self.ctx.pipelines.inkling_mix, &[blocks.buf, cur.buf, query.buf, out.buf], bytemuck::cast_slice(&pc), n_q, batch, 1);
     }
 
     pub fn inkling_ctrl(&mut self, cur: &Buffer, cur_off: u64, msg: &Buffer, msg_off: u64, gf: &Buffer, gf_off: u64, ne: u32) {
@@ -1542,8 +1565,42 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn inkling_conv(&mut self, inp: &Buffer, inp_off: u64, wt: &Buffer, dy: &Buffer, dy_off: u64, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32) {
-        let pc = [off_u32(inp_off), off_u32(dy_off), off_u32(hist_off), off_u32(out_off), n_ch, n_conv, has_dyn as u32, head_ch];
+        self.inkling_conv_batch(inp, inp_off, n_ch, wt, dy, dy_off, 0, hist, hist_off, out, out_off, n_ch, n_ch, n_conv, has_dyn, head_ch, 1);
+    }
+    /// Short convolution over `n_tok` consecutive tokens (rows inp_stride / dy_stride / out_stride
+    /// apart), updating the history once at the end.
+    pub fn inkling_conv_batch(&mut self, inp: &Buffer, inp_off: u64, inp_stride: u32, wt: &Buffer, dy: &Buffer, dy_off: u64, dy_stride: u32, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, out_stride: u32, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32, n_tok: u32) {
+        assert!(n_conv <= 9, "inkling_conv supports n_conv <= 9");
+        let pc = [off_u32(inp_off), off_u32(dy_off), off_u32(hist_off), off_u32(out_off), n_ch, n_conv, has_dyn as u32, head_ch, n_tok, inp_stride, dy_stride, out_stride];
         self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), n_ch.div_ceil(256), 1, 1);
+    }
+
+    /// Batched Inkling prefill pass 1: clip/normalize and store K/V for tokens pos..pos+n_tok.
+    pub fn inkling_kv_store(&mut self, k: &Buffer, k_off: u64, v: &Buffer, v_off: u64, k_cache: &Buffer, v_cache: &Buffer, kv_dim: u32, n_head_kv: u32, hd: u32, is_swa: bool, cap: u32, pos: u32, kv_slot_off: u32, qk_clip: f32, eps: f32, n_tok: u32) {
+        let pc = [off_u32(k_off), off_u32(v_off), kv_dim, n_head_kv, hd, is_swa as u32, cap, pos, kv_slot_off, qk_clip.to_bits(), eps.to_bits()];
+        self.dispatch_raw(&self.ctx.pipelines.inkling_kv_store, &[k.buf, v.buf, k_cache.buf, v_cache.buf], bytemuck::cast_slice(&pc), n_head_kv, n_tok, 1);
+    }
+
+    /// Batched Inkling prefill pass 2: attention for query tokens pos..pos+n_tok (K/V already
+    /// stored). `q/r/s/g` are (offset, row stride) pairs in floats; output rows are n_head*hd.
+    pub fn inkling_attn_batch(
+        &mut self,
+        q: &Buffer, r: &Buffer, sinks: &Buffer, gate: &Buffer,
+        q_clip: &Buffer, r_clip: &Buffer, r_bias: &Buffer, k_cache: &Buffer, v_cache: &Buffer, out: &Buffer,
+        qs: (u32, u32), rs: (u32, u32), ss: (u32, u32), gs: (u32, u32),
+        n_head: u32, n_head_kv: u32, hd: u32, n_rel: u32, n_extent: u32, n_swa: u32, is_swa: bool,
+        cap: u32, pos: u32, kv_slot_off: u32, qk_clip: f32, rel_clip: f32, log_alpha: f32, log_floor: f32, n_tok: u32,
+    ) {
+        let pc = [
+            qs.0, qs.1, rs.0, rs.1, ss.0, ss.1, gs.0, gs.1,
+            n_head, n_head_kv, hd, n_rel, n_extent, n_swa, is_swa as u32, cap, pos, kv_slot_off,
+            qk_clip.to_bits(), rel_clip.to_bits(), log_alpha.to_bits(), log_floor.to_bits(),
+        ];
+        self.dispatch_raw(
+            &self.ctx.pipelines.inkling_attn_batch,
+            &[q.buf, r.buf, sinks.buf, gate.buf, q_clip.buf, r_clip.buf, r_bias.buf, k_cache.buf, v_cache.buf, out.buf],
+            bytemuck::cast_slice(&pc), n_head, n_tok, 1,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2133,7 +2190,7 @@ mod tests {
         let n_ent = batch * n_used;
         let by_g = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
         let by_r = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
-        for wt in [WType::IQ3S, WType::Q4K, WType::IQ4NL, WType::Q8_0] {
+        for wt in [WType::IQ3S, WType::Q4K, WType::IQ4NL, WType::Q8_0, WType::NVFP4] {
             let rb = wt.row_bytes(k as u32) as usize;
             let slice = m * rb;
             let raw: Vec<u8> = (0..n_exp * slice).map(|_| (next() & 0x3F) as u8).collect();
@@ -2199,7 +2256,7 @@ mod tests {
         for wt in [
             WType::Q4K, WType::Q5K, WType::Q6K, WType::Q2K, WType::Q3K, WType::Q8_0, WType::Q4_0, WType::F16, WType::F32,
             WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS,
-            WType::IQ4NL,
+            WType::IQ4NL, WType::BF16, WType::NVFP4,
         ] {
             assert!(qmmt_index(wt).is_some());
             let rb = wt.row_bytes(k as u32) as usize;

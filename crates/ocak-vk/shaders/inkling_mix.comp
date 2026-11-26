@@ -4,17 +4,20 @@ layout(set = 0, binding = 0) readonly buffer Blocks { float blk[]; }; // [n_bloc
 layout(set = 0, binding = 1) readonly buffer Cur { float cur[]; };    // [ne] (raw, we norm it here)
 layout(set = 0, binding = 2) readonly buffer Query { float q[]; };    // [n_q * ne]
 layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };     // [n_q * ne]
-layout(push_constant) uniform PC { uint ne; uint blk_start; uint n_blk; uint n_q; } pc;
+// Batched: workgroup y = token t. Token t's cur row is t * tok_stride, its block `st` row is
+// st * blk_stride + t * tok_stride, and output query q goes to q * out_q_stride + t * tok_stride.
+layout(push_constant) uniform PC { uint ne; uint blk_start; uint n_blk; uint n_q; uint blk_stride; uint tok_stride; uint out_q_stride; } pc;
 shared float sbuf[256];
 shared float cur_norm[4096];
 shared float sc[32];
 void main() {
     uint q_idx = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
+    uint toff = gl_WorkGroupID.y * pc.tok_stride;
     // 1. RMSNorm(cur, 1e-6) into cur_norm
     float ss = 0.0;
     for (uint i = tid; i < pc.ne; i += 256u) {
-        float v = cur[i];
+        float v = cur[toff + i];
         ss += v * v;
     }
     sbuf[tid] = ss;
@@ -25,7 +28,7 @@ void main() {
     }
     float inv_rms = inversesqrt(sbuf[0] / float(pc.ne) + 1e-6);
     barrier();
-    for (uint i = tid; i < pc.ne; i += 256u) cur_norm[i] = cur[i] * inv_rms;
+    for (uint i = tid; i < pc.ne; i += 256u) cur_norm[i] = cur[toff + i] * inv_rms;
     barrier();
 
     // 2. Compute dot scores with blocks[blk_start..blk_start+n_blk] and cur_norm
@@ -35,7 +38,7 @@ void main() {
     for (uint st = 0u; st < n_st; st++) {
         float dot = 0.0;
         if (st < pc.n_blk) {
-            uint b_base = (pc.blk_start + st) * pc.ne;
+            uint b_base = (pc.blk_start + st) * pc.blk_stride + toff;
             for (uint i = tid; i < pc.ne; i += 256u) dot += blk[b_base + i] * q[q_base + i];
         } else {
             for (uint i = tid; i < pc.ne; i += 256u) dot += cur_norm[i] * q[q_base + i];
@@ -63,8 +66,8 @@ void main() {
     for (uint i = tid; i < pc.ne; i += 256u) {
         float acc = sc[pc.n_blk] * cur_norm[i];
         for (uint st = 0u; st < pc.n_blk; st++) {
-            acc += sc[st] * blk[(pc.blk_start + st) * pc.ne + i];
+            acc += sc[st] * blk[(pc.blk_start + st) * pc.blk_stride + toff + i];
         }
-        o[q_base + i] = acc;
+        o[q_idx * pc.out_q_stride + toff + i] = acc;
     }
 }
