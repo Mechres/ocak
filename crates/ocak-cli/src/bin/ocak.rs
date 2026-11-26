@@ -67,6 +67,13 @@ enum Cmd {
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
     },
+    /// Long-context counting parity test ("Counting: 1, 2, ..., N," -> expects N+1) across native architectures
+    CountTest {
+        #[arg(long, default_value = "/home/mechres/models")]
+        models_dir: PathBuf,
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
     /// Zero-dependency ANSI live dashboard polling ocakd
     Top {
         #[arg(long, default_value = "127.0.0.1:8090")]
@@ -237,6 +244,71 @@ async fn main() -> Result<()> {
             let text = asr.transcribe_wav(&bytes, max_tokens)?;
             println!("{text}");
             eprintln!("Transcribed {} bytes in {} ms", bytes.len(), t1.elapsed().as_millis());
+        }
+        Cmd::CountTest { models_dir, model } => {
+            let targets: Vec<PathBuf> = if let Some(m) = model {
+                vec![m]
+            } else {
+                [
+                    "Qwen3.5-4B-Q4_K_M.gguf",
+                    "LFM3-1.7B-AD-Q6_K.gguf",
+                    "LFM2.5-2.6B-Q4_K_M.gguf",
+                    "minicpm5-2b-abliterated-Q4_K_M.gguf",
+                    "Qwopus3.5-9B-coder-Exp-Q4_K_M.gguf",
+                    "RVN-IQ2_S-mtp.gguf",
+                    "Xing4.0-29B-A4B-IQ3_XXS.gguf",
+                    "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+                ]
+                .iter()
+                .map(|f| models_dir.join(f))
+                .collect()
+            };
+            let make_prompt = |n: usize| -> String {
+                let nums: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+                format!("Counting: {},", nums.join(", "))
+            };
+            println!("{:<36} {:<16} {:<16}", "MODEL", "N=20 (exp 21)", "N=120 (exp 121)");
+            let mut failed = 0usize;
+            for path in targets {
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+                if !path.exists() {
+                    println!("{:<36} {:<16} {:<16}", name, "SKIP", "SKIP");
+                    continue;
+                }
+                let mut eng = NativeEngine::load(
+                    &path,
+                    EngineOptions { backend: BackendKind::Vulkan, max_ctx: 1024, kv_pages: 128 },
+                )?;
+                let mut row = Vec::new();
+                for n in [20usize, 120usize] {
+                    let prompt = make_prompt(n);
+                    let exp = (n + 1).to_string();
+                    let gr = eng.generate(
+                        &GenRequest {
+                            prompt,
+                            parse_special: false,
+                            max_tokens: 6,
+                            sampler: SamplerParams { temperature: 0.0, ..Default::default() },
+                            stop: Vec::new(),
+                            json_mode: false,
+                            thinking: None,
+                        },
+                        |_, _| true,
+                    )?;
+                    let got = gr.text.trim_start().to_string();
+                    let ok = got.starts_with(&exp);
+                    if !ok {
+                        failed += 1;
+                    }
+                    let preview: String = got.replace('\n', "\\n").chars().take(10).collect();
+                    row.push(format!("{} ({preview:?})", if ok { "PASS" } else { "FAIL" }));
+                }
+                println!("{:<36} {:<16} {:<16}", name, row[0], row[1]);
+                drop(eng);
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} counting parity check(s) failed");
+            }
         }
         Cmd::Top { addr } => {
             let clean = addr.trim_start_matches("http://").to_string();

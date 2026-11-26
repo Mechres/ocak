@@ -129,7 +129,11 @@ impl Tokenizer {
             .get_bool("tokenizer.ggml.add_space_prefix")
             .unwrap_or(kind == VocabKind::Spm);
         let pre = g.get_str("tokenizer.ggml.pre").unwrap_or("");
-        let llama3_pre = pre.contains("llama3") || pre.contains("llama-bpe");
+        let llama3_pre = pre.contains("llama3")
+            || pre.contains("llama-bpe")
+            || pre.contains("minicpm")
+            || pre.contains("inkling")
+            || pre.contains("lfm");
         let chat_template = g.get_str("tokenizer.chat_template").map(|s| s.to_string());
 
         Ok(Self {
