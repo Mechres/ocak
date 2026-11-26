@@ -48,12 +48,19 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let models_dir = std::env::var("OCAK_MODELS_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join("models"))
+                    .unwrap_or_else(|_| PathBuf::from("./models"))
+            });
+        let presets_path = models_dir.join("models-preset.ini");
         Self {
-            models_dirs: vec![
-                PathBuf::from("/home/mechres/models"),
-                PathBuf::from("/home/mechres/Projeler/mergen/models"),
-            ],
-            presets_path: PathBuf::from("/home/mechres/models/models-preset.ini"),
+            models_dirs: vec![models_dir],
+            presets_path,
             sleep_idle_seconds: 120,
             backend: BackendKind::Vulkan,
             max_ctx: 2048,
@@ -1405,13 +1412,26 @@ mod tests {
         (st, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    fn find_test_tinyllama() -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let candidates = [
+            PathBuf::from(&home).join("models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"),
+            PathBuf::from(&home).join("Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"),
+        ];
+        candidates.into_iter().find(|p| p.exists())
+    }
+
     #[tokio::test]
     async fn end_to_end_openai_anthropic_embeddings_radix_kv_and_warm_sleep() {
-        let model_path = PathBuf::from("/home/mechres/Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf");
-        if !model_path.exists() {
+        let Some(model_path) = find_test_tinyllama() else {
             return;
+        };
+        let mut cfg = ServerConfig { sleep_idle_seconds: 2, ..Default::default() };
+        if let Some(dir) = model_path.parent() {
+            if !cfg.models_dirs.iter().any(|d| d == dir) {
+                cfg.models_dirs.push(dir.to_path_buf());
+            }
         }
-        let cfg = ServerConfig { sleep_idle_seconds: 2, ..Default::default() };
         let state = AppState::new(cfg);
         state.spawn_watchdog();
         let app = build_router(state.clone());
@@ -1631,11 +1651,16 @@ mod tests {
 
     #[tokio::test]
     async fn slow_sse_does_not_stall_batch_and_swap_queues_cleanly() {
-        let tiny = PathBuf::from("/home/mechres/Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf");
-        if !tiny.exists() {
+        let Some(tiny) = find_test_tinyllama() else {
             return;
+        };
+        let mut cfg = ServerConfig::default();
+        if let Some(dir) = tiny.parent() {
+            if !cfg.models_dirs.iter().any(|d| d == dir) {
+                cfg.models_dirs.push(dir.to_path_buf());
+            }
         }
-        let state = AppState::new(ServerConfig::default());
+        let state = AppState::new(cfg);
         let entry_tiny = state.find_model("tinyllama-1.1b-chat-v1.0.Q4_K_M").unwrap().clone();
         state.ensure_native(&entry_tiny).await.unwrap();
 

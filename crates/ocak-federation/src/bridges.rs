@@ -64,9 +64,19 @@ pub struct ManagedLlamaBridge {
 
 impl Default for ManagedLlamaBridge {
     fn default() -> Self {
+        let root = std::env::var("LLAMA_CPP_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join("llama.cpp"))
+                    .unwrap_or_else(|_| PathBuf::from("./llama.cpp"))
+            });
+        let lib_dir = root.join("build/bin");
         Self {
-            bin_path: PathBuf::from("/home/mechres/llama.cpp/build/bin/llama-server"),
-            lib_dir: PathBuf::from("/home/mechres/llama.cpp/build/bin"),
+            bin_path: lib_dir.join("llama-server"),
+            lib_dir,
         }
     }
 }
@@ -157,7 +167,15 @@ pub struct StrataBridge {
 
 impl StrataBridge {
     pub fn probe() -> Self {
-        let root = PathBuf::from("/home/mechres/Strata");
+        let root = std::env::var("STRATA_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join("Strata"))
+                    .unwrap_or_else(|_| PathBuf::from("./Strata"))
+            });
         Self {
             binary_present: root.join("engine/strata").exists(),
             root,

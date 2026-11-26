@@ -10,7 +10,6 @@ pub use tokenizer::{IncrementalDetokenizer, TokError, Tokenizer};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn incremental_detok_multibyte() {
@@ -55,11 +54,20 @@ mod tests {
         }
     }
 
+    fn home_model(rel: &str) -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let p = std::path::PathBuf::from(home).join(rel);
+        p.exists().then_some(p)
+    }
+
     #[test]
     fn tinyllama_real_gguf_tokenizer() {
-        let p = Path::new("/home/mechres/Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf");
-        if !p.exists() { return; }
-        let gf = ocak_gguf::GgufFile::open(p).unwrap();
+        let Some(p) = home_model("models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
+            .or_else(|| home_model("Projeler/mergen/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+        else {
+            return;
+        };
+        let gf = ocak_gguf::GgufFile::open(&p).unwrap();
         let tok = Tokenizer::from_gguf(&gf).unwrap();
         assert_eq!(tok.encode("Hello world", true, false), vec![1, 15043, 3186]);
         let rt = "The capital of France is Paris! 🚀";
@@ -73,9 +81,8 @@ mod tests {
 
     #[test]
     fn qwen35_real_gguf_tokenizer() {
-        let p = Path::new("/home/mechres/models/Qwen3.5-4B-Q4_K_M.gguf");
-        if !p.exists() { return; }
-        let gf = ocak_gguf::GgufFile::open(p).unwrap();
+        let Some(p) = home_model("models/Qwen3.5-4B-Q4_K_M.gguf") else { return; };
+        let gf = ocak_gguf::GgufFile::open(&p).unwrap();
         let tok = Tokenizer::from_gguf(&gf).unwrap();
         let s = "Hello 123, dünya!\nNext line.";
         let ids = tok.encode(s, false, false);
@@ -114,9 +121,9 @@ mod tests {
     fn bpe_and_spm_scale_linearly_on_large_inputs() {
         let big_chunk = "The quick brown fox jumps over the lazy dog 1234567890! ";
         let big_text = big_chunk.repeat(600); // ~33 KB
-        let p_qwen = Path::new("/home/mechres/models/Qwen3.5-4B-Q4_K_M.gguf");
-        if p_qwen.exists() {
-            let gf = ocak_gguf::GgufFile::open(p_qwen).unwrap();
+        let p_qwen = home_model("models/Qwen3.5-4B-Q4_K_M.gguf");
+        if let Some(ref p) = p_qwen {
+            let gf = ocak_gguf::GgufFile::open(p).unwrap();
             let tok = Tokenizer::from_gguf(&gf).unwrap();
             let t0 = std::time::Instant::now();
             let ids = tok.encode(&big_text, false, false);
@@ -127,8 +134,8 @@ mod tests {
         }
         // Also test a long single contiguous word (worst case for quadratic BPE!)
         let long_word = "supercalifragilisticexpialidocious".repeat(80); // 2720 chars, single pre-token
-        if p_qwen.exists() {
-            let gf = ocak_gguf::GgufFile::open(p_qwen).unwrap();
+        if let Some(ref p) = p_qwen {
+            let gf = ocak_gguf::GgufFile::open(p).unwrap();
             let tok = Tokenizer::from_gguf(&gf).unwrap();
             let t0 = std::time::Instant::now();
             let ids = tok.encode(&long_word, false, false);

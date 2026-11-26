@@ -16,16 +16,27 @@ struct Cli {
     cmd: Cmd,
 }
 
+fn default_models_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("OCAK_MODELS_DIR") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join("models"))
+        .unwrap_or_else(|_| PathBuf::from("./models"))
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Print live GPU/CPU/Vulkan/HIP hardware telemetry
     Hw,
     /// Inspect local GGUF models, .digest SHA-256 cache, and models-preset.ini
     Inspect {
-        #[arg(long, default_value = "/home/mechres/models")]
-        models_dir: PathBuf,
-        #[arg(long, default_value = "/home/mechres/Projeler/mergen/models")]
-        extra_dir: PathBuf,
+        #[arg(long, env = "OCAK_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+        #[arg(long)]
+        extra_dir: Option<PathBuf>,
     },
     /// Run native ground-up generation directly on Vulkan or CPU AVX2
     Run {
@@ -58,10 +69,10 @@ enum Cmd {
     },
     /// Transcribe a WAV file natively using Qwen3-ASR (qwen3a mmproj + qwen3vl Vulkan decoder)
     Asr {
-        #[arg(long, default_value = "/home/mechres/models/Qwen3-ASR-1.7B/Qwen3-ASR-1.7B-Q8_0.gguf")]
-        model: PathBuf,
-        #[arg(long, default_value = "/home/mechres/models/Qwen3-ASR-1.7B/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf")]
-        mmproj: PathBuf,
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
         #[arg(long)]
         wav: PathBuf,
         #[arg(long, default_value_t = 128)]
@@ -69,15 +80,15 @@ enum Cmd {
     },
     /// Long-context counting parity test ("Counting: 1, 2, ..., N," -> expects N+1) across native architectures
     CountTest {
-        #[arg(long, default_value = "/home/mechres/models")]
-        models_dir: PathBuf,
+        #[arg(long, env = "OCAK_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
         #[arg(long)]
         model: Option<PathBuf>,
     },
     /// Benchmark prefill and decode throughput across local native GGUF models and emit a Markdown table
     Bench {
-        #[arg(long, default_value = "/home/mechres/models")]
-        models_dir: PathBuf,
+        #[arg(long, env = "OCAK_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
         #[arg(long)]
         filter: Option<String>,
         #[arg(long, default_value_t = 128)]
@@ -130,8 +141,13 @@ async fn main() -> Result<()> {
             println!("Strata: binary_present={} ({})", strata.binary_present, strata.root.display());
         }
         Cmd::Inspect { models_dir, extra_dir } => {
+            let models_dir = models_dir.unwrap_or_else(default_models_dir);
             let presets = Presets::load(&models_dir.join("models-preset.ini"));
-            let entries = scan(&[models_dir, extra_dir]);
+            let mut dirs = vec![models_dir];
+            if let Some(ed) = extra_dir {
+                dirs.push(ed);
+            }
+            let entries = scan(&dirs);
             println!("{:<34} {:<10} {:>8} {:<14} {:<10} QUANTS", "MODEL", "ARCH", "SIZE", "BACKEND", "SHA256");
             for e in entries {
                 let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "qwen3vl" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") { "native-vk" } else { "bridge-llama" };
@@ -249,6 +265,9 @@ async fn main() -> Result<()> {
             println!("  Main trunk +2 verify  : {true2} ({:?}) | match={}", eng.tokenizer.token_text(true2).unwrap_or("?"), draft2 == true2);
         }
         Cmd::Asr { model, mmproj, wav, max_tokens } => {
+            let base = default_models_dir().join("Qwen3-ASR-1.7B");
+            let model = model.unwrap_or_else(|| base.join("Qwen3-ASR-1.7B-Q8_0.gguf"));
+            let mmproj = mmproj.unwrap_or_else(|| base.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"));
             let t0 = std::time::Instant::now();
             let mut asr = ocak_engine::asr::Qwen3AsrEngine::load(&model, &mmproj, true)?;
             eprintln!("Loaded Qwen3-ASR native (qwen3a + {}) in {} ms", asr.decoder.backend_name(), t0.elapsed().as_millis());
@@ -259,6 +278,7 @@ async fn main() -> Result<()> {
             eprintln!("Transcribed {} bytes in {} ms", bytes.len(), t1.elapsed().as_millis());
         }
         Cmd::CountTest { models_dir, model } => {
+            let models_dir = models_dir.unwrap_or_else(default_models_dir);
             let targets: Vec<PathBuf> = if let Some(m) = model {
                 vec![m]
             } else {
@@ -324,6 +344,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Bench { models_dir, filter, prompt_tokens, decode_tokens, backend } => {
+            let models_dir = models_dir.unwrap_or_else(default_models_dir);
             let bk = if backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
             let mut entries: Vec<_> = scan(&[models_dir])
                 .into_iter()

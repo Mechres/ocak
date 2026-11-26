@@ -1552,14 +1552,14 @@ impl XingExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     #[ignore]
     fn xing_vk_vs_cpu_parity() {
-        let p = Path::new("/home/mechres/models/Xing4.0-29B-A4B-IQ3_XXS.gguf");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let p = std::path::PathBuf::from(home).join("models/Xing4.0-29B-A4B-IQ3_XXS.gguf");
         if !p.exists() { return; }
-        let g = Arc::new(GgufFile::open(p).unwrap());
+        let g = Arc::new(GgufFile::open(&p).unwrap());
         let mut vk = XingExec::new(Arc::clone(&g), true, 64, 0).unwrap();
         let mut cpu = XingExec::new(Arc::clone(&g), false, 64, 40).unwrap();
         let toks = [1u32, 100, 200];

@@ -63,7 +63,12 @@ mod tests {
     }
     #[test]
     fn parses_real_preset() {
-        let p = Presets::load(std::path::Path::new("/home/mechres/models/models-preset.ini"));
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::path::PathBuf::from(home).join("models/models-preset.ini");
+        if !path.exists() {
+            return;
+        }
+        let p = Presets::load(&path);
         if !p.models.is_empty() {
             assert_eq!(p.resolve("Xing4.0-29B-A4B-IQ3_M")["n-cpu-moe"], "10");
             assert_eq!(p.defaults["sleep-idle-seconds"], "120");

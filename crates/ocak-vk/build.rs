@@ -81,21 +81,34 @@ fn main() {
         "qmm2_iq3_s",
         "argmax",
     ];
+    let has_glslc = Command::new("glslc").arg("--version").output().is_ok();
+    let has_usr_glslc = !has_glslc && Command::new("/usr/bin/glslc").arg("--version").output().is_ok();
+    let has_glslang = !has_glslc
+        && !has_usr_glslc
+        && Command::new("glslangValidator").arg("--version").output().is_ok();
+    if !has_glslc && !has_usr_glslc && !has_glslang {
+        panic!("neither `glslc` (shaderc) nor `glslangValidator` (glslang-tools) found in PATH");
+    }
     for name in shaders {
         let src = format!("shaders/{name}.comp");
         println!("cargo:rerun-if-changed={src}");
         let dst = out_dir.join(format!("{name}.spv"));
-        let glslc = if Command::new("glslc").arg("--version").output().is_ok() {
-            "glslc"
+        let status = if has_glslc || has_usr_glslc {
+            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
+            Command::new(bin)
+                .args(["--target-env=vulkan1.3", "-O", &src, "-o"])
+                .arg(&dst)
+                .status()
+                .expect("failed to invoke glslc")
         } else {
-            "/usr/bin/glslc"
+            Command::new("glslangValidator")
+                .args(["-V", "--target-env", "vulkan1.3", "-o"])
+                .arg(&dst)
+                .arg(&src)
+                .status()
+                .expect("failed to invoke glslangValidator")
         };
-        let status = Command::new(glslc)
-            .args(["--target-env=vulkan1.3", "-O", &src, "-o"])
-            .arg(&dst)
-            .status()
-            .expect("failed to invoke glslc");
-        assert!(status.success(), "glslc failed on {src}");
+        assert!(status.success(), "shader compilation failed on {src}");
         let _ = fs::metadata(&dst).expect("spv missing");
     }
 }

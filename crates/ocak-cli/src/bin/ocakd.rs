@@ -13,12 +13,12 @@ struct Args {
     port: u16,
     #[arg(long)]
     compat_port: Option<u16>,
-    #[arg(long, default_value = "/home/mechres/models")]
-    models_dir: PathBuf,
-    #[arg(long, default_value = "/home/mechres/Projeler/mergen/models")]
-    extra_models_dir: PathBuf,
-    #[arg(long, default_value = "/home/mechres/models/models-preset.ini")]
-    presets: PathBuf,
+    #[arg(long, env = "OCAK_MODELS_DIR")]
+    models_dir: Option<PathBuf>,
+    #[arg(long)]
+    extra_models_dir: Option<PathBuf>,
+    #[arg(long)]
+    presets: Option<PathBuf>,
     #[arg(long, default_value_t = 120)]
     sleep_idle_seconds: u64,
     #[arg(long, default_value_t = 2048)]
@@ -38,9 +38,19 @@ async fn main() -> anyhow::Result<()> {
     let backend = if args.backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
     let allow_remote_host = !matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1")
         || std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1");
+    let models_dir = args.models_dir.unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join("models"))
+            .unwrap_or_else(|_| PathBuf::from("./models"))
+    });
+    let presets_path = args.presets.unwrap_or_else(|| models_dir.join("models-preset.ini"));
+    let mut models_dirs = vec![models_dir];
+    if let Some(extra) = args.extra_models_dir {
+        models_dirs.push(extra);
+    }
     let cfg = ServerConfig {
-        models_dirs: vec![args.models_dir, args.extra_models_dir],
-        presets_path: args.presets,
+        models_dirs,
+        presets_path,
         sleep_idle_seconds: args.sleep_idle_seconds,
         backend,
         max_ctx: args.max_ctx,
