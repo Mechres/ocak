@@ -34,6 +34,8 @@ pub enum GgmlType {
     F64,
     IQ1M,
     BF16,
+    MXFP4,
+    NVFP4,
     Other(u32),
 }
 
@@ -45,7 +47,7 @@ impl GgmlType {
             10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K, 15 => Q8K,
             16 => IQ2XXS, 17 => IQ2XS, 18 => IQ3XXS, 19 => IQ1S, 20 => IQ4NL, 21 => IQ3S,
             22 => IQ2S, 23 => IQ4XS, 24 => I8, 25 => I16, 26 => I32, 27 => I64, 28 => F64,
-            29 => IQ1M, 30 => BF16, o => Other(o),
+            29 => IQ1M, 30 => BF16, 39 => MXFP4, 40 => NVFP4, o => Other(o),
         }
     }
 
@@ -56,7 +58,7 @@ impl GgmlType {
             Q2K => 10, Q3K => 11, Q4K => 12, Q5K => 13, Q6K => 14, Q8K => 15,
             IQ2XXS => 16, IQ2XS => 17, IQ3XXS => 18, IQ1S => 19, IQ4NL => 20, IQ3S => 21,
             IQ2S => 22, IQ4XS => 23, I8 => 24, I16 => 25, I32 => 26, I64 => 27, F64 => 28,
-            IQ1M => 29, BF16 => 30, Other(o) => o,
+            IQ1M => 29, BF16 => 30, MXFP4 => 39, NVFP4 => 40, Other(o) => o,
         }
     }
 
@@ -105,6 +107,8 @@ impl GgmlType {
             IQ1M => (QK_K, 56),
             IQ4NL => (32, 18),
             IQ4XS => (QK_K, 136),
+            MXFP4 => (32, 17),
+            NVFP4 => (64, 36),
             Other(_) => return None,
         })
     }
@@ -120,8 +124,27 @@ impl GgmlType {
     /// Types `dequantize_row` implements.
     pub fn dequant_supported(self) -> bool {
         use GgmlType::*;
-        matches!(self, F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K | IQ2XS | IQ3XXS | IQ3S | IQ4NL | IQ4XS)
+        matches!(
+            self,
+            F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K
+                | IQ2XXS | IQ2XS | IQ2S | IQ3XXS | IQ3S | IQ1S | IQ1M | IQ4NL | IQ4XS | NVFP4
+        )
     }
+}
+
+#[inline]
+pub fn ue4m3_to_fp32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0xF) as i32;
+    let man = (x & 0x7) as f32;
+    let raw = if exp == 0 {
+        man * 2.0f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2.0f32.powi(exp - 7)
+    };
+    raw * 0.5
 }
 
 #[inline]
@@ -471,6 +494,139 @@ pub fn dequantize_row(t: GgmlType, src: &[u8], dst: &mut [f32], n: usize) {
                     for j in 0..16 {
                         dst[out + j] = dl * KVALUES_IQ4NL[(q[j] & 0xF) as usize] as f32;
                         dst[out + j + 16] = dl * KVALUES_IQ4NL[(q[j] >> 4) as usize] as f32;
+                    }
+                }
+            }
+        }
+        IQ2XXS => {
+            use crate::iq_tables::{IQ2XXS_GRID, KSIGNS_IQ2XS};
+            for (bi, b) in src.chunks_exact(66).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let qs = &b[2..66];
+                let mut out = bi * QK_K;
+                for ib32 in 0..8 {
+                    let a0 = u32::from_le_bytes(qs[ib32 * 8..ib32 * 8 + 4].try_into().unwrap());
+                    let a1 = u32::from_le_bytes(qs[ib32 * 8 + 4..ib32 * 8 + 8].try_into().unwrap());
+                    let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                    for l in 0..4 {
+                        let gidx = ((a0 >> (8 * l)) & 0xFF) as usize;
+                        let grid = IQ2XXS_GRID[gidx].to_le_bytes();
+                        let signs = KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
+                        for j in 0..8 {
+                            dst[out] = db * grid[j] as f32 * if (signs & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        IQ2S => {
+            use crate::iq_tables::IQ2S_GRID;
+            for (bi, b) in src.chunks_exact(82).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let qs = &b[2..34];
+                let signs_all = &b[34..66];
+                let qh = &b[66..74];
+                let scales = &b[74..82];
+                let mut out = bi * QK_K;
+                for ib32 in 0..8 {
+                    let db = [
+                        d * (0.5 + (scales[ib32] & 0xF) as f32) * 0.25,
+                        d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+                    ];
+                    for l in 0..4 {
+                        let dl = db[l / 2];
+                        let q_lo = qs[ib32 * 4 + l] as usize;
+                        let q_hi = ((qh[ib32] as usize) << (8 - 2 * l)) & 0x300;
+                        let grid = IQ2S_GRID[q_lo | q_hi].to_le_bytes();
+                        let sg = signs_all[ib32 * 4 + l];
+                        for j in 0..8 {
+                            dst[out] = dl * grid[j] as f32 * if (sg & (1 << j)) != 0 { -1.0 } else { 1.0 };
+                            out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        IQ1S => {
+            use crate::iq_tables::IQ1S_GRID;
+            const IQ1S_DELTA: f32 = 0.125;
+            for (bi, b) in src.chunks_exact(50).take(n / QK_K).enumerate() {
+                let d = f16_at(b, 0);
+                let qs = &b[2..34];
+                let qh = &b[34..50];
+                let mut out = bi * QK_K;
+                for ib in 0..8 {
+                    let qhb = u16::from_le_bytes([qh[2 * ib], qh[2 * ib + 1]]);
+                    let dl = d * (2 * ((qhb >> 12) & 7) + 1) as f32;
+                    let delta = if (qhb & 0x8000) != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+                    for l in 0..4 {
+                        let idx = (qs[ib * 4 + l] as usize) | ((((qhb >> (3 * l)) & 7) as usize) << 8);
+                        let grid = IQ1S_GRID[idx].to_le_bytes();
+                        for j in 0..8 {
+                            dst[out] = dl * ((grid[j] as i8) as f32 + delta);
+                            out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        IQ1M => {
+            use crate::iq_tables::IQ1S_GRID;
+            const IQ1M_DELTA: f32 = 0.125;
+            for (bi, b) in src.chunks_exact(56).take(n / QK_K).enumerate() {
+                let qs = &b[0..32];
+                let qh = &b[32..48];
+                let sc = [
+                    u16::from_le_bytes([b[48], b[49]]),
+                    u16::from_le_bytes([b[50], b[51]]),
+                    u16::from_le_bytes([b[52], b[53]]),
+                    u16::from_le_bytes([b[54], b[55]]),
+                ];
+                let d_bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+                let d = f16::from_bits(d_bits).to_f32();
+                let mut out = bi * QK_K;
+                for ib in 0..8 {
+                    let s16 = sc[ib / 2];
+                    let sh = 6 * (ib % 2);
+                    let dl1 = d * (2 * ((s16 >> sh) & 7) + 1) as f32;
+                    let dl2 = d * (2 * ((s16 >> (sh + 3)) & 7) + 1) as f32;
+                    let (q0, q1) = (qh[ib * 2] as usize, qh[ib * 2 + 1] as usize);
+                    let idxs = [
+                        (qs[ib * 4] as usize) | ((q0 << 8) & 0x700),
+                        (qs[ib * 4 + 1] as usize) | ((q0 << 4) & 0x700),
+                        (qs[ib * 4 + 2] as usize) | ((q1 << 8) & 0x700),
+                        (qs[ib * 4 + 3] as usize) | ((q1 << 4) & 0x700),
+                    ];
+                    let deltas = [
+                        if (q0 & 0x08) != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
+                        if (q0 & 0x80) != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
+                        if (q1 & 0x08) != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
+                        if (q1 & 0x80) != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
+                    ];
+                    for l in 0..4 {
+                        let dl = if l < 2 { dl1 } else { dl2 };
+                        let grid = IQ1S_GRID[idxs[l]].to_le_bytes();
+                        for j in 0..8 {
+                            dst[out] = dl * ((grid[j] as i8) as f32 + deltas[l]);
+                            out += 1;
+                        }
+                    }
+                }
+            }
+        }
+        NVFP4 => {
+            use crate::iq_tables::KVALUES_FP4;
+            for (bi, b) in src.chunks_exact(36).take(n / 64).enumerate() {
+                let d_bytes = &b[0..4];
+                let qs = &b[4..36];
+                for s in 0..4 {
+                    let d = ue4m3_to_fp32(d_bytes[s]);
+                    let out = bi * 64 + s * 16;
+                    for j in 0..8 {
+                        let qv = qs[s * 8 + j];
+                        dst[out + j] = KVALUES_FP4[(qv & 0xF) as usize] as f32 * d;
+                        dst[out + 8 + j] = KVALUES_FP4[(qv >> 4) as usize] as f32 * d;
                     }
                 }
             }

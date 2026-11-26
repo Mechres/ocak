@@ -274,7 +274,10 @@ macro_rules! dispatch_row {
             GgmlType::Q4K => dot_q4k($w, $x),
             GgmlType::Q5K => dot_q5k($w, $x),
             GgmlType::Q6K => dot_q6k($w, $x),
-            GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS => dot_iq_generic($ty, $w, $x),
+            GgmlType::IQ2XXS | GgmlType::IQ2XS | GgmlType::IQ2S | GgmlType::IQ3XXS | GgmlType::IQ3S
+            | GgmlType::IQ1S | GgmlType::IQ1M | GgmlType::IQ4NL | GgmlType::IQ4XS | GgmlType::NVFP4 => {
+                dot_iq_generic($ty, $w, $x)
+            }
             t => panic!("cpu gemv: unsupported type {}", t.name()),
         }
     };
@@ -291,7 +294,13 @@ fn row_dot_scalar(ty: GgmlType, w: &[u8], x: &[f32]) -> f32 {
 }
 
 pub fn supported(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K | GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS)
+    matches!(
+        ty,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q4_0 | GgmlType::Q8_0
+            | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+            | GgmlType::IQ2XXS | GgmlType::IQ2XS | GgmlType::IQ2S | GgmlType::IQ3XXS | GgmlType::IQ3S
+            | GgmlType::IQ1S | GgmlType::IQ1M | GgmlType::IQ4NL | GgmlType::IQ4XS | GgmlType::NVFP4
+    )
 }
 
 /// Dot product of one quantised row (`k` elements) with `x`.
@@ -340,7 +349,8 @@ mod tests {
             GgmlType::Q2K => &[80, 82],
             GgmlType::Q3K => &[108],
             GgmlType::Q6K => &[208],
-            GgmlType::IQ2XS | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ4NL | GgmlType::IQ4XS => &[0],
+            GgmlType::IQ2XXS | GgmlType::IQ2XS | GgmlType::IQ2S | GgmlType::IQ3XXS | GgmlType::IQ3S
+            | GgmlType::IQ1S | GgmlType::IQ4NL | GgmlType::IQ4XS => &[0],
             _ => &[],
         }
     }
@@ -361,6 +371,21 @@ mod tests {
             for c in v.chunks_exact_mut(2) {
                 c.copy_from_slice(&half::bf16::from_f32(rng.f()).to_le_bytes());
             }
+        } else if matches!(ty, GgmlType::IQ1M) {
+            for blk in v.chunks_exact_mut(bb) {
+                let d = f16::from_f32(rng.f() * 0.05).to_bits();
+                for s in 0..4 {
+                    let lo = (rng.next() as u16) & 0x0FFF;
+                    let hi = ((d >> (4 * s)) & 0xF) << 12;
+                    blk[48 + 2 * s..50 + 2 * s].copy_from_slice(&(lo | hi).to_le_bytes());
+                }
+            }
+        } else if matches!(ty, GgmlType::NVFP4) {
+            for blk in v.chunks_exact_mut(bb) {
+                for s in 0..4 {
+                    blk[s] = (rng.next() as u8) & 0x7E;
+                }
+            }
         } else {
             for blk in v.chunks_exact_mut(bb) {
                 for &o in scale_offsets(ty) {
@@ -374,7 +399,12 @@ mod tests {
     #[test]
     fn gemv_matches_dequant_reference_for_all_types() {
         let mut rng = Lcg(42);
-        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K, GgmlType::IQ2XS, GgmlType::IQ3XXS, GgmlType::IQ3S, GgmlType::IQ4NL, GgmlType::IQ4XS] {
+        for ty in [
+            GgmlType::F32, GgmlType::F16, GgmlType::BF16, GgmlType::Q4_0, GgmlType::Q8_0,
+            GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K,
+            GgmlType::IQ2XXS, GgmlType::IQ2XS, GgmlType::IQ2S, GgmlType::IQ3XXS, GgmlType::IQ3S,
+            GgmlType::IQ1S, GgmlType::IQ1M, GgmlType::IQ4NL, GgmlType::IQ4XS, GgmlType::NVFP4,
+        ] {
             let (k, m) = (512usize, 37usize);
             let w = random_rows(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();

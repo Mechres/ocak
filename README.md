@@ -1,23 +1,24 @@
 # Ocak
 
-**Ocak** (*hearth / forge*) is a ground-up Rust LLM inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 30 custom GLSL/SPIR-V shaders)** and **x86-64 AVX2/FMA** (plus an optional runtime-loaded `ocak-hip` HSACO launcher) — with zero CUDA or ROCm SDK required to build or run.
+**Ocak** (*hearth / forge*) is a ground-up Rust LLM inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 36 custom GLSL/SPIR-V shaders)** and **x86-64 AVX2/FMA** (plus an optional runtime-loaded `ocak-hip` HSACO launcher) — with zero CUDA or ROCm SDK required to build or run.
 
-Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Radeon RX 6700 XT 12 GiB VRAM, Mesa RADV Vulkan 1.4**), Ocak runs dense, hybrid-recurrent, and hybrid GPU+CPU Mixture-of-Experts GGUF models natively from 1B up to 29B parameters while automatically curing AMD RDNA 2's 54W idle compute clock-lock bug.
+Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Radeon RX 6700 XT 12 GiB VRAM, Mesa RADV Vulkan 1.4**), Ocak runs dense, hybrid-recurrent, looped MoE, and hybrid GPU+CPU Mixture-of-Experts GGUF models natively from 1B up to 29B parameters while automatically curing AMD RDNA 2's 54W idle compute clock-lock bug.
 
 ---
 
 ## Highlights
 
-- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 30 hand-written GLSL shaders compiled at build time via `glslc` — zero graphics/render middleware, single `vkQueueSubmit` forward pass per token (including fused MoE layer dispatch), and full `VkDevice` teardown on idle sleep.
-- **Zero-copy GGUF v2/v3 & 15 quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
-  - Supported formats: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`.
+- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 36 hand-written GLSL shaders compiled at build time via `glslc` — zero graphics/render middleware, single `vkQueueSubmit` forward pass per token (including fused MoE layer dispatch), and full `VkDevice` teardown on idle sleep.
+- **Zero-copy GGUF v2/v3 & 20 quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
+  - Supported formats: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `NVFP4`.
 - **Native architectures (`ocak-engine`)**:
   - **Llama / MiniCPM / Qwen2** (dense GQA + NeoX / adjacent RoPE)
   - **Liquid LFM2 / LFM2.5** (causal `ShortConv` + QK-norm GQA)
   - **Liquid LFM3** (`ShortConv` + per-head sigmoid attention gate + sliding-window attention + `rope_freqs` + post-attention/FFW norms)
   - **Qwen3.5 / Qwen3.8 / RVN** (3:1 hybrid **Gated DeltaNet** linear recurrence + **Gated Full Attention** + partial NeoX RoPE + native **NextN MTP** draft head `MtpDrafter`)
   - **Xing4.0 MoE (29B-A4B)** (4-stream Sinkhorn **Hyper-Connections** + **YaRN MLA** latent KV cache + 64-expert / 4-active MoE + shared expert with fused GPU MoE dispatch, parallel MLA, and automatic hybrid GPU+CPU expert offloading `n_cpu_moe`)
-- **Radix Prefix Paged KV Cache (`ocak-kv`)**: 16-token physical KV pages organized in a Copy-on-Write Radix prefix tree with LRU zero-ref leaf eviction for instant multi-turn prefix reuse.
+  - **Inkling-2-Mini (26.4B Looped MoE)** (24 physical layers with middle 12 looped 3× = 48 logical layers, depth-wise Attention Residuals, cross-pass gain/forget controllers, dynamic `ShortConv`, relative-position bias + attention sinks, `SITU` activation, 128-expert / 8-active `NVFP4` MoE with hybrid GPU+CPU offloading)
+- **Radix Prefix Paged KV Cache & Q8 Compression (`ocak-kv`)**: 16-token physical KV pages organized in a Copy-on-Write Radix prefix tree with LRU zero-ref leaf eviction and `CompressedKvStore` (3.55× Q8 host-RAM spill) for instant multi-turn prefix reuse.
 - **RX 6700 XT 12 GiB VRAM & `WarmSleep` Power Governor (`ocak-sysfs`)**: Auto-discovers `amdgpu` DRM/hwmon sensors (VRAM, GTT, wattage, temperature, busy %) and destroys active Vulkan compute contexts after `sleep-idle-seconds`, dropping GPU idle draw back to desktop idle (~29 W) while waking from Linux page cache in ~300 ms.
 - **Multi-Protocol Server (`ocak-server`)**:
   - **OpenAI API**: `GET /v1/models`, `POST /v1/chat/completions` (sync + streaming SSE + JSON grammar mode + `<think>` token budget), `POST /v1/completions`, `POST /v1/embeddings` (L2-normalized), `POST /v1/audio/transcriptions`
@@ -37,7 +38,7 @@ flowchart TD
     Server --> Fed["ocak-federation (libllama parity/ASR bridge, Mergen fleet, HIP probe)"]
     Engine --> KV["ocak-kv (16-tok Paged Radix Prefix Tree)"]
     Engine --> Tok["ocak-tok (SentencePiece, Byte-BPE, Templates, Thinking Cap, JSON Grammar)"]
-    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 30 GLSL/SPIR-V Shaders)"]
+    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 36 GLSL/SPIR-V Shaders)"]
     Engine --> HIP["ocak-hip (Dynamic dlopen libamdhip64 HSACO Runtime)"]
     Engine --> CPU["ocak-cpu (x86-64 AVX2/FMA + Hybrid CPU MoE)"]
     Engine --> GGUF["ocak-gguf (Zero-Copy mmap GGUF v2/v3, Presets, .digest)"]
@@ -58,8 +59,10 @@ Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak
 | `LFM2.5-2.6B-Q4_K_M` | `lfm2` (ShortConv + GQA) | 1.56 GB | `1.000000` | `0.999716` (1-tok) | **52.3 tok/s** |
 | `Qwen3.5-4B-Q4_K_M` | `qwen35` (Gated DeltaNet + Attn) | 2.55 GB | `1.000000` | `0.999335` | **34.2 tok/s** |
 | `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GB | `1.000000` | `0.999584` | **19.9 tok/s** |
-| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + NextN MTP) | 9.14 GB | — | greedy + MTP `+2` match | **7.0 tok/s** |
+| `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GB | — | greedy verified | **7.8 tok/s** |
+| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + NextN MTP) | 9.14 GB | — | greedy + MTP 7/7 (100%) | **7.0 tok/s** |
 | `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, `gpu_moe=29, cpu_moe=8`) | 10.79 GB | — | greedy verified | **2.2 tok/s** |
+| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4` MoE) | 16.42 GB | — | greedy verified | **1.0 tok/s** |
 
 - **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`).
 - **`Xing4.0-29B-A4B` fused GPU MoE + parallel MLA**: Cold load `1.9 s`, prefill `2.1 tok/s`, decode `2.2 tok/s` (hybrid `gpu_moe=29, cpu_moe=8` in 12 GiB VRAM).
@@ -138,9 +141,9 @@ cargo test --release --workspace
 | `crates/ocak-kv` | 16-token paged KV allocator + Copy-on-Write Radix prefix tree |
 | `crates/ocak-tok` | SentencePiece & byte-level BPE tokenizers, chat templates, `<think>` budget, JSON grammar |
 | `crates/ocak-cpu` | x86-64 AVX2/FMA quantized GEMV and hybrid transformer ops |
-| `crates/ocak-vk` | Raw `ash` Vulkan 1.4 compute runtime + 30 GLSL/SPIR-V shaders |
+| `crates/ocak-vk` | Raw `ash` Vulkan 1.4 compute runtime + 36 GLSL/SPIR-V shaders (20 weight quant formats) |
 | `crates/ocak-hip` | Dynamic `dlopen("libamdhip64.so")` runtime + HSACO module/kernel launcher |
-| `crates/ocak-engine` | Native executors (`VkExec`, `CpuExec`, `XingExec`), `MtpDrafter`, sampler & streaming generator |
+| `crates/ocak-engine` | Native executors (`VkExec`, `CpuExec`, `XingExec`, `InklingExec`), `MtpDrafter`, sampler & generator |
 | `crates/ocak-federation` | `libllama.so` parity oracle, managed bridge, `mergen` fleet bridge, HIP `dlopen` probe |
 | `crates/ocak-server` | `axum` OpenAI + Anthropic + Embeddings + Audio + Prometheus + embedded `/ui` |
 | `crates/ocak-cli` | `ocakd` daemon & `ocak` CLI (`hw`, `inspect`, `run`, `parity-test`, `mtp-test`, `top`) |
@@ -149,11 +152,11 @@ cargo test --release --workspace
 
 ## Roadmap
 
-- [x] **M1–M3**: Ground-up GGUF/tokenizer/Radix KV, Vulkan 1.4 + AVX2 Llama/Qwen2 engine, OpenAI + Anthropic + Embeddings + Web UI/TUI + RX 6700 XT `WarmSleep`.
-- [x] **M4 / M4b**: Native `LFM2`, `LFM3`, `Qwen3.5`/`Qwen3.8` Gated DeltaNet & Gated Attention, `Q2_K`/`Q3_K` & `IQ2_XS`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` shaders (10 native models up to 27B).
-- [x] **M5 / M5b**: Native hybrid GPU+CPU MoE for `Xing4.0-29B-A4B` (4-stream Hyper-Connections + YaRN MLA + 64-expert MoE) with single-command-buffer fused GPU MoE (`add_scaled.comp`) and `rayon`-parallel MLA.
-- [x] **M6**: Native `Qwen3.5`/`RVN` NextN MTP draft head (`MtpDrafter` + `ocak mtp-test`) and dynamic `ocak-hip` HSACO runtime (`dlopen("libamdhip64.so")`).
-- [ ] **Future**: Batched speculative MTP verify step, `Inkling-2-Mini` looped MoE native executor, and native `Qwen3-ASR` audio mel/encoder frontend.
+- [x] **M1–M3**: Ground-up GGUF/tokenizer/Radix KV + Q8 spill store, Vulkan 1.4 + AVX2 Llama/Qwen2 engine, OpenAI + Anthropic + Embeddings + Web UI/TUI + RX 6700 XT `WarmSleep`.
+- [x] **M4 / M4b**: Native `LFM2`, `LFM3`, `Qwen3.5`/`Qwen3.8` Gated DeltaNet & Gated Attention, `Q2_K`/`Q3_K` & all `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` shaders.
+- [x] **M5 / M5b**: Native hybrid GPU+CPU MoE for `Xing4.0-29B-A4B` (fused GPU MoE + parallel MLA) and `Inkling-2-Mini` (`inkling2_loop` 3× looped MoE + `NVFP4` & `BF16` shaders).
+- [x] **M6**: Native `Qwen3.5`/`RVN` NextN MTP draft head (`MtpDrafter` wired into `generate()` + `ocak mtp-test`, 100% draft match) and dynamic `ocak-hip` HSACO runtime (`dlopen("libamdhip64.so")`).
+- [ ] **Future**: 2-token batched MTP verify pass, GPU-resident MLA/SITU shaders for higher MoE tok/s, and native `Qwen3-ASR` audio mel/encoder frontend.
 
 ---
 

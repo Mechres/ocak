@@ -28,6 +28,7 @@ impl From<vk::Result> for VkError {
 pub enum WType {
     F32,
     F16,
+    BF16,
     Q8_0,
     Q4_0,
     Q2K,
@@ -35,11 +36,16 @@ pub enum WType {
     Q4K,
     Q5K,
     Q6K,
+    IQ2XXS,
     IQ2XS,
+    IQ2S,
     IQ3XXS,
     IQ3S,
+    IQ1S,
+    IQ1M,
     IQ4NL,
     IQ4XS,
+    NVFP4,
 }
 
 impl WType {
@@ -47,6 +53,7 @@ impl WType {
         Ok(match t {
             GgmlType::F32 => WType::F32,
             GgmlType::F16 => WType::F16,
+            GgmlType::BF16 => WType::BF16,
             GgmlType::Q8_0 => WType::Q8_0,
             GgmlType::Q4_0 => WType::Q4_0,
             GgmlType::Q2K => WType::Q2K,
@@ -54,11 +61,16 @@ impl WType {
             GgmlType::Q4K => WType::Q4K,
             GgmlType::Q5K => WType::Q5K,
             GgmlType::Q6K => WType::Q6K,
+            GgmlType::IQ2XXS => WType::IQ2XXS,
             GgmlType::IQ2XS => WType::IQ2XS,
+            GgmlType::IQ2S => WType::IQ2S,
             GgmlType::IQ3XXS => WType::IQ3XXS,
             GgmlType::IQ3S => WType::IQ3S,
+            GgmlType::IQ1S => WType::IQ1S,
+            GgmlType::IQ1M => WType::IQ1M,
             GgmlType::IQ4NL => WType::IQ4NL,
             GgmlType::IQ4XS => WType::IQ4XS,
+            GgmlType::NVFP4 => WType::NVFP4,
             o => return Err(VkError::UnsupportedType(o.name())),
         })
     }
@@ -67,6 +79,7 @@ impl WType {
         match self {
             WType::F32 => GgmlType::F32,
             WType::F16 => GgmlType::F16,
+            WType::BF16 => GgmlType::BF16,
             WType::Q8_0 => GgmlType::Q8_0,
             WType::Q4_0 => GgmlType::Q4_0,
             WType::Q2K => GgmlType::Q2K,
@@ -74,11 +87,16 @@ impl WType {
             WType::Q4K => GgmlType::Q4K,
             WType::Q5K => GgmlType::Q5K,
             WType::Q6K => GgmlType::Q6K,
+            WType::IQ2XXS => GgmlType::IQ2XXS,
             WType::IQ2XS => GgmlType::IQ2XS,
+            WType::IQ2S => GgmlType::IQ2S,
             WType::IQ3XXS => GgmlType::IQ3XXS,
             WType::IQ3S => GgmlType::IQ3S,
+            WType::IQ1S => GgmlType::IQ1S,
+            WType::IQ1M => GgmlType::IQ1M,
             WType::IQ4NL => GgmlType::IQ4NL,
             WType::IQ4XS => GgmlType::IQ4XS,
+            WType::NVFP4 => GgmlType::NVFP4,
         }
     }
 
@@ -105,6 +123,7 @@ struct Pipelines {
     embed: PipelineBundle,
     qmv_f32: PipelineBundle,
     qmv_f16: PipelineBundle,
+    qmv_bf16: PipelineBundle,
     qmv_q8_0: PipelineBundle,
     qmv_q4_0: PipelineBundle,
     qmv_q4_k: PipelineBundle,
@@ -121,11 +140,16 @@ struct Pipelines {
     mul_sigmoid: PipelineBundle,
     mul_head_sigmoid: PipelineBundle,
     rope_ext: PipelineBundle,
+    qmv_iq2_xxs: PipelineBundle,
     qmv_iq2_xs: PipelineBundle,
+    qmv_iq2_s: PipelineBundle,
     qmv_iq3_xxs: PipelineBundle,
     qmv_iq3_s: PipelineBundle,
+    qmv_iq1_s: PipelineBundle,
+    qmv_iq1_m: PipelineBundle,
     qmv_iq4_nl: PipelineBundle,
     qmv_iq4_xs: PipelineBundle,
+    qmv_nvfp4: PipelineBundle,
 }
 
 impl Pipelines {
@@ -133,8 +157,12 @@ impl Pipelines {
         for p in [
             &self.rms_norm, &self.add, &self.add_scaled, &self.copy, &self.swiglu, &self.rope,
             &self.kv_write, &self.attention, &self.embed,
-            &self.qmv_f32, &self.qmv_f16, &self.qmv_q8_0, &self.qmv_q4_0,
-            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k, &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext, &self.qmv_iq2_xs, &self.qmv_iq3_xxs, &self.qmv_iq3_s, &self.qmv_iq4_nl, &self.qmv_iq4_xs,
+            &self.qmv_f32, &self.qmv_f16, &self.qmv_bf16, &self.qmv_q8_0, &self.qmv_q4_0,
+            &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k,
+            &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step,
+            &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext,
+            &self.qmv_iq2_xxs, &self.qmv_iq2_xs, &self.qmv_iq2_s, &self.qmv_iq3_xxs, &self.qmv_iq3_s,
+            &self.qmv_iq1_s, &self.qmv_iq1_m, &self.qmv_iq4_nl, &self.qmv_iq4_xs, &self.qmv_nvfp4,
         ] {
             dev.destroy_pipeline(p.pipeline, None);
             dev.destroy_pipeline_layout(p.layout, None);
@@ -298,6 +326,7 @@ impl VkContext {
                 embed: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv")), 3, 20)?,
                 qmv_f32: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f32.spv")), 3, 24)?,
                 qmv_f16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_f16.spv")), 3, 24)?,
+                qmv_bf16: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_bf16.spv")), 3, 24)?,
                 qmv_q8_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0.spv")), 3, 24)?,
                 qmv_q4_0: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_0.spv")), 3, 24)?,
                 qmv_q4_k: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k.spv")), 3, 24)?,
@@ -314,11 +343,16 @@ impl VkContext {
                 mul_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), 2, 4)?,
                 mul_head_sigmoid: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/mul_head_sigmoid.spv")), 2, 8)?,
                 rope_ext: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/rope_ext.spv")), 3, 40)?,
+                qmv_iq2_xxs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xxs.spv")), 4, 24)?,
                 qmv_iq2_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_xs.spv")), 4, 24)?,
+                qmv_iq2_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq2_s.spv")), 4, 24)?,
                 qmv_iq3_xxs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs.spv")), 4, 24)?,
                 qmv_iq3_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s.spv")), 4, 24)?,
+                qmv_iq1_s: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_s.spv")), 4, 24)?,
+                qmv_iq1_m: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq1_m.spv")), 4, 24)?,
                 qmv_iq4_nl: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_nl.spv")), 4, 24)?,
                 qmv_iq4_xs: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq4_xs.spv")), 4, 24)?,
+                qmv_nvfp4: build_pipeline(&device, include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4.spv")), 3, 24)?,
             };
 
             let cmd_pool = device.create_command_pool(
@@ -712,6 +746,7 @@ impl<'a> Recorder<'a> {
         let (pipe, needs_iq) = match ty {
             WType::F32 => (&self.ctx.pipelines.qmv_f32, false),
             WType::F16 => (&self.ctx.pipelines.qmv_f16, false),
+            WType::BF16 => (&self.ctx.pipelines.qmv_bf16, false),
             WType::Q8_0 => (&self.ctx.pipelines.qmv_q8_0, false),
             WType::Q4_0 => (&self.ctx.pipelines.qmv_q4_0, false),
             WType::Q4K => (&self.ctx.pipelines.qmv_q4_k, false),
@@ -719,11 +754,16 @@ impl<'a> Recorder<'a> {
             WType::Q6K => (&self.ctx.pipelines.qmv_q6_k, false),
             WType::Q2K => (&self.ctx.pipelines.qmv_q2_k, false),
             WType::Q3K => (&self.ctx.pipelines.qmv_q3_k, false),
+            WType::IQ2XXS => (&self.ctx.pipelines.qmv_iq2_xxs, true),
             WType::IQ2XS => (&self.ctx.pipelines.qmv_iq2_xs, true),
+            WType::IQ2S => (&self.ctx.pipelines.qmv_iq2_s, true),
             WType::IQ3XXS => (&self.ctx.pipelines.qmv_iq3_xxs, true),
             WType::IQ3S => (&self.ctx.pipelines.qmv_iq3_s, true),
+            WType::IQ1S => (&self.ctx.pipelines.qmv_iq1_s, true),
+            WType::IQ1M => (&self.ctx.pipelines.qmv_iq1_m, true),
             WType::IQ4NL => (&self.ctx.pipelines.qmv_iq4_nl, true),
             WType::IQ4XS => (&self.ctx.pipelines.qmv_iq4_xs, true),
+            WType::NVFP4 => (&self.ctx.pipelines.qmv_nvfp4, false),
         };
         if needs_iq {
             self.dispatch_raw(pipe, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
@@ -881,6 +921,7 @@ mod tests {
         match ty {
             WType::F32 => for c in v.chunks_exact_mut(4) { c.copy_from_slice(&rng.f().to_le_bytes()); },
             WType::F16 => for c in v.chunks_exact_mut(2) { c.copy_from_slice(&f16::from_f32(rng.f()).to_le_bytes()); },
+            WType::BF16 => for c in v.chunks_exact_mut(2) { c.copy_from_slice(&half::bf16::from_f32(rng.f()).to_le_bytes()); },
             WType::Q4_0 | WType::Q8_0 => for blk in v.chunks_exact_mut(bb) { blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
             WType::Q4K | WType::Q5K => for blk in v.chunks_exact_mut(bb) {
                 blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
@@ -893,7 +934,20 @@ mod tests {
             WType::Q3K => for blk in v.chunks_exact_mut(bb) {
                 blk[108..110].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
             },
-            WType::IQ2XS | WType::IQ3XXS | WType::IQ3S | WType::IQ4NL | WType::IQ4XS => for blk in v.chunks_exact_mut(bb) { blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
+            WType::IQ2XXS | WType::IQ2XS | WType::IQ2S | WType::IQ3XXS | WType::IQ3S | WType::IQ1S | WType::IQ4NL | WType::IQ4XS => {
+                for blk in v.chunks_exact_mut(bb) { blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); }
+            }
+            WType::IQ1M => for blk in v.chunks_exact_mut(bb) {
+                let d = f16::from_f32(rng.f() * 0.05).to_bits();
+                for s in 0..4 {
+                    let lo = (rng.next() as u16) & 0x0FFF;
+                    let hi = ((d >> (4 * s)) & 0xF) << 12;
+                    blk[48 + 2 * s..50 + 2 * s].copy_from_slice(&(lo | hi).to_le_bytes());
+                }
+            },
+            WType::NVFP4 => for blk in v.chunks_exact_mut(bb) {
+                for s in 0..4 { blk[s] = (rng.next() as u8) & 0x7E; }
+            },
             WType::Q6K => for blk in v.chunks_exact_mut(bb) { blk[208..210].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes()); },
         }
         v
@@ -903,7 +957,12 @@ mod tests {
     fn vk_qmv_all_types_match_cpu() {
         let c = ctx();
         let mut rng = Lcg(1337);
-        for ty in [WType::F32, WType::F16, WType::Q8_0, WType::Q4_0, WType::Q2K, WType::Q3K, WType::Q4K, WType::Q5K, WType::Q6K, WType::IQ2XS, WType::IQ3XXS, WType::IQ3S, WType::IQ4NL, WType::IQ4XS] {
+        for ty in [
+            WType::F32, WType::F16, WType::BF16, WType::Q8_0, WType::Q4_0,
+            WType::Q2K, WType::Q3K, WType::Q4K, WType::Q5K, WType::Q6K,
+            WType::IQ2XXS, WType::IQ2XS, WType::IQ2S, WType::IQ3XXS, WType::IQ3S,
+            WType::IQ1S, WType::IQ1M, WType::IQ4NL, WType::IQ4XS, WType::NVFP4,
+        ] {
             let (k, m) = (512usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();

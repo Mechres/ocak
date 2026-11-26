@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
             let entries = scan(&[models_dir, extra_dir]);
             println!("{:<34} {:<10} {:>8} {:<14} {:<10} {}", "MODEL", "ARCH", "SIZE", "BACKEND", "SHA256", "QUANTS");
             for e in entries {
-                let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0") && !["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_S"].iter().any(|u| e.quant_summary.contains(u)) { "native-vk" } else { "bridge-llama" };
+                let eng = if matches!(e.arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") { "native-vk" } else { "bridge-llama" };
                 let sha = e.sha256.as_deref().map(|s| &s[..8]).unwrap_or("none");
                 let has_p = if presets.models.contains_key(&e.id) { "*" } else { " " };
                 println!(
@@ -138,11 +138,21 @@ async fn main() -> Result<()> {
                 true
             })?;
             println!();
-            eprintln!(
-                "prompt: {} tok (cache={}) {:.1} tok/s | decode: {} tok {:.1} tok/s",
-                res.timings.prompt_n, res.timings.cache_n, res.timings.prompt_per_second,
-                res.timings.predicted_n, res.timings.predicted_per_second
-            );
+            if res.timings.mtp_drafted > 0 {
+                let rate = 100.0 * res.timings.mtp_accepted as f64 / res.timings.mtp_drafted as f64;
+                eprintln!(
+                    "prompt: {} tok (cache={}) {:.1} tok/s | decode: {} tok {:.1} tok/s | mtp: {}/{} ({:.0}%)",
+                    res.timings.prompt_n, res.timings.cache_n, res.timings.prompt_per_second,
+                    res.timings.predicted_n, res.timings.predicted_per_second,
+                    res.timings.mtp_accepted, res.timings.mtp_drafted, rate
+                );
+            } else {
+                eprintln!(
+                    "prompt: {} tok (cache={}) {:.1} tok/s | decode: {} tok {:.1} tok/s",
+                    res.timings.prompt_n, res.timings.cache_n, res.timings.prompt_per_second,
+                    res.timings.predicted_n, res.timings.predicted_per_second
+                );
+            }
         }
         Cmd::ParityTest { model, prompt, steps } => {
             let mut eng_vk = NativeEngine::load(&model, EngineOptions { backend: BackendKind::Vulkan, max_ctx: 512, kv_pages: 64 })?;

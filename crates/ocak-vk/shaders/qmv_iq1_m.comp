@@ -1,0 +1,71 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+float s8(uint word, uint byte_idx) {
+    int v = int((word >> (8u * byte_idx)) & 0xFFu);
+    if (v >= 128) v -= 256;
+    return float(v);
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 256u;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 56u;
+            uint sc0 = uint(w[b + 48u]) | (uint(w[b + 49u]) << 8);
+            uint sc1 = uint(w[b + 50u]) | (uint(w[b + 51u]) << 8);
+            uint sc2 = uint(w[b + 52u]) | (uint(w[b + 53u]) << 8);
+            uint sc3 = uint(w[b + 54u]) | (uint(w[b + 55u]) << 8);
+            uint dbits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+            float d = unpackHalf2x16(dbits).x;
+            uint xb = pc.x_off + blk * 256u;
+            for (uint ib = 0u; ib < 8u; ib++) {
+                uint s16 = (ib < 2u) ? sc0 : ((ib < 4u) ? sc1 : ((ib < 6u) ? sc2 : sc3));
+                uint sh = 6u * (ib & 1u);
+                float dl1 = d * float(2u * ((s16 >> sh) & 7u) + 1u);
+                float dl2 = d * float(2u * ((s16 >> (sh + 3u)) & 7u) + 1u);
+                uint q0 = uint(w[b + 32u + ib * 2u]);
+                uint q1 = uint(w[b + 33u + ib * 2u]);
+                uint idxs[4];
+                idxs[0] = uint(w[b + ib * 4u]) | ((q0 << 8) & 0x700u);
+                idxs[1] = uint(w[b + ib * 4u + 1u]) | ((q0 << 4) & 0x700u);
+                idxs[2] = uint(w[b + ib * 4u + 2u]) | ((q1 << 8) & 0x700u);
+                idxs[3] = uint(w[b + ib * 4u + 3u]) | ((q1 << 4) & 0x700u);
+                float deltas[4];
+                deltas[0] = ((q0 & 0x08u) != 0u) ? -0.125 : 0.125;
+                deltas[1] = ((q0 & 0x80u) != 0u) ? -0.125 : 0.125;
+                deltas[2] = ((q1 & 0x08u) != 0u) ? -0.125 : 0.125;
+                deltas[3] = ((q1 & 0x80u) != 0u) ? -0.125 : 0.125;
+                for (uint l = 0u; l < 4u; l++) {
+                    float dl = (l < 2u) ? dl1 : dl2;
+                    uint glo = tbl[4496u + 2u * idxs[l]];
+                    uint ghi = tbl[4496u + 2u * idxs[l] + 1u];
+                    uint xo = xb + ib * 32u + l * 8u;
+                    float s = 0.0;
+                    for (uint j = 0u; j < 4u; j++) {
+                        s += (s8(glo, j) + deltas[l]) * x[xo + j];
+                        s += (s8(ghi, j) + deltas[l]) * x[xo + j + 4u];
+                    }
+                    acc += dl * s;
+                }
+            }
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0u && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}

@@ -3,6 +3,7 @@ pub mod config;
 pub mod cpu_exec;
 pub mod engine;
 pub mod exec;
+pub mod inkling_exec;
 pub mod mtp;
 pub mod sampler;
 pub mod xing_exec;

@@ -51,6 +51,22 @@ void main() {
         int q = int(w[b + 2u + sub]);
         if (q >= 128) q -= 256;
         val = float(q) * d;
+    } else if (pc.ty == 10u) { // Q2_K
+        uint blk = i / 256u;
+        uint sub = i % 256u;
+        uint b = rbase + blk * 84u;
+        float d = f16_at(b + 80u);
+        float dmin = f16_at(b + 82u);
+        uint half_i = sub / 128u;
+        uint rem = sub % 128u;
+        uint g = rem / 32u;
+        uint rem32 = rem % 32u;
+        uint is = half_i * 8u + g * 2u + (rem32 / 16u);
+        uint sc = uint(w[b + is]);
+        uint shift = g * 2u;
+        uint qbyte = uint(w[b + 16u + half_i * 32u + rem32]);
+        uint q = (qbyte >> shift) & 3u;
+        val = d * float(sc & 0xFu) * float(q) - dmin * float(sc >> 4);
     } else if (pc.ty == 12u) { // Q4_K
         uint blk = i / 256u;
         uint sub = i % 256u;

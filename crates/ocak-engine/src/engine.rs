@@ -64,6 +64,8 @@ pub struct Timings {
     pub predicted_n: usize,
     pub predicted_ms: f64,
     pub predicted_per_second: f64,
+    pub mtp_drafted: usize,
+    pub mtp_accepted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,7 @@ pub struct NativeEngine {
     pub cfg: ModelConfig,
     pub tokenizer: Tokenizer,
     exec: Box<dyn Executor>,
+    mtp: Option<crate::mtp::MtpDrafter>,
     pager: RadixPager,
     max_ctx: usize,
     backend_name: String,
@@ -96,6 +99,9 @@ impl NativeEngine {
         let exec: Box<dyn Executor> = if cfg.arch == "xing4_0" {
             let n_cpu_moe = if g.file_len() > 11 * (1u64 << 30) { 12 } else { 8 };
             Box::new(crate::xing_exec::XingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, n_cpu_moe)?)
+        } else if cfg.arch == "inkling2_loop" {
+            // 24 physical MoE layers (~14.8 GB NVFP4): keep 12 on RX 6700 XT VRAM (~7.4 GB) + 12 mmap CPU
+            Box::new(crate::inkling_exec::InklingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, 12)?)
         } else { match opts.backend {
             #[cfg(feature = "vulkan")]
             BackendKind::Vulkan => Box::new(VkExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
@@ -104,16 +110,20 @@ impl NativeEngine {
             BackendKind::CpuAvx2 => Box::new(CpuExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
         } };
         let backend_name = exec.name();
+        let mtp = crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten();
         Ok(Self {
             cfg,
             tokenizer,
             exec,
+            mtp,
             pager: RadixPager::new(n_pages),
             max_ctx,
             backend_name,
             vram_bytes,
         })
     }
+
+    pub fn has_mtp(&self) -> bool { self.mtp.is_some() }
 
     pub fn backend_name(&self) -> &str { &self.backend_name }
     pub fn estimated_vram_bytes(&self) -> u64 { self.vram_bytes }
@@ -232,12 +242,19 @@ impl NativeEngine {
             Ok(())
         };
 
+        let use_mtp = self.mtp.is_some()
+            && !req.json_mode
+            && req.thinking.is_none()
+            && std::env::var("OCAK_MTP_VERIFY").is_ok();
+        if let Some(m) = &mut self.mtp {
+            m.reset();
+        }
         let t_prefill = Instant::now();
         let prompt_len = tokens.len();
         for pos in cache_n..prompt_len {
             ensure_page(&mut self.pager, &mut pages, pos)?;
             let is_last = pos + 1 == prompt_len;
-            if let Err(e) = self.exec.forward(tokens[pos], pos, &pages, Out { logits: is_last, hidden: false }) {
+            if let Err(e) = self.exec.forward(tokens[pos], pos, &pages, Out { logits: is_last, hidden: is_last && use_mtp }) {
                 self.pager.release(&pages);
                 return Err(e);
             }
@@ -266,6 +283,10 @@ impl NativeEngine {
         let t_dec = Instant::now();
 
         let mut logits_buf = self.exec.logits().to_vec();
+        let mut hidden_buf = if use_mtp { self.exec.hidden().to_vec() } else { Vec::new() };
+        let mut mtp_drafted = 0usize;
+        let mut mtp_accepted = 0usize;
+        let mut pending_draft: Option<u32> = None;
         for step in 0..req.max_tokens {
             let next_tok = if let Some(forced) = think_gov.as_mut().and_then(|g| g.forced_next()) {
                 forced
@@ -275,6 +296,12 @@ impl NativeEngine {
                 }
                 sampler.sample(&mut logits_buf)
             };
+            if let Some(dt) = pending_draft.take() {
+                mtp_drafted += 1;
+                if dt == next_tok {
+                    mtp_accepted += 1;
+                }
+            }
 
             if self.tokenizer.is_eog(next_tok) {
                 finish = FinishReason::Stop;
@@ -308,12 +335,28 @@ impl NativeEngine {
                 break;
             }
             let pos = tokens.len() - 1;
+            if use_mtp {
+                if let Some(m) = &mut self.mtp {
+                    if let Ok(dl) = m.draft_logits(&hidden_buf, next_tok, step) {
+                        let dt = dl
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1))
+                            .map(|(i, _)| i as u32)
+                            .unwrap_or(0);
+                        pending_draft = Some(dt);
+                    }
+                }
+            }
             ensure_page(&mut self.pager, &mut pages, pos)?;
-            if let Err(e) = self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: false }) {
+            if let Err(e) = self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: use_mtp }) {
                 self.pager.release(&pages);
                 return Err(e);
             }
             logits_buf.copy_from_slice(self.exec.logits());
+            if use_mtp {
+                hidden_buf.copy_from_slice(self.exec.hidden());
+            }
         }
 
         let tail = detok.flush();
@@ -335,6 +378,8 @@ impl NativeEngine {
             predicted_n: gen_tokens.len(),
             predicted_ms: dec_ms,
             predicted_per_second: if dec_ms > 0.0 { gen_tokens.len() as f64 / (dec_ms / 1000.0) } else { 0.0 },
+            mtp_drafted,
+            mtp_accepted,
         };
 
         Ok(GenResult { text: full_text, tokens: gen_tokens, finish_reason: finish, timings })

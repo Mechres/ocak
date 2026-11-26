@@ -62,16 +62,18 @@ impl ModelConfig {
 
     pub fn from_gguf(g: &GgufFile) -> Result<Self, EngineError> {
         let arch = g.architecture().ok_or_else(|| EngineError::Unsupported("no architecture".into()))?.to_string();
-        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0") {
+        if !matches!(arch.as_str(), "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop") {
             return Err(EngineError::Unsupported(format!(
-                "architecture '{arch}' (native engine supports llama, qwen2, lfm2, qwen35)"
+                "architecture '{arch}' (native engine supports llama, qwen2, lfm2, lfm3, qwen35, xing4_0, inkling2_loop)"
             )));
         }
         let req = |s: &str| g.arch_u64(s).ok_or_else(|| EngineError::Unsupported(format!("missing {arch}.{s}")));
         let block_count = req("block_count")? as usize;
         let nextn = g.arch_u64("nextn_predict_layers").unwrap_or(0) as usize;
         let n_layer = block_count.saturating_sub(nextn);
-        let n_head = req("attention.head_count")? as usize;
+        let n_head = g.arch_u64("attention.head_count")
+            .or_else(|| g.ints(&format!("{arch}.attention.head_count")).and_then(|a| a.first().map(|&v| v as u64)))
+            .ok_or_else(|| EngineError::Unsupported(format!("missing {arch}.attention.head_count")))? as usize;
         let n_embd = req("embedding_length")? as usize;
         let head_dim = g.arch_u64("attention.key_length").map(|v| v as usize).unwrap_or(n_embd / n_head);
         let embd = g.tensor("token_embd.weight").ok_or_else(|| EngineError::Unsupported("no token_embd.weight".into()))?;
@@ -141,6 +143,9 @@ impl ModelConfig {
                 }
             }
         } else {
+            if arch == "inkling2_loop" || arch == "xing4_0" {
+                is_hybrid = true;
+            }
             n_head_kv_max = kv_scalar;
             for i in 0..n_layer {
                 layer_kinds.push(LayerKind::FullAttn {
@@ -194,7 +199,7 @@ impl ModelConfig {
             arch,
         };
 
-        if cfg.arch != "xing4_0" && g.arch_f64("rope.scaling.factor").map_or(false, |f| (f - 1.0).abs() > 1e-6) {
+        if cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && g.arch_f64("rope.scaling.factor").map_or(false, |f| (f - 1.0).abs() > 1e-6) {
             return Err(EngineError::Unsupported("rope scaling".into()));
         }
 

@@ -251,6 +251,79 @@ impl RadixPager {
     }
 }
 
+/// Host-RAM Q8_0 compressed KV page store for `WarmSleep` teardown and long-context spill.
+/// Compresses each 32-float block into `[f32 scale (4B) + 32 x i8 (32B)]` = 36B (3.55x reduction).
+#[derive(Default)]
+pub struct CompressedKvStore {
+    pages: FxHashMap<Vec<u32>, Vec<u8>>,
+    max_bytes: usize,
+    used_bytes: usize,
+}
+
+impl CompressedKvStore {
+    pub fn new(max_bytes: usize) -> Self {
+        Self { pages: FxHashMap::default(), max_bytes, used_bytes: 0 }
+    }
+
+    pub fn compress_f32(src: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity((src.len() / 32) * 36);
+        for blk in src.chunks_exact(32) {
+            let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let d = amax / 127.0;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            out.extend_from_slice(&d.to_le_bytes());
+            for &v in blk {
+                out.push((v * inv).round().clamp(-127.0, 127.0) as i8 as u8);
+            }
+        }
+        out
+    }
+
+    pub fn decompress_f32(src: &[u8], dst: &mut [f32]) {
+        for (blk, out) in src.chunks_exact(36).zip(dst.chunks_exact_mut(32)) {
+            let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
+            for i in 0..32 {
+                out[i] = (blk[4 + i] as i8) as f32 * d;
+            }
+        }
+    }
+
+    pub fn put(&mut self, prefix_key: Vec<u32>, kv_f32: &[f32]) -> bool {
+        let comp = Self::compress_f32(kv_f32);
+        if comp.len() > self.max_bytes {
+            return false;
+        }
+        if let Some(old) = self.pages.remove(&prefix_key) {
+            self.used_bytes -= old.len();
+        }
+        while self.used_bytes + comp.len() > self.max_bytes {
+            if let Some(k) = self.pages.keys().next().cloned() {
+                if let Some(v) = self.pages.remove(&k) {
+                    self.used_bytes -= v.len();
+                }
+            } else {
+                break;
+            }
+        }
+        self.used_bytes += comp.len();
+        self.pages.insert(prefix_key, comp);
+        true
+    }
+
+    pub fn get(&self, prefix_key: &[u32], dst: &mut [f32]) -> bool {
+        if let Some(comp) = self.pages.get(prefix_key) {
+            Self::decompress_f32(comp, dst);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn used_bytes(&self) -> usize { self.used_bytes }
+    pub fn len(&self) -> usize { self.pages.len() }
+    pub fn is_empty(&self) -> bool { self.pages.is_empty() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +386,17 @@ mod tests {
         assert!(ex.iter().any(|(path, pid)| path == &t[..16] && *pid == a));
         assert!(ex.iter().any(|(path, pid)| path == &t[..32] && *pid == b));
         p.release(&[a, b]);
+    }
+
+    #[test]
+    fn compressed_kv_q8_roundtrip_and_budget() {
+        let kv: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.13).sin() * 2.5).collect();
+        let mut store = CompressedKvStore::new(4096);
+        assert!(store.put(vec![1, 2, 3], &kv));
+        assert_eq!(store.used_bytes(), (1024 / 32) * 36);
+        let mut out = vec![0f32; 1024];
+        assert!(store.get(&[1, 2, 3], &mut out));
+        let max_err = kv.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max_err < 0.025, "max_err={max_err}");
     }
 }

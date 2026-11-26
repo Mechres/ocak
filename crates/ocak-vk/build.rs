@@ -18,6 +18,7 @@ fn main() {
         "embed",
         "qmv_f32",
         "qmv_f16",
+        "qmv_bf16",
         "qmv_q8_0",
         "qmv_q4_0",
         "qmv_q4_k",
@@ -34,11 +35,16 @@ fn main() {
         "mul_sigmoid",
         "mul_head_sigmoid",
         "rope_ext",
+        "qmv_iq2_xxs",
         "qmv_iq2_xs",
+        "qmv_iq2_s",
         "qmv_iq3_xxs",
         "qmv_iq3_s",
+        "qmv_iq1_s",
+        "qmv_iq1_m",
         "qmv_iq4_nl",
         "qmv_iq4_xs",
+        "qmv_nvfp4",
     ];
     for name in shaders {
         let src = format!("shaders/{name}.comp");

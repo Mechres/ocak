@@ -1,0 +1,52 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer T { uint tbl[]; };
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; } pc;
+shared float sdata[4][32];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    float acc = 0.0;
+    if (row < pc.m) {
+        uint rbase = pc.w_off + row * pc.row_bytes;
+        uint nblk = pc.k / 256u;
+        for (uint blk = tid; blk < nblk; blk += 32u) {
+            uint b = rbase + blk * 66u;
+            float d = unpackHalf2x16(uint(w[b]) | (uint(w[b + 1u]) << 8)).x;
+            uint xb = pc.x_off + blk * 256u;
+            for (uint ib32 = 0u; ib32 < 8u; ib32++) {
+                uint q0 = b + 2u + ib32 * 8u;
+                uint a0 = uint(w[q0]) | (uint(w[q0 + 1u]) << 8) | (uint(w[q0 + 2u]) << 16) | (uint(w[q0 + 3u]) << 24);
+                uint a1 = uint(w[q0 + 4u]) | (uint(w[q0 + 5u]) << 8) | (uint(w[q0 + 6u]) << 16) | (uint(w[q0 + 7u]) << 24);
+                float db = d * (0.5 + float(a1 >> 28)) * 0.25;
+                for (uint l = 0u; l < 4u; l++) {
+                    uint gidx = (a0 >> (8u * l)) & 0xFFu;
+                    uint glo = tbl[1936u + 2u * gidx];
+                    uint ghi = tbl[1936u + 2u * gidx + 1u];
+                    uint signs = tbl[1792u + ((a1 >> (7u * l)) & 127u)];
+                    uint xo = xb + ib32 * 32u + l * 8u;
+                    float s = 0.0;
+                    for (uint j = 0u; j < 4u; j++) {
+                        float v0 = float((glo >> (8u * j)) & 0xFFu);
+                        float v1 = float((ghi >> (8u * j)) & 0xFFu);
+                        s += v0 * (((signs & (1u << j)) != 0u) ? -1.0 : 1.0) * x[xo + j];
+                        s += v1 * (((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0) * x[xo + j + 4u];
+                    }
+                    acc += db * s;
+                }
+            }
+        }
+    }
+    sdata[ly][tid] = acc;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[ly][tid] += sdata[ly][tid + s];
+        barrier();
+    }
+    if (tid == 0u && row < pc.m) y[pc.y_off + row] = sdata[ly][0];
+}
