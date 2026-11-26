@@ -20,8 +20,11 @@ jobs:
           sudo apt-get install -y glslc libvulkan-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to the toolchain used for local development: floating `stable` pulls in
+        # new clippy lints (e.g. 1.100's chunks_exact_to_as_chunks) that fail -D warnings.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.0
           components: clippy
 
       - name: Clippy
