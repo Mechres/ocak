@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Vulkan / glslang shader compiler
+      - name: Install Vulkan headers & glslc shader compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y glslang-tools libvulkan-dev
+          sudo apt-get install -y glslc libvulkan-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
