@@ -325,6 +325,10 @@ impl Tokenizer {
         };
         let tt = self.token_types.get(id as usize).copied().unwrap_or(1);
         if tt == 3 {
+            // Preserve reasoning-mode control markers so reasoning can be separated from answer text
+            if matches!(tok.as_str(), "<think>" | "</think>" | "<|content_thinking|>" | "<|content_text|>") {
+                return tok.as_bytes().to_vec();
+            }
             // Control token (e.g. <s>, </s>, <|im_end|>)
             return Vec::new();
         }

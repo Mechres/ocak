@@ -1,6 +1,7 @@
 //! Multi-protocol HTTP/SSE server: OpenAI, Anthropic `/v1/messages`, Embeddings, Audio/ASR,
 //! Prometheus `/metrics`, Admin SSE, embedded `/ui`, and RX 6700 XT WarmSleep watchdog.
 pub mod batch;
+pub mod reasoning;
 pub mod tools;
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, Request as AxRequest, State};
@@ -679,6 +680,7 @@ async fn chat_completions(
         thinking: req.reasoning_max_tokens.map(|m| ThinkingCfg { max_tokens: m }),
     };
 
+    let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
     if req.stream {
         let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
         let (tok_tx, mut tok_rx) = mpsc::channel::<String>(256);
@@ -694,22 +696,66 @@ async fn chat_completions(
         );
         tokio::spawn(async move {
             if !has_tools {
+                let mut splitter = reasoning::StreamReasoningSplitter::new(started_in_think);
                 while let Some(piece) = tok_rx.recv().await {
+                    let (r_delta, c_delta) = splitter.push(&piece);
+                    if !r_delta.is_empty() {
+                        let chunk = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "reasoning_content": r_delta }, "finish_reason": null }]
+                        });
+                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                            return;
+                        }
+                    }
+                    if !c_delta.is_empty() {
+                        let chunk = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "content": c_delta }, "finish_reason": null }]
+                        });
+                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let (r_tail, c_tail) = splitter.flush();
+                if !r_tail.is_empty() {
                     let chunk = json!({
                         "id": id,
                         "object": "chat.completion.chunk",
                         "model": model_id,
-                        "choices": [{ "index": 0, "delta": { "content": piece }, "finish_reason": null }]
+                        "choices": [{ "index": 0, "delta": { "reasoning_content": r_tail }, "finish_reason": null }]
                     });
-                    if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
-                        return;
-                    }
+                    let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+                }
+                if !c_tail.is_empty() {
+                    let chunk = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "model": model_id,
+                        "choices": [{ "index": 0, "delta": { "content": c_tail }, "finish_reason": null }]
+                    });
+                    let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
                 }
             }
             if let Ok(Ok(gr)) = done_rx.await {
                 let mut finish_reason = json!(gr.finish_reason);
                 if has_tools {
-                    let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
+                    let (r_opt, answer) = reasoning::split_reasoning(&gr.text, started_in_think);
+                    if let Some(r_txt) = r_opt {
+                        let rc = json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "reasoning_content": r_txt }, "finish_reason": null }]
+                        });
+                        let _ = tx.send(Ok(Event::default().data(rc.to_string()))).await;
+                    }
+                    let (clean, calls) = tools::parse_tool_calls(&answer, "call_");
                     if !clean.is_empty() {
                         let c = json!({
                             "id": id,
@@ -774,8 +820,9 @@ async fn chat_completions(
         Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     };
-    let (msg_obj, finish_reason) = if has_tools {
-        let (clean, calls) = tools::parse_tool_calls(&gr.text, "call_");
+    let (reasoning_opt, answer_text) = reasoning::split_reasoning(&gr.text, started_in_think);
+    let (mut msg_obj, finish_reason) = if has_tools {
+        let (clean, calls) = tools::parse_tool_calls(&answer_text, "call_");
         if !calls.is_empty() {
             let tc_json: Vec<Value> = calls
                 .iter()
@@ -788,11 +835,16 @@ async fn chat_completions(
             let content_val = if clean.is_empty() { Value::Null } else { json!(clean) };
             (json!({ "role": "assistant", "content": content_val, "tool_calls": tc_json }), json!("tool_calls"))
         } else {
-            (json!({ "role": "assistant", "content": gr.text }), json!(gr.finish_reason))
+            (json!({ "role": "assistant", "content": answer_text }), json!(gr.finish_reason))
         }
     } else {
-        (json!({ "role": "assistant", "content": gr.text }), json!(gr.finish_reason))
+        (json!({ "role": "assistant", "content": answer_text }), json!(gr.finish_reason))
     };
+    if let Some(r_txt) = reasoning_opt {
+        if let Some(obj) = msg_obj.as_object_mut() {
+            obj.insert("reasoning_content".into(), json!(r_txt));
+        }
+    }
     Json(json!({
         "id": id,
         "object": "chat.completion",
@@ -968,15 +1020,12 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                 "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_id, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
             });
             let _ = tx.blocking_send(Ok(Event::default().event("message_start").data(start.to_string())));
-            if !has_tools {
-                let blk = json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } });
-                let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
-            }
 
             let mut guard = st_c.native.blocking_lock();
             match guard.as_mut() {
                 Some(active) if active.id == model_id => {
                     let fam = detect_family(active.engine.tokenizer.chat_template());
+                    let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
                     let prompt = render(fam, &chat_msgs, true, enable_thinking);
                     let greq = GenRequest {
                         prompt,
@@ -988,10 +1037,39 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                         thinking: None,
                     };
                     let tx_c = tx.clone();
+                    let mut splitter = reasoning::StreamReasoningSplitter::new(started_in_think);
+                    let mut cur_block_idx = 0usize;
+                    let mut cur_block_kind: Option<&'static str> = None;
                     match active.engine.generate(&greq, |_, piece| {
                         if piece.is_empty() || has_tools { return true; }
-                        let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": piece } });
-                        tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_ok()
+                        let (r_delta, c_delta) = splitter.push(piece);
+                        if !r_delta.is_empty() {
+                            if cur_block_kind != Some("thinking") {
+                                if cur_block_kind.is_some() {
+                                    let _ = tx_c.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                    cur_block_idx += 1;
+                                }
+                                let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "thinking", "thinking": "" } });
+                                if tx_c.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string()))).is_err() { return false; }
+                                cur_block_kind = Some("thinking");
+                            }
+                            let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "thinking_delta", "thinking": r_delta } });
+                            if tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_err() { return false; }
+                        }
+                        if !c_delta.is_empty() {
+                            if cur_block_kind != Some("text") {
+                                if cur_block_kind.is_some() {
+                                    let _ = tx_c.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                    cur_block_idx += 1;
+                                }
+                                let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "text", "text": "" } });
+                                if tx_c.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string()))).is_err() { return false; }
+                                cur_block_kind = Some("text");
+                            }
+                            let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "text_delta", "text": c_delta } });
+                            if tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_err() { return false; }
+                        }
+                        true
                     }) {
                         Ok(gr) => {
                             st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
@@ -1001,12 +1079,21 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                                 _ => "end_turn",
                             };
                             if has_tools {
-                                let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
+                                let (r_opt, answer) = reasoning::split_reasoning(&gr.text, started_in_think);
+                                let (clean, calls) = tools::parse_tool_calls(&answer, "toolu_");
                                 let mut idx = 0usize;
+                                if let Some(r_txt) = r_opt {
+                                    let blk = json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "thinking", "thinking": "" } });
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                    let d = json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "thinking_delta", "thinking": r_txt } });
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": idx }).to_string())));
+                                    idx += 1;
+                                }
                                 if !clean.is_empty() || calls.is_empty() {
                                     let blk = json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "text", "text": "" } });
                                     let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
-                                    let txt = if calls.is_empty() { &gr.text } else { &clean };
+                                    let txt = if calls.is_empty() { &answer } else { &clean };
                                     if !txt.is_empty() {
                                         let d = json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "text_delta", "text": txt } });
                                         let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
@@ -1034,7 +1121,36 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                                     }
                                 }
                             } else {
-                                let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": 0 }).to_string())));
+                                let (r_tail, c_tail) = splitter.flush();
+                                if !r_tail.is_empty() {
+                                    if cur_block_kind != Some("thinking") {
+                                        if cur_block_kind.is_some() {
+                                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                            cur_block_idx += 1;
+                                        }
+                                        let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "thinking", "thinking": "" } });
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                        cur_block_kind = Some("thinking");
+                                    }
+                                    let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "thinking_delta", "thinking": r_tail } });
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                }
+                                if !c_tail.is_empty() {
+                                    if cur_block_kind != Some("text") {
+                                        if cur_block_kind.is_some() {
+                                            let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                            cur_block_idx += 1;
+                                        }
+                                        let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "text", "text": "" } });
+                                        let _ = tx.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string())));
+                                        cur_block_kind = Some("text");
+                                    }
+                                    let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "text_delta", "text": c_tail } });
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string())));
+                                }
+                                if cur_block_kind.is_some() {
+                                    let _ = tx.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                }
                             }
                             let md = json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason }, "usage": { "output_tokens": gr.timings.predicted_n } });
                             let _ = tx.blocking_send(Ok(Event::default().event("message_delta").data(md.to_string())));
@@ -1069,6 +1185,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             return Err(format!("model mismatch: requested '{model_id_c}' but '{}' is loaded", active.id));
         }
         let fam = detect_family(active.engine.tokenizer.chat_template());
+        let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
         let prompt = render(fam, &chat_msgs, true, enable_thinking);
         let greq = GenRequest {
             prompt,
@@ -1081,34 +1198,41 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         };
         let out = active.engine.generate(&greq, |_, _| true).map_err(|e| e.to_string());
         st_c.governor.blocking_lock().touch(&model_id_c, Instant::now());
-        out
+        out.map(|gr| (gr, started_in_think))
     })
     .await;
     match res {
-        Ok(Ok(gr)) => {
+        Ok(Ok((gr, started_in_think))) => {
             st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
             st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
             let default_stop = match gr.finish_reason {
                 FinishReason::Length => "max_tokens",
                 _ => "end_turn",
             };
-            let (content, stop_reason) = if has_tools {
-                let (clean, calls) = tools::parse_tool_calls(&gr.text, "toolu_");
+            let (r_opt, answer) = reasoning::split_reasoning(&gr.text, started_in_think);
+            let mut blocks = Vec::new();
+            if let Some(r_txt) = r_opt {
+                blocks.push(json!({ "type": "thinking", "thinking": r_txt }));
+            }
+            let stop_reason = if has_tools {
+                let (clean, calls) = tools::parse_tool_calls(&answer, "toolu_");
                 if !calls.is_empty() {
-                    let mut blocks = Vec::new();
                     if !clean.is_empty() {
                         blocks.push(json!({ "type": "text", "text": clean }));
                     }
                     for tc in &calls {
                         blocks.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments }));
                     }
-                    (blocks, "tool_use")
+                    "tool_use"
                 } else {
-                    (vec![json!({ "type": "text", "text": gr.text })], default_stop)
+                    blocks.push(json!({ "type": "text", "text": answer }));
+                    default_stop
                 }
             } else {
-                (vec![json!({ "type": "text", "text": gr.text })], default_stop)
+                blocks.push(json!({ "type": "text", "text": answer }));
+                default_stop
             };
+            let content = blocks;
             Json(json!({
                 "id": msg_id,
                 "type": "message",
