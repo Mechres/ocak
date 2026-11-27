@@ -14,6 +14,8 @@
 #define DPT (HHD / 4u)     // packed output dims per lane
 #define NREL 16u
 #define RB_ROWS 64u        // relative-bias rows staged per tile (>= BK + 64 / group - 1)
+#define HS (HHD + 1u)      // padded shared row stride (rows land in different banks)
+#define PS (BK + 1u)       // padded P row stride
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
 layout(set = 0, binding = 1) readonly buffer Rr { float rr[]; };
@@ -47,10 +49,10 @@ layout(push_constant) uniform PC {
     uint n_tok;
 } pc;
 
-shared uint qs[64u * HHD];
-shared uint ks[BK * HHD];
-shared uint vs[BK * HHD];
-shared float ps[64u * BK];
+shared uint qs[64u * HS];
+shared uint ks[BK * HS];
+shared uint vs[BK * HS];
+shared float ps[64u * PS];
 shared float rbs[RB_ROWS * NREL];
 
 void main() {
@@ -86,7 +88,7 @@ void main() {
         float qn = sqrt(ss);
         float qf = ((qn > pc.qk_clip) ? (pc.qk_clip / qn) : 1.0) * tau * scale;
         for (uint e = 0u; e < 16u; e++)
-            qs[r * HHD + sub * 16u + e] = packHalf2x16(vec2(qv[2u * e], qv[2u * e + 1u]) * (row_valid ? qf : 0.0));
+            qs[r * HS + sub * 16u + e] = packHalf2x16(vec2(qv[2u * e], qv[2u * e + 1u]) * (row_valid ? qf : 0.0));
     }
     // R (relative query, n_rel <= 16): clip, norm clip to rel_clip, times tau. Kept in registers
     // (all 4 lanes of the row hold the full vector).
@@ -117,21 +119,27 @@ void main() {
     for (uint j = 0u; j < DPT; j++) acc[j] = vec2(0.0);
     barrier();
 
+    // K/V tile staging with a register prefetch of the next tile (cache slot = t, or t % cap in
+    // the SWA ring). BK * HHD = 2048 words: 8 per thread.
+    #define LPT ((BK * HHD) / 256u)
+    uint pk[LPT];
+    uint pv[LPT];
+    for (uint u = 0u; u < LPT; u++) {
+        uint idx = tid + 256u * u;
+        uint t = t_lo + idx / HHD;
+        pk[u] = 0u; pv[u] = 0u;
+        if (t <= max_qpos) {
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+            uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + idx % HHD;
+            pk[u] = kcache[kb];
+            pv[u] = vcache[kb];
+        }
+    }
     for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
-        // Stage K/V tile (cache slot = t, or t % cap in the SWA ring).
-        for (uint idx = tid; idx < BK * HHD; idx += 256u) {
-            uint kk = idx / HHD;
-            uint e = idx % HHD;
-            uint t = t0 + kk;
-            uint kval = 0u, vval = 0u;
-            if (t <= max_qpos) {
-                uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-                uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + e;
-                kval = kcache[kb];
-                vval = vcache[kb];
-            }
-            ks[kk * HHD + e] = kval;
-            vs[kk * HHD + e] = vval;
+        for (uint u = 0u; u < LPT; u++) {
+            uint idx = tid + 256u * u;
+            ks[(idx / HHD) * HS + idx % HHD] = pk[u];
+            vs[(idx / HHD) * HS + idx % HHD] = pv[u];
         }
         // Stage relative-bias rows for distances dist_base .. dist_base + RB_ROWS - 1.
         uint dist_base = (min_qpos + 1u > t0 + BK) ? (min_qpos + 1u - t0 - BK) : 0u;
@@ -141,12 +149,25 @@ void main() {
             rbs[idx] = (dd < pc.n_extent && j < pc.n_rel) ? rbias[dd * pc.n_rel + j] : 0.0;
         }
         barrier();
+        if (t0 + BK <= max_qpos) {
+            for (uint u = 0u; u < LPT; u++) {
+                uint idx = tid + 256u * u;
+                uint t = t0 + BK + idx / HHD;
+                pk[u] = 0u; pv[u] = 0u;
+                if (t <= max_qpos) {
+                    uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+                    uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + idx % HHD;
+                    pk[u] = kcache[kb];
+                    pv[u] = vcache[kb];
+                }
+            }
+        }
 
         float s[KPT];
         for (uint j = 0u; j < KPT; j++) s[j] = 0.0;
         for (uint e = 0u; e < HHD; e++) {
-            vec2 qv = unpackHalf2x16(qs[r * HHD + e]);
-            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HHD + e]));
+            vec2 qv = unpackHalf2x16(qs[r * HS + e]);
+            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HS + e]));
         }
         float tmax = -3.0e38;
         for (uint j = 0u; j < KPT; j++) {
@@ -172,7 +193,7 @@ void main() {
         float psum = 0.0;
         for (uint j = 0u; j < KPT; j++) {
             float p = (s[j] > -1.0e38) ? exp(s[j] - m_new) : 0.0;
-            ps[r * BK + sub * KPT + j] = p;
+            ps[r * PS + sub * KPT + j] = p;
             psum += p;
         }
         psum = subgroupClusteredAdd(psum, 4u);
@@ -182,8 +203,8 @@ void main() {
         barrier();
 
         for (uint kk = 0u; kk < BK; kk++) {
-            float p = ps[r * BK + kk];
-            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HHD + sub * DPT + j]);
+            float p = ps[r * PS + kk];
+            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HS + sub + 4u * j]);
         }
         barrier();
     }
@@ -193,7 +214,7 @@ void main() {
         uint gb = pc.g_off + tok_r * pc.g_stride + h * HD;
         uint ob = (tok_r * pc.n_head + h) * HD;
         for (uint j = 0u; j < DPT; j++) {
-            uint d = 2u * (sub * DPT + j);
+            uint d = 2u * (sub + 4u * j);
             float g0 = 1.0 / (1.0 + exp(-gate[gb + d]));
             float g1 = 1.0 / (1.0 + exp(-gate[gb + d + 1u]));
             o[ob + d] = acc[j].x * inv * g0;
