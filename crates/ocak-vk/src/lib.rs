@@ -808,22 +808,22 @@ impl VkContext {
                 sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
                 qmmq: vec![
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q5_k.spv")), "qmmq_q5_k", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q6_k.spv")), "qmmq_q6_k", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q8_0.spv")), "qmmq_q8_0", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q2_k.spv")), "qmmq_q2_k", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q3_k.spv")), "qmmq_q3_k", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_nl.spv")), "qmmq_iq4_nl", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_xs.spv")), "qmmq_iq4_xs", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_s.spv")), "qmmq_iq3_s", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_xxs.spv")), "qmmq_iq3_xxs", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xs.spv")), "qmmq_iq2_xs", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_s.spv")), "qmmq_iq2_s", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xxs.spv")), "qmmq_iq2_xxs", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_s.spv")), "qmmq_iq1_s", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_m.spv")), "qmmq_iq1_m", 5, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_nvfp4.spv")), "qmmq_nvfp4", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q5_k.spv")), "qmmq_q5_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q6_k.spv")), "qmmq_q6_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q8_0.spv")), "qmmq_q8_0", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q2_k.spv")), "qmmq_q2_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q3_k.spv")), "qmmq_q3_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_nl.spv")), "qmmq_iq4_nl", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_xs.spv")), "qmmq_iq4_xs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_s.spv")), "qmmq_iq3_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_xxs.spv")), "qmmq_iq3_xxs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xs.spv")), "qmmq_iq2_xs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_s.spv")), "qmmq_iq2_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xxs.spv")), "qmmq_iq2_xxs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_s.spv")), "qmmq_iq1_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_m.spv")), "qmmq_iq1_m", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_nvfp4.spv")), "qmmq_nvfp4", 5, 40)?,
                 ],
                 qmmqg: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q4_k.spv")), "qmmqg_q4_k", 6, 52)?,
@@ -1489,9 +1489,34 @@ impl<'a> Recorder<'a> {
         }
         let Some(q_off) = self.quantize_q8(x, x_off, k, batch) else { return false };
         let n = batch as u64 * k as u64;
-        let pc = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k), batch];
         let q8 = self.ctx.q8_scratch;
-        self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
+        let (gx, gy) = (m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN));
+        let kblocks = k / 32;
+        // Small m (e.g. 48-row gate projections, 1024-row KV projections) gives too few
+        // workgroups: split the K blocks across workgroup z and sum the partials.
+        let splits = if gx * gy < 80 { (160 / (gx * gy)).min(kblocks / 32).min(32) } else { 1 };
+        let part = batch as u64 * m as u64 * 4;
+        if splits >= 2 && part * splits as u64 <= ATTN_SCRATCH_BYTES {
+            let bytes = part * splits as u64;
+            if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+                self.barrier();
+                self.scratch_cursor = 0;
+            }
+            let s_off = self.scratch_cursor;
+            self.scratch_cursor += bytes;
+            let kbchunk = kblocks.div_ceil(splits);
+            let splits = kblocks.div_ceil(kbchunk);
+            let scratch = self.ctx.attn_scratch;
+            let pcs = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(s_off / 4), k, m, ty.row_bytes(k), batch, kbchunk, batch * m];
+            self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
+            self.barrier();
+            let nn = batch * m;
+            let pcr = [off_u32(s_off / 4), off_u32(y_off), nn, splits];
+            self.dispatch_raw(&self.ctx.pipelines.sum_splits, &[scratch, y.buf], bytemuck::cast_slice(&pcr), nn.div_ceil(256), 1, 1);
+        } else {
+            let pc = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k), batch, kblocks, 0];
+            self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1);
+        }
         self.q8_cache = Some((x.buf, x_off, k, batch, q_off));
         true
     }
@@ -2091,8 +2116,8 @@ impl<'a> Recorder<'a> {
         self.attention_swa(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, 0);
     }
     /// Flash-style causal prefill attention (attention_prefill.comp) for queries at pos..pos+batch:
-    /// each workgroup stages K/V tiles once for 64 query rows of one KV head. Falls back to
-    /// `attention_batch` when head_dim > 256 or the GQA group size does not divide 64.
+    /// each workgroup stages K/V tiles once for group * (64 / group) query rows of one KV head.
+    /// Falls back to `attention_batch` when head_dim > 256 or the GQA group exceeds 64.
     pub fn attention_prefill(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32, batch: u32) {
         let group = n_heads / n_kv_heads.max(1);
         let pipe = match head_dim {
@@ -2103,7 +2128,7 @@ impl<'a> Recorder<'a> {
                 return;
             }
         };
-        if group == 0 || !64u32.is_multiple_of(group) || !head_dim.is_multiple_of(2) {
+        if group == 0 || group > 64 || !n_heads.is_multiple_of(n_kv_heads) || !head_dim.is_multiple_of(2) {
             self.attention_batch(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, sliding_window, batch);
             return;
         }
@@ -2775,7 +2800,7 @@ mod tests {
         let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
         c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
         let by = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        for wt in [WType::F32, WType::F16, WType::Q8_0, WType::Q4K, WType::Q6K, WType::IQ3S, WType::IQ2XS] {
+        for wt in [WType::F32, WType::F16, WType::Q8_0, WType::Q4K, WType::Q6K, WType::Q2K, WType::Q3K, WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2XXS, WType::IQ2S, WType::IQ1S] {
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
             let bw = c.create_device_buffer(raw.len() as u64).unwrap();
@@ -2856,7 +2881,7 @@ mod tests {
             ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
         };
         // (n_heads, n_kv_heads, head_dim, pos0, n_tok, sliding_window)
-        for &(nh, nkv, hd, pos0, ntok, sw) in &[(16u32, 4u32, 128u32, 37u32, 75u32, 0u32), (8, 8, 64, 0, 40, 0), (16, 2, 256, 300, 50, 0), (12, 4, 128, 500, 70, 64)] {
+        for &(nh, nkv, hd, pos0, ntok, sw) in &[(16u32, 4u32, 128u32, 37u32, 75u32, 0u32), (8, 8, 64, 0, 40, 0), (16, 2, 256, 300, 50, 0), (12, 4, 128, 500, 70, 64), (24, 4, 256, 100, 70, 0)] {
             let n_ctx = (pos0 + ntok) as usize;
             let n_pages = n_ctx.div_ceil(16);
             let half_kv_dim = (nkv * hd / 2) as usize;
@@ -3147,57 +3172,59 @@ mod tests {
     #[test]
     fn vk_qmm_int8_matches_qmv() {
         let c = VkContext::new().expect("vulkan init");
-        // m and batch not multiples of the 64x128 tile; k spans two 256-blocks.
-        let (k, m, batch) = (512usize, 70usize, 150usize);
-        let mut s = 0x0BAD_F00Du64;
-        let mut next_u8 = || -> u8 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (s >> 32) as u8
-        };
-        // Activations with varying magnitude per 32-block, including all-zero blocks.
-        let x: Vec<f32> = (0..batch * k)
-            .map(|i| if (i / 32) % 17 == 5 { 0.0 } else { ((i * 7 % 31) as f32 - 15.0) * 0.05 * (1.0 + (i / 32 % 5) as f32) })
-            .collect();
-        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
-        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
-        let by_a = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        let by_b = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        let by_ref = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        for wt in [WType::Q4K, WType::Q5K, WType::Q6K, WType::Q8_0, WType::Q2K, WType::Q3K, WType::IQ4NL, WType::IQ4XS, WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::NVFP4] {
-            let rb = wt.row_bytes(k as u32) as usize;
-            let raw: Vec<u8> = (0..m * rb).map(|_| next_u8() & 0x3F).collect();
-            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
-            c.upload(&bw, 0, &raw).unwrap();
-            let mut rec = c.begin();
-            rec.set_defer_barriers(true);
-            assert!(rec.qmm_int8(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch as u32));
-            // A second matmul on the same X reuses the quantized activations.
-            assert!(rec.q8_cache.is_some());
-            assert!(rec.qmm_int8(wt, &bw, 0, &bx, 0, &by_b, 0, k as u32, m as u32, batch as u32));
-            rec.barrier();
-            for b in 0..batch {
-                rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_ref, (b * m) as u64, k as u32, m as u32);
+        // m and batch not multiples of the 64x128 tile; k spans two 256-blocks. The second shape
+        // (small m, large k) takes the split-K path.
+        for (k, m, batch) in [(512usize, 70usize, 150usize), (4608, 48, 200)] {
+            let mut s = 0x0BAD_F00Du64;
+            let mut next_u8 = || -> u8 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 32) as u8
+            };
+            // Activations with varying magnitude per 32-block, including all-zero blocks.
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| if (i / 32) % 17 == 5 { 0.0 } else { ((i * 7 % 31) as f32 - 15.0) * 0.05 * (1.0 + (i / 32 % 5) as f32) })
+                .collect();
+            let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+            c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+            let by_a = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+            let by_b = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+            let by_ref = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+            for wt in [WType::Q4K, WType::Q5K, WType::Q6K, WType::Q8_0, WType::Q2K, WType::Q3K, WType::IQ4NL, WType::IQ4XS, WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::NVFP4] {
+                let rb = wt.row_bytes(k as u32) as usize;
+                let raw: Vec<u8> = (0..m * rb).map(|_| next_u8() & 0x3F).collect();
+                let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+                c.upload(&bw, 0, &raw).unwrap();
+                let mut rec = c.begin();
+                rec.set_defer_barriers(true);
+                assert!(rec.qmm_int8(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch as u32));
+                // A second matmul on the same X reuses the quantized activations.
+                assert!(rec.q8_cache.is_some());
+                assert!(rec.qmm_int8(wt, &bw, 0, &bx, 0, &by_b, 0, k as u32, m as u32, batch as u32));
+                rec.barrier();
+                for b in 0..batch {
+                    rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_ref, (b * m) as u64, k as u32, m as u32);
+                }
+                rec.barrier();
+                rec.finish_and_wait().unwrap();
+                let mut ya = vec![0f32; batch * m];
+                let mut yb = vec![0f32; batch * m];
+                let mut yr = vec![0f32; batch * m];
+                c.download(&by_a, 0, bytemuck::cast_slice_mut(&mut ya)).unwrap();
+                c.download(&by_b, 0, bytemuck::cast_slice_mut(&mut yb)).unwrap();
+                c.download(&by_ref, 0, bytemuck::cast_slice_mut(&mut yr)).unwrap();
+                assert_eq!(ya, yb, "{wt:?}: reused quantization differs");
+                // int8 activations (like llama.cpp's q8_1 MMQ): error ~ amax/254 per element.
+                let scale = yr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+                let mut sum_err = 0f64;
+                for i in 0..batch * m {
+                    let e = (ya[i] - yr[i]).abs();
+                    sum_err += e as f64;
+                    assert!(e <= 2e-2 * scale, "int8 qmm vs qmv mismatch for {wt:?} idx={i}: {} vs {}", ya[i], yr[i]);
+                }
+                let mean = sum_err / (batch * m) as f64;
+                eprintln!("{wt:?}: int8 max-scale {scale} mean err {mean:.3e}");
+                assert!(mean <= 3e-3 * scale as f64, "{wt:?}: mean error {mean} too high (scale {scale})");
             }
-            rec.barrier();
-            rec.finish_and_wait().unwrap();
-            let mut ya = vec![0f32; batch * m];
-            let mut yb = vec![0f32; batch * m];
-            let mut yr = vec![0f32; batch * m];
-            c.download(&by_a, 0, bytemuck::cast_slice_mut(&mut ya)).unwrap();
-            c.download(&by_b, 0, bytemuck::cast_slice_mut(&mut yb)).unwrap();
-            c.download(&by_ref, 0, bytemuck::cast_slice_mut(&mut yr)).unwrap();
-            assert_eq!(ya, yb, "{wt:?}: reused quantization differs");
-            // int8 activations (like llama.cpp's q8_1 MMQ): error ~ amax/254 per element.
-            let scale = yr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
-            let mut sum_err = 0f64;
-            for i in 0..batch * m {
-                let e = (ya[i] - yr[i]).abs();
-                sum_err += e as f64;
-                assert!(e <= 2e-2 * scale, "int8 qmm vs qmv mismatch for {wt:?} idx={i}: {} vs {}", ya[i], yr[i]);
-            }
-            let mean = sum_err / (batch * m) as f64;
-            eprintln!("{wt:?}: int8 max-scale {scale} mean err {mean:.3e}");
-            assert!(mean <= 3e-3 * scale as f64, "{wt:?}: mean error {mean} too high (scale {scale})");
         }
     }
 

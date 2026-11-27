@@ -4,11 +4,20 @@
 // and q1 (i >= 4). d and m are constant over the 16-column group containing k0.
 // The including shader defines `w` (uint8_t[]), `w32` (uint[], same buffer) and `tbl` (IQ
 // grid tables).
-float f16at(uint o) { return unpackHalf2x16(uint(w[o]) | (uint(w[o + 1u]) << 8)).x; }
+// fp16 at an even byte offset: one aligned 32-bit load.
+float f16at(uint o) { return unpackHalf2x16(w32[o >> 2] >> ((o & 2u) << 3)).x; }
 uint pack4(int a, int b, int c, int e) {
     return uint(a & 0xFF) | (uint(b & 0xFF) << 8) | (uint(c & 0xFF) << 16) | (uint(e & 0xFF) << 24);
 }
-uint bytes4(uint o) { return uint(w[o]) | (uint(w[o + 1u]) << 8) | (uint(w[o + 2u]) << 16) | (uint(w[o + 3u]) << 24); }
+// 4 bytes at any offset from two aligned 32-bit loads (funnel shift; sh = 0 adds nothing since
+// (x << 1) << 31 drops every bit of x << 1).
+uint bytes4(uint o) {
+    uint a = o >> 2;
+    uint sh = (o & 3u) << 3;
+    return (w32[a] >> sh) | ((w32[a + 1u] << 1) << (31u - sh));
+}
+// Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
+uint sub_bytes(uint x, uint c) { return ((x | 0x80808080u) - c) ^ 0x80808080u; }
 
 void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) {
 #if defined(Q4_K) || defined(Q5_K)
@@ -60,8 +69,8 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint u1 = ((lo1 >> sl) & 0x0F0F0F0Fu) | (((hi1 >> sh) & 0x03030303u) << 4);
     // q - 32 per byte without cross-byte borrows: bytes are 0..63, so (b + 0x80) - 0x20
     // stays in 0x60..0x9F, and flipping bit 7 back gives (b - 32) mod 256.
-    q0 = ((u0 | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
-    q1 = ((u1 | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+    q0 = sub_bytes(u0, 0x20202020u);
+    q1 = sub_bytes(u1, 0x20202020u);
 #elif defined(Q8_0)
     uint b = rb + (k0 >> 5) * 34u;
     uint o = b + 2u + (k0 & 31u);
@@ -76,11 +85,14 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint g = (n >> 5) & 3u;
     uint l = n & 31u;
     uint sc = uint(w[b + half_ * 8u + 2u * g + (l >> 4)]);
-    d = f16at(b + 80u) * float(sc & 0xFu);
+    // The 4-bit sub-scale is folded into the integer weights (q * sc <= 45 per byte, so the
+    // packed multiply never carries), leaving the superblock d as the only weight scale; the
+    // min (per 16) stays separate.
+    d = f16at(b + 80u);
     m = f16at(b + 82u) * float(sc >> 4);
     uint qo = (b + 16u + half_ * 32u + l) >> 2;   // 84-byte blocks: 4-byte aligned
-    q0 = (w32[qo] >> (2u * g)) & 0x03030303u;
-    q1 = (w32[qo + 1u] >> (2u * g)) & 0x03030303u;
+    q0 = ((w32[qo] >> (2u * g)) & 0x03030303u) * (sc & 0xFu);
+    q1 = ((w32[qo + 1u] >> (2u * g)) & 0x03030303u) * (sc & 0xFu);
 #elif defined(Q3_K)
     uint b = rb + (k0 >> 8) * 110u;
     uint n = k0 & 255u;
@@ -94,11 +106,11 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     m = 0.0;
     uint qo = b + 32u + half_ * 32u + l;
     uint hs = half_ * 4u + g;
-    int v[8];
-    for (uint i = 0u; i < 8u; i++)
-        v[i] = int((uint(w[qo + i]) >> (2u * g)) & 3u) - ((((uint(w[b + l + i]) >> hs) & 1u) != 0u) ? 0 : 4);
-    q0 = pack4(v[0], v[1], v[2], v[3]);
-    q1 = pack4(v[4], v[5], v[6], v[7]);
+    // q = low 2 bits + 4 * hmask bit - 4, per byte.
+    uint lo0 = (bytes4(qo) >> (2u * g)) & 0x03030303u, lo1 = (bytes4(qo + 4u) >> (2u * g)) & 0x03030303u;
+    uint hm0 = (bytes4(b + l) >> hs) & 0x01010101u, hm1 = (bytes4(b + l + 4u) >> hs) & 0x01010101u;
+    q0 = sub_bytes(lo0 | (hm0 << 2), 0x04040404u);
+    q1 = sub_bytes(lo1 | (hm1 << 2), 0x04040404u);
 #elif defined(IQ4_NL) || defined(IQ4_XS)
 #if defined(IQ4_NL)
     uint b = rb + (k0 >> 5) * 18u;

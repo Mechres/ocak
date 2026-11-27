@@ -57,6 +57,7 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint group = pc.n_heads / pc.n_kv_heads;
     uint bq = R / group;
+    uint rows = bq * group;   // rows in use (group need not divide 64)
     uint q0 = gl_WorkGroupID.y * bq;
     uint hhd = pc.head_dim >> 1;
     uint half_kv_dim = pc.n_kv_heads * hhd;
@@ -69,7 +70,7 @@ void main() {
         uint tok = q0 + r / group;
         uint h = kvh * group + r % group;
         vec2 v = vec2(0.0);
-        if (tok < pc.n_tok) {
+        if (r < rows && tok < pc.n_tok) {
             uint qb = pc.q_off + (tok * pc.n_heads + h) * pc.head_dim + 2u * e;
             v = vec2(q[qb], q[qb + 1u]) * scale;
         }
@@ -85,8 +86,8 @@ void main() {
     uint rb = ra + 1u;
     uint tok_a = q0 + ra / group;
     uint tok_b = q0 + rb / group;
-    bool valid_a = tok_a < pc.n_tok;
-    bool valid_b = tok_b < pc.n_tok;
+    bool valid_a = ra < rows && tok_a < pc.n_tok;
+    bool valid_b = rb < rows && tok_b < pc.n_tok;
     uint qpos_a = pc.pos0 + tok_a;
     uint qpos_b = pc.pos0 + tok_b;
     uint ntq = min(bq, pc.n_tok - q0);
@@ -196,7 +197,7 @@ void main() {
     for (uint w = 0u; w < 2u; w++) {
         uint r = ra + w;
         uint tok_r = (w == 0u) ? tok_a : tok_b;
-        if (tok_r >= pc.n_tok) continue;
+        if (r >= rows || tok_r >= pc.n_tok) continue;
         uint h = kvh * group + r % group;
         float inv = 1.0 / ((w == 0u) ? la : lb);
         uint ob = pc.out_off + (tok_r * pc.n_heads + h) * pc.head_dim;

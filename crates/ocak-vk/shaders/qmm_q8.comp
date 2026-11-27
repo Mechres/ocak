@@ -9,12 +9,16 @@
 // product is dotPacked4x8EXT (4 MACs per instruction) with one float scale fix-up per
 // 16-column group:  sum_i (d q_i - m) * dx qx_i = d dx (q . qx) - m (dx sum qx).
 // Compiled once per weight format with -D<TYPE> (see build.rs).
-#if defined(Q6_K) || defined(Q2_K) || defined(Q3_K) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ1_M) || defined(NVFP4)
+#if defined(Q6_K) || defined(Q3_K) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ1_M) || defined(NVFP4)
 #define SCALE16
 #endif
 // Formats with a per-block min (weights d * q - m); the others skip the min fix-up.
 #if defined(Q4_K) || defined(Q5_K) || defined(Q2_K)
 #define HAS_MIN
+#endif
+// Q2_K: one weight scale per 32 (sub-scales folded into the integers) but a min per 16.
+#if defined(Q2_K)
+#define MIN16
 #endif
 #define TM 4u
 #define BM 64u
@@ -45,7 +49,9 @@ layout(push_constant) uniform PC {
     uint x_div; uint slice_bytes; uint n_groups; uint count; uint use_list; uint cap;
 } pc;
 #else
-layout(push_constant) uniform PC { uint w_off; uint q_off4; uint s_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+// Split-K (small m, large k): workgroup z covers K blocks [z * kbchunk, (z + 1) * kbchunk) and
+// writes its partial result at y_off + z * split_stride (summed by sum_splits.comp).
+layout(push_constant) uniform PC { uint w_off; uint q_off4; uint s_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; uint kbchunk; uint split_stride; } pc;
 #endif
 
 shared uvec4 ws[8u * (BM / 4u)];   // [k word][row / 4] (4 consecutive rows per uvec4)
@@ -90,6 +96,13 @@ void main() {
 #else
     uint xblk0 = col * kblocks;
 #endif
+#ifdef GROUPED
+    uint kb_beg = 0u, kb_end = kblocks, ybase = pc.y_off;
+#else
+    uint kb_beg = gl_WorkGroupID.z * pc.kbchunk;
+    uint kb_end = min(kblocks, kb_beg + pc.kbchunk);
+    uint ybase = pc.y_off + gl_WorkGroupID.z * pc.split_stride;
+#endif
 
     uint tx = lid & 15u;   // rows tx*4 .. +3
     uint ty = lid >> 4;    // cols ty*TN .. +TN-1
@@ -103,11 +116,11 @@ void main() {
     float pd, pm;
     uint pxv[WPT];
     vec4 pxs;
-    dqi8(rb, ld_part * 8u, pq0, pq1, pd, pm);
-    for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + xblk0 * 8u + x_part * WPT + c];
-    pxs = xsc[pc.s_off + xblk0];
+    dqi8(rb, (kb_beg << 5) + ld_part * 8u, pq0, pq1, pd, pm);
+    for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + (xblk0 + kb_beg) * 8u + x_part * WPT + c];
+    pxs = xsc[pc.s_off + xblk0 + kb_beg];
 
-    for (uint kb = 0u; kb < kblocks; kb++) {
+    for (uint kb = kb_beg; kb < kb_end; kb++) {
         {
             uint kw = ld_part * 2u;
             ws[kw * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq0;
@@ -129,7 +142,7 @@ void main() {
             }
         }
         barrier();
-        if (kb + 1u < kblocks) {
+        if (kb + 1u < kb_end) {
             dqi8(rb, ((kb + 1u) << 5) + ld_part * 8u, pq0, pq1, pd, pm);
             for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + (xblk0 + kb + 1u) * 8u + x_part * WPT + c];
             pxs = xsc[pc.s_off + xblk0 + kb + 1u];
@@ -208,13 +221,24 @@ void main() {
             float wm[TM];
             for (uint i = 0u; i < TM; i++) wm[i] = wsm[tx * TM + i];
 #endif
+#ifdef MIN16
+            float wm1[TM];
+            for (uint i = 0u; i < TM; i++) wm1[i] = wsm[BM + tx * TM + i];
+#endif
             for (uint j = 0u; j < TN; j++) {
                 float xd = xsd[ty * TN + j];
 #ifdef HAS_MIN
+#ifdef MIN16
+                float xm0 = xsm[ty * TN + j];
+                float xm1 = xsm[BN + ty * TN + j];
+#else
                 float xm = xsm[ty * TN + j] + xsm[BN + ty * TN + j];
 #endif
+#endif
                 for (uint i = 0u; i < TM; i++)
-#ifdef HAS_MIN
+#ifdef MIN16
+                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - (wm[i] * xm0 + wm1[i] * xm1);
+#elif defined(HAS_MIN)
                     acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - wm[i] * xm;
 #else
                     acc[j][i] += float(ia[j][i]) * (wd[i] * xd);
@@ -235,7 +259,7 @@ void main() {
 #endif
         for (uint i = 0u; i < TM; i++) {
             uint row = row0 + tx * TM + i;
-            if (row < pc.m) y[pc.y_off + yentry * pc.m + row] = acc[j][i];
+            if (row < pc.m) y[ybase + yentry * pc.m + row] = acc[j][i];
         }
     }
 }
