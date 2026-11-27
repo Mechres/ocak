@@ -315,6 +315,16 @@ impl MtpDrafter {
 
     /// Fast greedy draft token using on-device GPU argmax (downloads 4 bytes instead of full vocab logits).
     pub fn draft_token(&mut self, h_main: &[f32], token: u32, pos: usize) -> Result<u32, EngineError> {
+        self.draft_token_impl(Some(h_main), token, pos)
+    }
+
+    /// Chained draft: like `draft_token`, but the hidden input is the drafter's own output from
+    /// the previous draft (kept on the GPU), predicting one more token ahead.
+    pub fn draft_token_chain(&mut self, token: u32, pos: usize) -> Result<u32, EngineError> {
+        self.draft_token_impl(None, token, pos)
+    }
+
+    fn draft_token_impl(&mut self, h_main: Option<&[f32]>, token: u32, pos: usize) -> Result<u32, EngineError> {
         #[cfg(feature = "vulkan")]
         if let Some(gp) = &self.gpu {
             if pos >= self.max_ctx {
@@ -328,9 +338,15 @@ impl MtpDrafter {
             let r = token as usize;
             dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
             gp.ctx.upload(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
-            gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h_main)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            if let Some(h) = h_main {
+                gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            }
             let mut rec = gp.ctx.begin();
             rec.set_defer_barriers(true);
+            if h_main.is_none() {
+                rec.copy(&gp.h_out, 0, &gp.h_in, 0, ne as u32);
+                rec.barrier();
+            }
             rec.rms_norm(&gp.tok_e, 0, &gp.enorm, 0, &gp.concat, 0, ne as u32, c.eps);
             rec.rms_norm(&gp.h_in, 0, &gp.hnorm, 0, &gp.concat, ne as u64, ne as u32, c.eps);
             rec.barrier();
@@ -381,6 +397,9 @@ impl MtpDrafter {
             gp.ctx.download(&gp.argmax_out, 0, bytemuck::cast_slice_mut(&mut best)).map_err(|e| EngineError::Backend(e.to_string()))?;
             return Ok(best[0]);
         }
+        let Some(h_main) = h_main else {
+            return Err(EngineError::Unsupported("chained MTP drafts need the GPU drafter".into()));
+        };
         let dl = self.draft_logits(h_main, token, pos)?;
         Ok(dl
             .iter()

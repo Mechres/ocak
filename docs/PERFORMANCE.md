@@ -91,6 +91,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Host-cached staging buffer (was write-combined: CPU reads ~200 MB/s) | 1 MB logits download 4.5 -> 0.2 ms; sampled decode Qwen3.8 IQ2_S 26.5 -> 33.7 tok/s |
 | MTP for sampled decoding by default (sample from the target logits, accept the draft iff it equals the sample: exact, same draw count per token) | Qwen3.8 Q2_K at T=0.7: 24.5 -> 37.9 tok/s |
 | Sampler without a full-vocabulary sort when top_k = 0 (O(n) for plain temperature; growing top-M prefix for top_p / min_p) | top_k = 0 sampling 8.0 -> 1.8 ms per token (248k vocab) |
+| Drafter KV gap fill: feed the accepted (hidden, draft) pair to the MTP layer's KV (it skipped one position per accepted draft) | acceptance +1-2 points, ~+1% |
+| Multi-draft greedy MTP: chained drafts (drafter's own output hidden), one 2..4-token verify, per-token rollback snapshots written by the DeltaNet/conv kernels, adaptive 1 vs 2 drafts (EMA of second-draft acceptance) | Qwen3.8 Q2_K story 39 -> 44.4, code 48.7; IQ2_S (borrowed head) code 50.4 -> 54.8 tok/s; output identical |
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
@@ -122,13 +124,15 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | More Inkling experts in VRAM at the cost of prefill buffers | est. +5% decode, -40% long-prompt prefill | not done; 12 GB card |
 | Decode matvec: two rows per 32-lane group (share activation loads) | no change per kernel | activation loads are not the limit (cached, overlapped) |
 | MTP draft head over only the first N vocab rows (BPE: low ids are common) | N=65536: ~+2-5% (within noise), acceptance 72 -> 69% | marginal, and acceptance would drop for text with high token ids (non-English, code) |
+| Fixed 3 MTP drafts per step | slower than 2 (Q2_K 41.0 vs 44.7) | third-draft acceptance too low for its drafter pass + verify row |
+| Fixed 2 drafts on low-acceptance text | IQ2_S story 46.7 vs 47.7 with 1 draft | replaced by the adaptive choice |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
 ## Open ideas (not tried yet)
 
 - Decode: IQ1_S and Q3_K block decoders reach only ~225-246 GB/s (others 320-370).
-- MTP: draft more than one token per step (acceptance is ~74% on Qwen3.8).
+- MTP: multi-draft for sampled decoding (greedy only so far); drafting the second token without the extra drafter round trip (embedding lookup on the GPU).
 - Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
   input).
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).

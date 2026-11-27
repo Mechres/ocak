@@ -360,6 +360,14 @@ impl NativeEngine {
             && think_gov.is_none()
             && !use_mtp;
         let prof_mtp = std::env::var("OCAK_MTP_PROFILE").is_ok();
+        let mtp_fill_gaps = std::env::var("OCAK_MTP_NOFILL").is_err();
+        // Greedy MTP drafts per step (chained through the drafter's own hidden state).
+        let (mut chain_ema, mut mtp_step) = (0.6f32, 0usize);
+        let n_drafts = if self.mtp.as_ref().is_some_and(|m| m.has_gpu()) {
+            std::env::var("OCAK_MTP_DRAFTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, 3)
+        } else {
+            1
+        };
         // MTP verification may use device-side argmax when sampling is plain greedy.
         let verify_greedy = req.sampler.temperature <= 0.0
             && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
@@ -367,7 +375,7 @@ impl NativeEngine {
             && think_gov.is_none();
         let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
 
-        while gen_tokens.len() < req.max_tokens && tokens.len() < self.max_ctx {
+        'gen: while gen_tokens.len() < req.max_tokens && tokens.len() < self.max_ctx {
             let next_tok = if let Some(ft) = forced_tok.take() {
                 ft
             } else if let Some(forced) = think_gov.as_mut().and_then(|g| g.forced_next()) {
@@ -411,6 +419,106 @@ impl NativeEngine {
             }
 
             let pos = tokens.len() - 1;
+            // Multi-draft greedy MTP: draft n tokens (chained), verify all in one batch, accept the
+            // longest prefix the target model agrees with, roll recurrent state back to it.
+            // Adaptive: a chained draft costs a drafter pass plus a verify row, so it is only used
+            // while later drafts are being accepted often enough (EMA of P(draft k+1 | draft k)),
+            // with a periodic probe to notice when acceptance recovers.
+            mtp_step += 1;
+            let want = if chain_ema >= 0.5 || mtp_step % 16 == 0 { n_drafts } else { 1 };
+            let nd = want
+                .min(req.max_tokens.saturating_sub(gen_tokens.len() + 1))
+                .min(self.max_ctx.saturating_sub(tokens.len() + 1));
+            if use_mtp && verify_greedy && nd >= 2 {
+                let t0 = Instant::now();
+                let mut drafts: Vec<u32> = Vec::with_capacity(nd);
+                if let Some(m) = self.mtp.as_mut() {
+                    if let Ok(d) = m.draft_token(&hidden_buf, next_tok, mtp_pos) {
+                        mtp_pos += 1;
+                        drafts.push(d);
+                        while drafts.len() < nd {
+                            // Speculative drafter KV slot (overwritten by the true pair if accepted).
+                            match m.draft_token_chain(*drafts.last().unwrap(), mtp_pos + drafts.len() - 1) {
+                                Ok(d) => drafts.push(d),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                ms_draft += t0.elapsed().as_secs_f64() * 1000.0;
+                if drafts.len() >= 2 {
+                    let nd = drafts.len();
+                    if let Err(e) = ensure_page(&mut self.pager, &mut pages, pos + nd) {
+                        self.pager.release(&pages);
+                        return Err(e);
+                    }
+                    let mut vtoks = Vec::with_capacity(nd + 1);
+                    vtoks.push(next_tok);
+                    vtoks.extend_from_slice(&drafts);
+                    let t2 = Instant::now();
+                    match self.exec.forward_verify_argmax(&vtoks, pos, &pages) {
+                        Ok(Some((v, hs))) => {
+                            ms_v2 += t2.elapsed().as_secs_f64() * 1000.0;
+                            mtp_drafted += nd;
+                            let mut acc = 0usize;
+                            while acc < nd && v[acc] == drafts[acc] {
+                                if acc >= 1 {
+                                    chain_ema = 0.9 * chain_ema + 0.1;
+                                }
+                                let dt = drafts[acc];
+                                mtp_accepted += 1;
+                                eval_len = pos + 2 + acc;
+                                if self.tokenizer.is_eog(dt) {
+                                    finish = FinishReason::Stop;
+                                    break 'gen;
+                                }
+                                sampler.accept(dt);
+                                let b2 = self.tokenizer.token_bytes(dt);
+                                let p2 = detok.push(&b2);
+                                gen_tokens.push(dt);
+                                tokens.push(dt);
+                                full_text.push_str(&p2);
+                                if req.stop.iter().any(|s| !s.is_empty() && full_text.ends_with(s)) {
+                                    finish = FinishReason::Stop;
+                                    break 'gen;
+                                }
+                                if !on_chunk(dt, &p2) {
+                                    finish = FinishReason::Cancelled;
+                                    break 'gen;
+                                }
+                                if mtp_fill_gaps {
+                                    if let Some(m) = self.mtp.as_mut() {
+                                        if m.warmup_kv(&hs[acc], dt, mtp_pos).is_ok() {
+                                            mtp_pos += 1;
+                                        }
+                                    }
+                                }
+                                acc += 1;
+                            }
+                            if acc >= 1 && acc < nd {
+                                chain_ema *= 0.9; // a chained draft after an accepted one was rejected
+                            }
+                            if acc < nd {
+                                eval_len = pos + 1 + acc;
+                                let t3 = Instant::now();
+                                if let Err(e) = self.exec.restore_recurrent_to(acc) {
+                                    self.pager.release(&pages);
+                                    return Err(e);
+                                }
+                                ms_rej += t3.elapsed().as_secs_f64() * 1000.0;
+                            }
+                            forced_tok = Some(v[acc]);
+                            hidden_buf = hs[acc].clone();
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.pager.release(&pages);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             // Real 2-token batched speculative MTP verify when greedy + MTP drafter available
             if use_mtp && gen_tokens.len() + 1 < req.max_tokens && tokens.len() + 1 < self.max_ctx {
                 let t0 = Instant::now();
@@ -454,6 +562,15 @@ impl NativeEngine {
                                         break;
                                     }
                                     forced_tok = Some(v2);
+                                    // Feed the accepted pair (hidden after next_tok, draft) to the
+                                    // drafter's KV so its context has no gap.
+                                    if mtp_fill_gaps {
+                                        if let Some(m) = self.mtp.as_mut() {
+                                            if m.warmup_kv(&h0, dt, mtp_pos).is_ok() {
+                                                mtp_pos += 1;
+                                            }
+                                        }
+                                    }
                                     hidden_buf = h1;
                                 } else {
                                     eval_len = pos + 1;
@@ -502,6 +619,13 @@ impl NativeEngine {
                                     break;
                                 }
                                 logits_buf = l1;
+                                if mtp_fill_gaps {
+                                    if let Some(m) = self.mtp.as_mut() {
+                                        if m.warmup_kv(&h0, dt, mtp_pos).is_ok() {
+                                            mtp_pos += 1;
+                                        }
+                                    }
+                                }
                                 hidden_buf = h1;
                                 continue;
                             } else {

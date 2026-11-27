@@ -9,6 +9,8 @@ const PREFILL_BATCH: usize = 256;
 /// submits keeps each one far below amdgpu's ~2 s TDR timeout even on 64-layer 27B models.
 const LAYERS_PER_SUBMIT: usize = 8;
 /// Prefill chunk used when some layer weight format has no tiled matmul kernel.
+/// Max tokens in one MTP verification (current token + drafts).
+const MAX_VERIFY: usize = 4;
 const SLOW_PREFILL_CHUNK: usize = 16;
 
 struct WeightBuf {
@@ -283,8 +285,8 @@ impl VkExec {
             act: mk(PREFILL_BATCH * cfg.n_ff)?,
             hidden_buf: mk(cfg.n_embd)?,
             logits_buf: mk(cfg.n_vocab)?,
-            hidden_buf2: mk(2 * cfg.n_embd)?,
-            logits_buf2: mk(2 * cfg.n_vocab)?,
+            hidden_buf2: mk(MAX_VERIFY * cfg.n_embd)?,
+            logits_buf2: mk(MAX_VERIFY * cfg.n_vocab)?,
             multi_logits_buf: None,
             argmax_buf: mk(4)?,
             rec_snaps: None,
@@ -430,6 +432,22 @@ impl Executor for VkExec {
         pos0: usize,
         page_table: &[u32],
     ) -> Result<Option<([u32; 2], [Vec<f32>; 2])>, EngineError> {
+        let Some((idx, mut hs)) = self.forward_verify_argmax(&tokens, pos0, page_table)? else { return Ok(None) };
+        let h1 = hs.pop().unwrap();
+        let h0 = hs.pop().unwrap();
+        Ok(Some(([idx[0], idx[1]], [h0, h1])))
+    }
+
+    fn forward_verify_argmax(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<(Vec<u32>, Vec<Vec<f32>>)>, EngineError> {
+        let n = tokens.len();
+        if !(2..=MAX_VERIFY).contains(&n) {
+            return Ok(None);
+        }
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
@@ -439,26 +457,28 @@ impl Executor for VkExec {
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
         rec.set_defer_barriers(true);
-        self.record_batch_layers(&mut rec, &tokens, pos0, true, 0..self.layers.len());
-        rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf2, 0, ne, c.eps);
-        rec.rms_norm(&self.x, ne as u64, &self.out_norm, 0, &self.hidden_buf2, ne as u64, ne, c.eps);
+        self.record_batch_layers(&mut rec, tokens, pos0, true, 0..self.layers.len());
+        for t in 0..n as u64 {
+            rec.rms_norm(&self.x, t * ne as u64, &self.out_norm, 0, &self.hidden_buf2, t * ne as u64, ne, c.eps);
+        }
         rec.barrier();
         let w = self.output.as_ref().unwrap_or(&self.embd);
-        rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, 2);
+        rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, n as u32);
         rec.barrier();
-        // Greedy: argmax of both rows on the device (argmax_buf words 0 and 1); only two indices
-        // and the hidden states cross PCIe instead of 2 x n_vocab logits.
-        rec.argmax(&self.logits_buf2, 0, &self.argmax_buf, c.n_vocab as u32);
-        rec.argmax_at(&self.logits_buf2, c.n_vocab as u64, &self.argmax_buf, 1, c.n_vocab as u32);
+        // Greedy: argmax of each row on the device; only n indices and the hidden states cross
+        // PCIe instead of n x n_vocab logits.
+        for t in 0..n as u32 {
+            rec.argmax_at(&self.logits_buf2, t as u64 * c.n_vocab as u64, &self.argmax_buf, t, c.n_vocab as u32);
+        }
         rec.barrier();
         rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
-        let mut idx = [0u32; 2];
+        let mut idx = vec![0u32; n];
         self.ctx.download(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let mut h_both = vec![0f32; 2 * c.n_embd];
-        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_both)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let h1 = h_both.split_off(c.n_embd);
-        self.hidden.copy_from_slice(&h1);
-        Ok(Some((idx, [h_both, h1])))
+        let mut h_all = vec![0f32; n * c.n_embd];
+        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let hs: Vec<Vec<f32>> = h_all.chunks(c.n_embd).map(|h| h.to_vec()).collect();
+        self.hidden.copy_from_slice(&hs[n - 1]);
+        Ok(Some((idx, hs)))
     }
 
     fn snapshot_recurrent(&mut self) -> Result<(), EngineError> {
@@ -488,6 +508,10 @@ impl Executor for VkExec {
     }
 
     fn restore_recurrent(&mut self) -> Result<(), EngineError> {
+        self.restore_recurrent_to(0)
+    }
+
+    fn restore_recurrent_to(&mut self, k: usize) -> Result<(), EngineError> {
         let Some(snaps) = self.rec_snaps.as_ref() else { return Ok(()); };
         if snaps.is_empty() {
             return Ok(());
@@ -497,12 +521,16 @@ impl Executor for VkExec {
         for l in &self.layers {
             match &l.mixer {
                 VkMixer::ShortConv { state, .. } => {
+                    if k != 0 {
+                        return Err(EngineError::Unsupported("short-conv rollback beyond token 0".into()));
+                    }
                     rec.copy_buf_bytes(&snaps[idx].0, state, state.size());
                     idx += 1;
                 }
                 VkMixer::DeltaNet { conv_state, ssm_state, .. } => {
-                    rec.copy_buf_bytes(&snaps[idx].0, conv_state, conv_state.size());
-                    rec.copy_buf_bytes(snaps[idx].1.as_ref().unwrap(), ssm_state, ssm_state.size());
+                    let (cs, ss) = (conv_state.size(), ssm_state.size());
+                    rec.copy_buf_region(&snaps[idx].0, k as u64 * cs, conv_state, 0, cs);
+                    rec.copy_buf_region(snaps[idx].1.as_ref().unwrap(), k as u64 * ss, ssm_state, 0, ss);
                     idx += 1;
                 }
                 VkMixer::FullAttn { .. } => {}
@@ -840,8 +868,10 @@ impl VkExec {
                         snaps.push((b, None));
                     }
                     VkMixer::DeltaNet { conv_state, ssm_state, .. } => {
-                        let b1 = self.ctx.create_device_buffer(conv_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
-                        let b2 = self.ctx.create_device_buffer(ssm_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        // MAX_VERIFY - 1 rollback slots (after each verified token but the last).
+                        let n = (MAX_VERIFY - 1) as u64;
+                        let b1 = self.ctx.create_device_buffer(n * conv_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
+                        let b2 = self.ctx.create_device_buffer(n * ssm_state.size()).map_err(|e| EngineError::Backend(e.to_string()))?;
                         snaps.push((b1, Some(b2)));
                     }
                     VkMixer::FullAttn { .. } => {}
@@ -1034,16 +1064,17 @@ impl VkExec {
                     rec.qmm(walpha.ty, &walpha.buf, 0, &self.xn, 0, &self.alpha_buf, 0, walpha.k, walpha.m, batch);
                     rec.qmm(wbeta.ty, &wbeta.buf, 0, &self.xn, 0, &self.beta_buf, 0, wbeta.k, wbeta.m, batch);
                     rec.barrier();
-                    if snap_after_t0 && batch == 2 {
-                        // Both tokens in one dispatch per kernel; the kernels also write the exact
-                        // post-token-0 state (rollback point for a rejected draft) to the
-                        // snapshot buffers from registers - no copies / transfer barriers.
+                    if snap_after_t0 && (2..=MAX_VERIFY as u32).contains(&batch) {
+                        // All verified tokens in one dispatch per kernel; the kernels also write
+                        // the exact state after each token but the last (rollback points for
+                        // rejected drafts) to the snapshot slots from registers.
                         let snaps = self.rec_snaps.as_ref().unwrap();
-                        rec.ssm_conv_silu_batch_snap(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 2, Some((&snaps[rec_snap_idx].0, 0)));
+                        let n = batch - 1;
+                        rec.ssm_conv_silu_batch_snap(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch, Some((&snaps[rec_snap_idx].0, n)));
                         rec.barrier();
-                        rec.deltanet_step_batch_snap(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 2, Some((snaps[rec_snap_idx].1.as_ref().unwrap(), 0)));
+                        rec.deltanet_step_batch_snap(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, batch, Some((snaps[rec_snap_idx].1.as_ref().unwrap(), n)));
                         rec.barrier();
-                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 2);
+                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, batch);
                         rec.barrier();
                     } else {
                         rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch);

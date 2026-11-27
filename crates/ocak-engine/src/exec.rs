@@ -84,6 +84,25 @@ pub trait Executor: Send {
     ) -> Result<Option<([u32; 2], [Vec<f32>; 2])>, EngineError> {
         Ok(None)
     }
+    /// Greedy verification of 2..=4 tokens (current token + up to 3 drafts): argmax and hidden
+    /// state after each position; recurrent-state rollback points are kept after every token
+    /// but the last (see `restore_recurrent_to`). None if unsupported.
+    fn forward_verify_argmax(
+        &mut self,
+        _tokens: &[u32],
+        _pos0: usize,
+        _page_table: &[u32],
+    ) -> Result<Option<(Vec<u32>, Vec<Vec<f32>>)>, EngineError> {
+        Ok(None)
+    }
+    /// Restore the recurrent state saved after token `k` of the last verification.
+    fn restore_recurrent_to(&mut self, k: usize) -> Result<(), EngineError> {
+        if k == 0 {
+            self.restore_recurrent()
+        } else {
+            Err(EngineError::Unsupported("multi-token rollback".into()))
+        }
+    }
     /// Runs a continuous multi-slot decode batch across independent sequences (each with its own `pos` and `page_table`),
     /// returning one logits vector per slot when supported.
     fn forward_multi_slot(&mut self, _slots: &[SlotStep<'_>]) -> Result<Option<Vec<Vec<f32>>>, EngineError> {
