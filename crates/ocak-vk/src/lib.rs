@@ -210,6 +210,8 @@ struct Pipelines {
     quant_q8: PipelineBundle,
     /// Integer-dot tiled matmuls, indexed by qmmq_index.
     qmmq: Vec<PipelineBundle>,
+    /// Integer-dot small-batch matvecs, indexed by qmmq_index.
+    qmvq: Vec<PipelineBundle>,
     /// Grouped (MoE) integer-dot matmuls, indexed by qmmq_index.
     qmmqg: Vec<PipelineBundle>,
 }
@@ -267,6 +269,12 @@ fn qmmq_index(ty: WType) -> Option<usize> {
 fn mmq_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("OCAK_MMQ").map_or(true, |v| v != "0"))
+}
+
+/// Integer-dot decode matvec (qmv_q8.comp) unless OCAK_QMV_INT8=0.
+fn qmv_int8_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OCAK_QMV_INT8").map_or(true, |v| v != "0"))
 }
 
 /// Device scratch for int8-quantized activations (bump-allocated per recording).
@@ -327,6 +335,7 @@ impl Pipelines {
         .chain(self.qmvm.iter())
         .chain(self.qmvi.iter())
         .chain(self.qmmq.iter())
+        .chain(self.qmvq.iter())
         .chain(self.attention_prefill_128_f2.iter())
         .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
@@ -824,6 +833,24 @@ impl VkContext {
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_s.spv")), "qmmq_iq1_s", 5, 40)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_m.spv")), "qmmq_iq1_m", 5, 40)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_nvfp4.spv")), "qmmq_nvfp4", 5, 40)?,
+                ],
+                qmvq: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q4_k.spv")), "qmvq_q4_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q5_k.spv")), "qmvq_q5_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q6_k.spv")), "qmvq_q6_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q8_0.spv")), "qmvq_q8_0", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q2_k.spv")), "qmvq_q2_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_q3_k.spv")), "qmvq_q3_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq4_nl.spv")), "qmvq_iq4_nl", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq4_xs.spv")), "qmvq_iq4_xs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq3_s.spv")), "qmvq_iq3_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq3_xxs.spv")), "qmvq_iq3_xxs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq2_xs.spv")), "qmvq_iq2_xs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq2_s.spv")), "qmvq_iq2_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq2_xxs.spv")), "qmvq_iq2_xxs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq1_s.spv")), "qmvq_iq1_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_iq1_m.spv")), "qmvq_iq1_m", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmvq_nvfp4.spv")), "qmvq_nvfp4", 5, 32)?,
                 ],
                 qmmqg: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q4_k.spv")), "qmmqg_q4_k", 6, 52)?,
@@ -1398,6 +1425,9 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn qmv(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32) {
+        if self.qmv_int8(ty, w, w_off, x, x_off, y, y_off, k, m, 1) {
+            return;
+        }
         if qmvm_beats_qmv(ty) && k.is_multiple_of(32) {
             let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), 1];
             let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
@@ -1443,10 +1473,6 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// Integer-dot prefill matmul: quantizes X to int8 blocks (reusing the previous
-    /// quantization when the same X feeds consecutive matmuls), then runs qmm_q8.comp.
-    /// Returns false when the format / shape is not supported.
     /// Quantize `rows` activation rows of k floats (contiguous at x_off) to int8 blocks in the
     /// q8 scratch, or reuse the previous quantization of the same rows. Returns the scratch
     /// byte offset of the quantized words (scales follow at + rows * k), or None if unsupported.
@@ -1477,6 +1503,24 @@ impl<'a> Recorder<'a> {
             self.barrier();
         }
         Some(q_off)
+    }
+
+    /// Integer-dot matvec for 1..8 tokens (decode / MTP verify): activations quantized to int8
+    /// blocks (shared with other matvecs on the same input), weights unpacked to int8.
+    fn qmv_int8(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, batch: u32) -> bool {
+        let Some(qi) = qmmq_index(ty) else { return false };
+        if !qmv_int8_enabled() || batch == 0 || batch > 8 || !w_off.is_multiple_of(4) {
+            return false;
+        }
+        let Some(q_off) = self.quantize_q8(x, x_off, k, batch) else { return false };
+        let n = batch as u64 * k as u64;
+        let pc = [off_u32(w_off), off_u32(q_off / 8), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k), batch];
+        let q8 = self.ctx.q8_scratch;
+        // Rows per workgroup (qmv_q8.comp RPW): 16 for formats with a shared-memory lookup table.
+        let rpw = if matches!(ty, WType::IQ1S | WType::IQ1M | WType::IQ2XS | WType::IQ2XXS | WType::IQ2S | WType::IQ3XXS | WType::IQ3S | WType::IQ4NL | WType::IQ4XS) { 16 } else { 4 };
+        self.dispatch_raw(&self.ctx.pipelines.qmvq[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(rpw), 1, 1);
+        self.q8_cache = Some((x.buf, x_off, k, batch, q_off));
+        true
     }
 
     /// Integer-dot prefill matmul: quantizes X to int8 blocks (reusing the previous
@@ -1528,6 +1572,9 @@ impl<'a> Recorder<'a> {
         }
         let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), batch];
         let gx = m.div_ceil(4);
+        if batch <= 8 && self.qmv_int8(ty, w, w_off, x, x_off, y, y_off, k, m, batch) {
+            return;
+        }
         if batch <= 8 && k.is_multiple_of(32) {
             // Small batch: one weight read for all tokens.
             let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
@@ -2372,6 +2419,7 @@ mod tests {
             c.upload(&bw, 0, &w).unwrap();
             c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
             let mut rec = c.begin();
+            rec.set_mmq(false);
             rec.qmv(ty, &bw, 0, &bx, 0, &by, 0, k as u32, m as u32);
             rec.finish_and_wait().unwrap();
             let mut y_gpu = vec![0f32; m];
@@ -3054,6 +3102,7 @@ mod tests {
             c.upload(&bw, 0, &raw).unwrap();
             for batch in 1..=8u32 {
                 let mut rec = c.begin();
+            rec.set_mmq(false);
                 rec.qmm(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch);
                 for b in 0..batch as usize {
                     rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_b, (b * m) as u64, k as u32, m as u32);
@@ -3229,6 +3278,51 @@ mod tests {
     }
 
     #[test]
+    fn vk_qmv_int8_matches_classic() {
+        let c = VkContext::new().expect("vulkan init");
+        let (k, m) = (1024usize, 37usize);
+        let mut s = 0x5EED_1234u64;
+        let mut next_u8 = || -> u8 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 32) as u8
+        };
+        let x: Vec<f32> = (0..8 * k).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.07 * (1.0 + (i / 32 % 3) as f32)).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let by_a = c.create_device_buffer((8 * m * 4) as u64).unwrap();
+        let by_b = c.create_device_buffer((8 * m * 4) as u64).unwrap();
+        for wt in [
+            WType::Q4K, WType::Q5K, WType::Q6K, WType::Q8_0, WType::Q2K, WType::Q3K, WType::IQ4NL, WType::IQ4XS,
+            WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::NVFP4,
+        ] {
+            let rb = wt.row_bytes(k as u32) as usize;
+            let raw: Vec<u8> = (0..m * rb).map(|_| next_u8() & 0x3F).collect();
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            for batch in [1usize, 3, 8] {
+                let mut rec = c.begin();
+                assert!(rec.qmv_int8(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch as u32));
+                for b in 0..batch {
+                    rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_b, (b * m) as u64, k as u32, m as u32);
+                }
+                rec.finish_and_wait().unwrap();
+                let mut ya = vec![0f32; batch * m];
+                let mut yb = vec![0f32; batch * m];
+                c.download(&by_a, 0, bytemuck::cast_slice_mut(&mut ya)).unwrap();
+                c.download(&by_b, 0, bytemuck::cast_slice_mut(&mut yb)).unwrap();
+                let scale = yb.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+                let mut sum = 0f64;
+                for i in 0..batch * m {
+                    let e = (ya[i] - yb[i]).abs();
+                    sum += e as f64;
+                    assert!(e <= 2e-2 * scale, "int8 qmv {wt:?} batch={batch} idx={i}: {} vs {}", ya[i], yb[i]);
+                }
+                assert!(sum / ((batch * m) as f64) <= 3e-3 * scale as f64, "int8 qmv {wt:?} batch={batch}: mean error too high");
+            }
+        }
+    }
+
+    #[test]
     fn vk_qmm_matches_qmv() {
         let c = VkContext::new().expect("vulkan init");
         let (k, m, batch) = (512usize, 13usize, 11usize);
@@ -3276,6 +3370,7 @@ mod tests {
             }
             // Also verify batch=2 (qmm2_* fast path)
             let mut rec2 = c.begin();
+            rec2.set_mmq(false);
             rec2.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, 2);
             rec2.finish_and_wait().unwrap();
             let mut y_qmm2 = vec![0f32; 2 * m];

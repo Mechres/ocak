@@ -1,0 +1,101 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_GOOGLE_include_directive : require
+// Small-batch (1..8 tokens) integer-dot matvec for decode / MTP verify:
+// Y[t, m] = X[t, k] * W[m, k]^T with X pre-quantized by quant_q8.comp (int8 blocks of 32).
+// 32 lanes per row, 4 rows per workgroup (16 for IQ1); each step a lane unpacks 8 weights to int8 once
+// (dequant_i8.glsl) and applies them to every token with two dotPacked4x8EXT, so the per-weight
+// work is a few integer ops instead of a float conversion and FMA per weight per token.
+// Compiled once per weight format with -D<TYPE> (see build.rs).
+#if defined(Q4_K) || defined(Q5_K) || defined(Q2_K)
+#define HAS_MIN
+#endif
+#define MAXB 8u
+// IQ lookup tables (up to 16 KB for IQ1) are staged in shared memory per workgroup, 16 rows per
+// workgroup to amortize the copy, instead of competing with the weight stream in the L0 cache.
+// [TBL_LO, TBL_HI): the table words the format reads (see ocak_gguf::iq_tables layout).
+#if defined(IQ1_S) || defined(IQ1_M)
+#define TBL_LO 4496u
+#define TBL_HI 8592u
+#elif defined(IQ2_XS)
+#define TBL_LO 0u
+#define TBL_HI 1920u
+#elif defined(IQ2_XXS)
+#define TBL_LO 1792u
+#define TBL_HI 2448u
+#elif defined(IQ2_S)
+#define TBL_LO 2448u
+#define TBL_HI 4496u
+#elif defined(IQ3_XXS)
+#define TBL_LO 1024u
+#define TBL_HI 1920u
+#elif defined(IQ3_S)
+#define TBL_LO 1280u
+#define TBL_HI 1792u
+#elif defined(IQ4_NL) || defined(IQ4_XS)
+#define TBL_LO 1920u
+#define TBL_HI 1936u
+#endif
+#ifdef TBL_LO
+#define RPW 16u
+#define TBL(i) stab[(i) - TBL_LO]
+#else
+#define RPW 4u
+#endif
+layout(local_size_x = 32, local_size_y = RPW) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 0) readonly buffer W32 { uint w32[]; };
+layout(set = 0, binding = 1) readonly buffer XQ { uvec2 xq2[]; };
+layout(set = 0, binding = 2) readonly buffer XS { vec4 xsc[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 4) readonly buffer T { uint tbl[]; };
+// q_off2: uvec2 offset of the quantized activations; s_off: vec4 offset of their scales.
+layout(push_constant) uniform PC { uint w_off; uint q_off2; uint s_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+
+#ifdef TBL_LO
+shared uint stab[TBL_HI - TBL_LO];
+#endif
+#include "dequant_i8.glsl"
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x * RPW + gl_LocalInvocationID.y;
+#ifdef TBL_LO
+    for (uint i = gl_LocalInvocationIndex; i < TBL_HI - TBL_LO; i += 32u * RPW) stab[i] = tbl[TBL_LO + i];
+    barrier();
+#endif
+    float acc[MAXB];
+    for (uint t = 0u; t < MAXB; t++) acc[t] = 0.0;
+    if (row < pc.m) {
+        uint rb = pc.w_off + row * pc.row_bytes;
+        uint kblocks = pc.k >> 5;
+        for (uint k0 = tid * 8u; k0 < pc.k; k0 += 256u) {
+            uint q0, q1;
+            float d, mn;
+            dqi8(rb, k0, q0, q1, d, mn);
+            uint blk = k0 >> 5;
+            uint sub = (k0 & 31u) >> 3;   // 8-value group within the 32-block
+            for (uint t = 0u; t < MAXB; t++) {
+                if (t < pc.batch) {
+                    uint xb = t * kblocks + blk;
+                    uvec2 xw = xq2[pc.q_off2 + xb * 4u + sub];
+                    int ia = dotPacked4x8EXT(int(q0), int(xw.x)) + dotPacked4x8EXT(int(q1), int(xw.y));
+                    float dx = xsc[pc.s_off + xb].x;
+#ifdef HAS_MIN
+                    int is = dotPacked4x8EXT(0x01010101, int(xw.x)) + dotPacked4x8EXT(0x01010101, int(xw.y));
+                    acc[t] += dx * (d * float(ia) - mn * float(is));
+#else
+                    acc[t] += dx * d * float(ia);
+#endif
+                }
+            }
+        }
+    }
+    for (uint t = 0u; t < MAXB; t++) {
+        float r = subgroupClusteredAdd(acc[t], 32u);
+        if (tid == 0u && row < pc.m && t < pc.batch) y[pc.y_off + t * pc.m + row] = r;
+    }
+}

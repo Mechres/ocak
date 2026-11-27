@@ -5,6 +5,11 @@
 // The including shader defines `w` (uint8_t[]), `w32` (uint[], same buffer) and `tbl` (IQ
 // grid tables).
 // fp16 at an even byte offset: one aligned 32-bit load.
+// Lookup-table word i (IQ grids / signs / IQ4 values); an including shader may redirect it to
+// a shared-memory copy of the range its format uses.
+#ifndef TBL
+#define TBL(i) tbl[i]
+#endif
 float f16at(uint o) { return unpackHalf2x16(w32[o >> 2] >> ((o & 2u) << 3)).x; }
 uint pack4(int a, int b, int c, int e) {
     return uint(a & 0xFF) | (uint(b & 0xFF) << 8) | (uint(c & 0xFF) << 16) | (uint(e & 0xFF) << 24);
@@ -15,6 +20,12 @@ uint bytes4(uint o) {
     uint a = o >> 2;
     uint sh = (o & 3u) << 3;
     return (w32[a] >> sh) | ((w32[a + 1u] << 1) << (31u - sh));
+}
+// Apply 4 sign bits (bit j -> byte j) to packed unsigned bytes g, all nonzero and < 0x80:
+// bytes with the bit set become 256 - g (two's complement), with no carry between bytes.
+uint apply_signs4(uint g, uint bits) {
+    uint m = ((bits & 0xFu) * 0x00204081u) & 0x01010101u;   // bit j -> bit 0 of byte j
+    return (g ^ (m * 0xFFu)) + m;
 }
 // Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
 uint sub_bytes(uint x, uint c) { return ((x | 0x80808080u) - c) ^ 0x80808080u; }
@@ -130,7 +141,7 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint so = qo + (p & 15u);
     uint nsh = (p >> 4) * 4u;
     int v[8];
-    for (uint i = 0u; i < 8u; i++) v[i] = int(tbl[1920u + ((uint(w[so + i]) >> nsh) & 0xFu)]);
+    for (uint i = 0u; i < 8u; i++) v[i] = int(TBL(1920u + ((uint(w[so + i]) >> nsh) & 0xFu)));
     q0 = pack4(v[0], v[1], v[2], v[3]);
     q1 = pack4(v[4], v[5], v[6], v[7]);
 #elif defined(IQ3_S) || defined(IQ3_XXS) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ2_XXS)
@@ -146,16 +157,16 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint qh = uint(w[b + 66u + ib32]);
     uint i1 = uint(w[b + 2u + 2u * t]) | ((qh << (8u - 2u * l)) & 256u);
     uint i2 = uint(w[b + 2u + 2u * t + 1u]) | ((qh << (7u - 2u * l)) & 256u);
-    glo = tbl[1280u + i1];
-    ghi = tbl[1280u + i2];
+    glo = TBL(1280u + i1);
+    ghi = TBL(1280u + i2);
     sg = uint(w[b + 74u + t]);
 #elif defined(IQ3_XXS)
     uint b = rb + (k0 >> 8) * 98u;
     uint aux32 = bytes4(b + 66u + ib32 * 4u);
     d = f16at(b) * (0.5 + float(aux32 >> 28)) * 0.5;
-    sg = tbl[1792u + ((aux32 >> (7u * l)) & 127u)];
-    glo = tbl[1024u + uint(w[b + 2u + 2u * t])];
-    ghi = tbl[1024u + uint(w[b + 2u + 2u * t + 1u])];
+    sg = TBL(1792u + ((aux32 >> (7u * l)) & 127u));
+    glo = TBL(1024u + uint(w[b + 2u + 2u * t]));
+    ghi = TBL(1024u + uint(w[b + 2u + 2u * t + 1u]));
 #elif defined(IQ2_XS)
     uint b = rb + (k0 >> 8) * 74u;
     uint sc = uint(w[b + 66u + ib32]);
@@ -163,17 +174,17 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint qo = b + 2u + 2u * t;
     uint q = uint(w[qo]) | (uint(w[qo + 1u]) << 8);
     uint gidx = q & 511u;
-    glo = tbl[2u * gidx];
-    ghi = tbl[2u * gidx + 1u];
-    sg = tbl[1792u + (q >> 9)];
+    glo = TBL(2u * gidx);
+    ghi = TBL(2u * gidx + 1u);
+    sg = TBL(1792u + (q >> 9));
 #elif defined(IQ2_S)
     uint b = rb + (k0 >> 8) * 82u;
     uint sc = uint(w[b + 74u + ib32]);
     d = f16at(b) * (0.5 + float((l < 2u) ? (sc & 0xFu) : (sc >> 4))) * 0.25;
     uint qhb = uint(w[b + 66u + ib32]);
     uint gidx = uint(w[b + 2u + t]) | ((qhb << (8u - 2u * l)) & 0x300u);
-    glo = tbl[2448u + 2u * gidx];
-    ghi = tbl[2448u + 2u * gidx + 1u];
+    glo = TBL(2448u + 2u * gidx);
+    ghi = TBL(2448u + 2u * gidx + 1u);
     sg = uint(w[b + 34u + t]);
 #else
     uint b = rb + (k0 >> 8) * 66u;
@@ -181,20 +192,14 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
     uint a1 = bytes4(b + 6u + ib32 * 8u);
     d = f16at(b) * (0.5 + float(a1 >> 28)) * 0.25;
     uint gidx = (a0 >> (8u * l)) & 0xFFu;
-    glo = tbl[1936u + 2u * gidx];
-    ghi = tbl[1936u + 2u * gidx + 1u];
-    sg = tbl[1792u + ((a1 >> (7u * l)) & 127u)];
+    glo = TBL(1936u + 2u * gidx);
+    ghi = TBL(1936u + 2u * gidx + 1u);
+    sg = TBL(1792u + ((a1 >> (7u * l)) & 127u));
 #endif
     m = 0.0;
-    int v[8];
-    for (uint j = 0u; j < 4u; j++) {
-        int a = int((glo >> (8u * j)) & 0xFFu);
-        int c = int((ghi >> (8u * j)) & 0xFFu);
-        v[j] = ((sg & (1u << j)) != 0u) ? -a : a;
-        v[j + 4u] = ((sg & (1u << (j + 4u))) != 0u) ? -c : c;
-    }
-    q0 = pack4(v[0], v[1], v[2], v[3]);
-    q1 = pack4(v[4], v[5], v[6], v[7]);
+    // Grid bytes are nonzero and < 0x80, so the signs apply packed (no per-byte unpacking).
+    q0 = apply_signs4(glo, sg);
+    q1 = apply_signs4(ghi, sg >> 4);
 #elif defined(IQ1_S) || defined(IQ1_M)
     // Weights are dl * (g + delta) with grid g in {-1, 0, 1} and delta = +-1/8: exact as
     // integers 8 g +- 1 with d = dl / 8.
@@ -228,16 +233,15 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
 #endif
     d = dl * 0.125;
     m = 0.0;
-    uint glo = tbl[4496u + 2u * gidx];
-    uint ghi = tbl[4496u + 2u * gidx + 1u];
-    int dd = neg ? -1 : 1;
-    int v[8];
-    for (uint j = 0u; j < 4u; j++) {
-        v[j] = 8 * int(int8_t(int((glo >> (8u * j)) & 0xFFu))) + dd;
-        v[j + 4u] = 8 * int(int8_t(int((ghi >> (8u * j)) & 0xFFu))) + dd;
-    }
-    q0 = pack4(v[0], v[1], v[2], v[3]);
-    q1 = pack4(v[4], v[5], v[6], v[7]);
+    uint glo = TBL(4496u + 2u * gidx);
+    uint ghi = TBL(4496u + 2u * gidx + 1u);
+    // Grid bytes b are 0xFF / 0x00 / 0x01 (g = -1 / 0 / 1). Packed, borrow-free:
+    // g + 1 = 1 + (b & 1) - 2 ((b >> 1) & 1), then 8 g +- 1 = 8 (g + 1) - (7 or 9).
+    uint c = neg ? 0x09090909u : 0x07070707u;
+    uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
+    uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
+    q0 = sub_bytes(g1lo << 3, c);
+    q1 = sub_bytes(g1hi << 3, c);
 #elif defined(NVFP4)
     // 36-byte blocks of 64: 4 UE4M3 scales (one per 16) + E2M1 nibbles. E2M1 magnitudes are
     // {0, .5, 1, 1.5, 2, 3, 4, 6}: exact as integers {0, 1, 2, 3, 4, 6, 8, 12} with d = scale / 2.

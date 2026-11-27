@@ -122,7 +122,8 @@ fn main() {
     }
     // Sources compiled several times with different defines: (output name, source, defines).
     println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
-    let variants: [(&str, &str, &[&str]); 37] = [
+    println!("cargo:rerun-if-changed=shaders/qmv_q8.comp");
+    let variants: [(&str, &str, &[&str]); 53] = [
         ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
         ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
         ("attention_prefill_128_f2", "shaders/attention_prefill.comp", &["-DHDMAX=128", "-DFDOT2"]),
@@ -144,6 +145,22 @@ fn main() {
         ("qmmq_iq1_s", "shaders/qmm_q8.comp", &["-DIQ1_S"]),
         ("qmmq_iq1_m", "shaders/qmm_q8.comp", &["-DIQ1_M"]),
         ("qmmq_nvfp4", "shaders/qmm_q8.comp", &["-DNVFP4"]),
+        ("qmvq_q4_k", "shaders/qmv_q8.comp", &["-DQ4_K"]),
+        ("qmvq_q5_k", "shaders/qmv_q8.comp", &["-DQ5_K"]),
+        ("qmvq_q6_k", "shaders/qmv_q8.comp", &["-DQ6_K"]),
+        ("qmvq_q8_0", "shaders/qmv_q8.comp", &["-DQ8_0"]),
+        ("qmvq_q2_k", "shaders/qmv_q8.comp", &["-DQ2_K"]),
+        ("qmvq_q3_k", "shaders/qmv_q8.comp", &["-DQ3_K"]),
+        ("qmvq_iq4_nl", "shaders/qmv_q8.comp", &["-DIQ4_NL"]),
+        ("qmvq_iq4_xs", "shaders/qmv_q8.comp", &["-DIQ4_XS"]),
+        ("qmvq_iq3_s", "shaders/qmv_q8.comp", &["-DIQ3_S"]),
+        ("qmvq_iq3_xxs", "shaders/qmv_q8.comp", &["-DIQ3_XXS"]),
+        ("qmvq_iq2_xs", "shaders/qmv_q8.comp", &["-DIQ2_XS"]),
+        ("qmvq_iq2_s", "shaders/qmv_q8.comp", &["-DIQ2_S"]),
+        ("qmvq_iq2_xxs", "shaders/qmv_q8.comp", &["-DIQ2_XXS"]),
+        ("qmvq_iq1_s", "shaders/qmv_q8.comp", &["-DIQ1_S"]),
+        ("qmvq_iq1_m", "shaders/qmv_q8.comp", &["-DIQ1_M"]),
+        ("qmvq_nvfp4", "shaders/qmv_q8.comp", &["-DNVFP4"]),
         ("qmmqg_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K", "-DGROUPED"]),
         ("qmmqg_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K", "-DGROUPED"]),
         ("qmmqg_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K", "-DGROUPED"]),
