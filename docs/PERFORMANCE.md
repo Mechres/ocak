@@ -85,6 +85,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | IQ1 grid in shared memory | IQ1_S matvec 258 -> 121 us |
 | IQ1 grid pre-transformed to 8 (g + 1) per byte (new 4096-word table at [8592, 12688)), so the unpack is one `sub_bytes` per word instead of the borrow-free g + 1 formula; that table in shared memory (the block decoder had been reading the global copy) | IQ1_S matvec 75.6 -> 56.5 us (225 -> 308 GB/s); batch 2 68 us |
 | Sign byte-mask table for IQ2_XS / IQ2_S block decoders (shared memory, per KSIGNS index / raw sign byte; negate as (g ^ M) + ((M >> 7) & 0x01010101) instead of deriving the mask from 4 sign bits) | IQ2_XS 77.8 -> 75.5 us, IQ2_S 84.4 -> 82.8 us; Qwen3.8 IQ2_S decode 36.2 -> 36.3 tok/s |
+| Opt-in `OCAK_PREFILL_Q256=1`: prefill activations with one int8 scale per 256 values (quant_q8 -DGROUP256, same layout); qmm_q8 -DACT256 keeps acc in units of the current activation scale and rescales once per 256, so the fix-up drops the d_w * d_x multiply (lossy: 1.6-1.9x the int8 rounding error in vk_qmm_int8_matches_qmv; Qwen3.8 greedy text identical for ~70 tokens of a summary, then a different wording; count-test passes) | matmul +1-7% (IQ2_XS 2.97 -> 2.78 ms, IQ2_S 2.96 -> 2.80); Qwen3.8 IQ2_S prefill 300.5 -> 313.6 tok/s |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -154,6 +155,7 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 - Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
   input).
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).
-- Prefill int8 matmul: per-256 activation scales with integer sub-scale accumulation (cuts the
-  fix-up; precision trade-off).
+- Prefill: the per-256 opt-in still converts every block's int32 dot to float; accumulating
+  ia * integer weight sub-scale in int32 needs a 24-bit multiply ACO only emits when it can prove
+  the operand ranges (otherwise quarter-rate `v_mul_lo_u32`).
 - MLA prefill attention is still ~55% of Xing's long-prompt prefill.

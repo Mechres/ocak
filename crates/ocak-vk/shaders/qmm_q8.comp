@@ -20,6 +20,14 @@
 #if defined(Q2_K)
 #define MIN16
 #endif
+// -DACT256 (opt-in, OCAK_PREFILL_Q256): activations carry one scale per 256 values
+// (quant_q8.comp -DGROUP256), so acc is kept in units of the current activation scale cur[j]
+// and rescaled once per 256 columns: the per-block fix-up drops the d_w * d_x multiply.
+#ifdef ACT256
+#define XS(wd, xd) (wd)
+#else
+#define XS(wd, xd) ((wd) * (xd))
+#endif
 #define TM 4u
 #define BM 64u
 #ifdef GROUPED
@@ -109,6 +117,10 @@ void main() {
     float acc[TN][TM];
     for (uint j = 0u; j < TN; j++)
         for (uint i = 0u; i < TM; i++) acc[j][i] = 0.0;
+#ifdef ACT256
+    float cur[TN];
+    for (uint j = 0u; j < TN; j++) cur[j] = 1.0;
+#endif
 
     // Register prefetch: the next K block's weights / activations are loaded from global memory
     // while the current one is computed from shared memory.
@@ -136,8 +148,15 @@ void main() {
             if (x_part == 0u) {
                 xsd[x_col] = pxs.x;
 #ifdef HAS_MIN
+#ifdef ACT256
+                // In units of dx: the raw sums of the quantized activations.
+                float ix = (pxs.x > 0.0) ? 1.0 / pxs.x : 0.0;
+                xsm[x_col] = pxs.y * ix;
+                xsm[BN + x_col] = pxs.z * ix;
+#else
                 xsm[x_col] = pxs.y;
                 xsm[BN + x_col] = pxs.z;
+#endif
 #endif
             }
         }
@@ -147,6 +166,19 @@ void main() {
             for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + (xblk0 + kb + 1u) * 8u + x_part * WPT + c];
             pxs = xsc[pc.s_off + xblk0 + kb + 1u];
         }
+#ifdef ACT256
+        if ((kb & 7u) == 0u || kb == kb_beg) {
+            // New 256-group: move acc to the units of its scale (all-zero groups keep the old).
+            for (uint j = 0u; j < TN; j++) {
+                float xd = xsd[ty * TN + j];
+                if (xd > 0.0) {
+                    float r = cur[j] / xd;
+                    for (uint i = 0u; i < TM; i++) acc[j][i] *= r;
+                    cur[j] = xd;
+                }
+            }
+        }
+#endif
 #ifdef SCALE16
         // d (and m) change every 16 columns: one fix-up per half.
         for (uint h = 0u; h < 2u; h++) {
@@ -185,9 +217,9 @@ void main() {
 #endif
                 for (uint i = 0u; i < TM; i++)
 #ifdef HAS_MIN
-                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - wm[i] * xm;
+                    acc[j][i] += float(ia[j][i]) * XS(wd[i], xd) - wm[i] * xm;
 #else
-                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd);
+                    acc[j][i] += float(ia[j][i]) * XS(wd[i], xd);
 #endif
             }
         }
@@ -237,11 +269,11 @@ void main() {
 #endif
                 for (uint i = 0u; i < TM; i++)
 #ifdef MIN16
-                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - (wm[i] * xm0 + wm1[i] * xm1);
+                    acc[j][i] += float(ia[j][i]) * XS(wd[i], xd) - (wm[i] * xm0 + wm1[i] * xm1);
 #elif defined(HAS_MIN)
-                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - wm[i] * xm;
+                    acc[j][i] += float(ia[j][i]) * XS(wd[i], xd) - wm[i] * xm;
 #else
-                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd);
+                    acc[j][i] += float(ia[j][i]) * XS(wd[i], xd);
 #endif
             }
         }
@@ -259,7 +291,11 @@ void main() {
 #endif
         for (uint i = 0u; i < TM; i++) {
             uint row = row0 + tx * TM + i;
+#ifdef ACT256
+            if (row < pc.m) y[ybase + yentry * pc.m + row] = acc[j][i] * cur[j];
+#else
             if (row < pc.m) y[ybase + yentry * pc.m + row] = acc[j][i];
+#endif
         }
     }
 }

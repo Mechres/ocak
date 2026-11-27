@@ -210,6 +210,9 @@ struct Pipelines {
     quant_q8: PipelineBundle,
     /// Integer-dot tiled matmuls, indexed by qmmq_index.
     qmmq: Vec<PipelineBundle>,
+    /// qmm_q8 -DACT256 (same order as qmmq) and its 256-group quantizer (OCAK_PREFILL_Q256).
+    qmmq256: Vec<PipelineBundle>,
+    quant_q8_256: PipelineBundle,
     /// Integer-dot small-batch matvecs, indexed by qmmq_index.
     qmvq: Vec<PipelineBundle>,
     /// Grouped (MoE) integer-dot matmuls, indexed by qmmq_index.
@@ -303,6 +306,13 @@ fn qmvm_beats_qmv(ty: WType) -> bool {
     !matches!(ty, WType::Q4K | WType::Q5K | WType::Q6K | WType::NVFP4 | WType::IQ2XS)
 }
 
+/// Opt-in coarser prefill activation quantization (env `OCAK_PREFILL_Q256=1`): one int8 scale
+/// per 256 values instead of 32 for the batched int8 matmuls (lossy; faster fix-up).
+fn prefill_q256() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OCAK_PREFILL_Q256").is_ok_and(|v| v != "0"))
+}
+
 /// Smallest batch that uses the tiled prefill matmul (env `OCAK_QMMT_MIN`, default 32).
 fn qmmt_min_batch() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -335,13 +345,14 @@ impl Pipelines {
         .chain(self.qmvm.iter())
         .chain(self.qmvi.iter())
         .chain(self.qmmq.iter())
+        .chain(self.qmmq256.iter())
         .chain(self.qmvq.iter())
         .chain(self.attention_prefill_128_f2.iter())
         .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
         .chain([
             &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill,
-            &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8, &self.sum_splits,
+            &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8, &self.quant_q8_256, &self.sum_splits,
         ])
         {
             dev.destroy_pipeline(p.pipeline, None);
@@ -816,6 +827,25 @@ impl VkContext {
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 3, 24)?,
                 sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
+                quant_q8_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_256.spv")), "quant_q8_256", 3, 16)?,
+                qmmq256: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q4_k.spv")), "qmmq256_q4_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q5_k.spv")), "qmmq256_q5_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q6_k.spv")), "qmmq256_q6_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q8_0.spv")), "qmmq256_q8_0", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q2_k.spv")), "qmmq256_q2_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_q3_k.spv")), "qmmq256_q3_k", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq4_nl.spv")), "qmmq256_iq4_nl", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq4_xs.spv")), "qmmq256_iq4_xs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq3_s.spv")), "qmmq256_iq3_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq3_xxs.spv")), "qmmq256_iq3_xxs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq2_xs.spv")), "qmmq256_iq2_xs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq2_s.spv")), "qmmq256_iq2_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq2_xxs.spv")), "qmmq256_iq2_xxs", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq1_s.spv")), "qmmq256_iq1_s", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_iq1_m.spv")), "qmmq256_iq1_m", 5, 40)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq256_nvfp4.spv")), "qmmq256_nvfp4", 5, 40)?,
+                ],
                 qmmq: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 5, 40)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q5_k.spv")), "qmmq_q5_k", 5, 40)?,
@@ -1479,12 +1509,18 @@ impl<'a> Recorder<'a> {
     /// q8 scratch, or reuse the previous quantization of the same rows. Returns the scratch
     /// byte offset of the quantized words (scales follow at + rows * k), or None if unsupported.
     fn quantize_q8(&mut self, x: &Buffer, x_off: u64, k: u32, rows: u32) -> Option<u64> {
+        self.quantize_q8_mode(x, x_off, k, rows, false)
+    }
+
+    /// `g256`: one scale per 256 values (quant_q8.comp -DGROUP256; k % 256 == 0). The cache
+    /// key marks it with k's top bit so the two quantizations of one input never alias.
+    fn quantize_q8_mode(&mut self, x: &Buffer, x_off: u64, k: u32, rows: u32, g256: bool) -> Option<u64> {
         let n = rows as u64 * k as u64;
         let bytes = (n + n / 2).next_multiple_of(256);
         if !self.mmq || !x_off.is_multiple_of(4) || !k.is_multiple_of(32) || bytes > Q8_SCRATCH_BYTES {
             return None;
         }
-        let key = (x.buf, x_off, k, rows);
+        let key = (x.buf, x_off, k | ((g256 as u32) << 31), rows);
         if let Some((b, o, kk, rr, q_off)) = self.q8_cache {
             if (b, o, kk, rr) == key {
                 return Some(q_off);
@@ -1500,7 +1536,8 @@ impl<'a> Recorder<'a> {
         let n_blocks = off_u32(n / 32);
         let pc = [off_u32(x_off / 4), off_u32(q_off / 4), off_u32((q_off + n) / 16), n_blocks];
         let q8 = self.ctx.q8_scratch;
-        self.dispatch_raw(&self.ctx.pipelines.quant_q8, &[x.buf, q8, q8], bytemuck::cast_slice(&pc), n_blocks.div_ceil(32), 1, 1);
+        let qp = if g256 { &self.ctx.pipelines.quant_q8_256 } else { &self.ctx.pipelines.quant_q8 };
+        self.dispatch_raw(qp, &[x.buf, q8, q8], bytemuck::cast_slice(&pc), n_blocks.div_ceil(32), 1, 1);
         if self.defer_barriers {
             self.barrier();
         }
@@ -1545,7 +1582,9 @@ impl<'a> Recorder<'a> {
         if !w_off.is_multiple_of(4) {
             return false;
         }
-        let Some(q_off) = self.quantize_q8(x, x_off, k, batch) else { return false };
+        let g256 = prefill_q256() && k.is_multiple_of(256);
+        let Some(q_off) = self.quantize_q8_mode(x, x_off, k, batch, g256) else { return false };
+        let pipe = if g256 { &self.ctx.pipelines.qmmq256[qi] } else { &self.ctx.pipelines.qmmq[qi] };
         let n = batch as u64 * k as u64;
         let q8 = self.ctx.q8_scratch;
         let (gx, gy) = (m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN));
@@ -1566,16 +1605,16 @@ impl<'a> Recorder<'a> {
             let splits = kblocks.div_ceil(kbchunk);
             let scratch = self.ctx.attn_scratch;
             let pcs = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(s_off / 4), k, m, ty.row_bytes(k), batch, kbchunk, batch * m];
-            self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
+            self.dispatch_raw(pipe, &[w.buf, q8, q8, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
             self.barrier();
             let nn = batch * m;
             let pcr = [off_u32(s_off / 4), off_u32(y_off), nn, splits];
             self.dispatch_raw(&self.ctx.pipelines.sum_splits, &[scratch, y.buf], bytemuck::cast_slice(&pcr), nn.div_ceil(256), 1, 1);
         } else {
             let pc = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k), batch, kblocks, 0];
-            self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1);
+            self.dispatch_raw(pipe, &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1);
         }
-        self.q8_cache = Some((x.buf, x_off, k, batch, q_off));
+        self.q8_cache = Some((x.buf, x_off, k | ((g256 as u32) << 31), batch, q_off));
         true
     }
 

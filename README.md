@@ -163,6 +163,8 @@ Performance work log (methodology, what helped, and what was tried and rejected)
 
 Experimental: `OCAK_MTP_FROM=/path/to/other.gguf` borrows the NextN MTP draft head from another GGUF of the same model when the loaded file has none (e.g. a Qwen3.8 IQ2_S quant without `blk.64`), enabling lossless speculative decoding.
 
+Opt-in: `OCAK_PREFILL_Q256=1` quantizes prefill activations to int8 with one scale per 256 values instead of 32 (lossy, about 1.6-1.9x the int8 rounding error; Qwen3.8 IQ2_S prefill +4%).
+
 ---
 
 ## License

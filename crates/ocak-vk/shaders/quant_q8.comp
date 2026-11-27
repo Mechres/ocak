@@ -11,15 +11,34 @@ layout(set = 0, binding = 1) writeonly buffer Q { uint q[]; };
 layout(set = 0, binding = 2) writeonly buffer S { vec4 sc[]; };
 layout(push_constant) uniform PC { uint x_off4; uint q_off; uint s_off; uint n_blocks; } pc;
 
+#ifdef GROUP256
+// -DGROUP256 (opt-in, OCAK_PREFILL_Q256): one scale per 256 values (8 consecutive blocks, 64
+// lanes; rows must be multiples of 256), same output layout. Coarser (lossy) but lets the
+// prefill matmul skip the per-block scale multiply (qmm_q8.comp -DACT256).
+shared float gmax[8];
+#endif
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid >> 3;
     uint lane = gid & 7u;
+#ifdef GROUP256
+    // No early exit: the shared-memory reduction needs every invocation at the barrier.
+    bool live = blk < pc.n_blocks;
+    vec4 v = live ? x4[pc.x_off4 + gid] : vec4(0.0);
+    float amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = subgroupClusteredMax(amax, 32u);
+    uint lid = gl_LocalInvocationID.x;
+    if ((lid & 31u) == 0u) gmax[lid >> 5] = amax;
+    barrier();
+    amax = max(gmax[(lid >> 6) * 2u], gmax[(lid >> 6) * 2u + 1u]);
+    if (!live) return;
+#else
     // Whole 8-lane clusters share blk, so they exit together and the reductions stay uniform.
     if (blk >= pc.n_blocks) return;
     vec4 v = x4[pc.x_off4 + gid];
     float amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
     amax = subgroupClusteredMax(amax, 8u);
+#endif
     float dx = amax / 127.0;
     float inv = (amax > 0.0) ? 127.0 / amax : 0.0;
     ivec4 qi = clamp(ivec4(round(v * inv)), ivec4(-127), ivec4(127));

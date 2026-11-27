@@ -123,12 +123,29 @@ fn main() {
     // Sources compiled several times with different defines: (output name, source, defines).
     println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
     println!("cargo:rerun-if-changed=shaders/qmv_q8.comp");
-    let variants: [(&str, &str, &[&str]); 53] = [
+    let variants: [(&str, &str, &[&str]); 70] = [
         ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
         ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
         ("attention_prefill_128_f2", "shaders/attention_prefill.comp", &["-DHDMAX=128", "-DFDOT2"]),
         ("attention_prefill_256_f2", "shaders/attention_prefill.comp", &["-DHDMAX=256", "-DFDOT2"]),
         ("quant_q8", "shaders/quant_q8.comp", &[]),
+        ("quant_q8_256", "shaders/quant_q8.comp", &["-DGROUP256"]),
+        ("qmmq256_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K", "-DACT256"]),
+        ("qmmq256_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K", "-DACT256"]),
+        ("qmmq256_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K", "-DACT256"]),
+        ("qmmq256_q8_0", "shaders/qmm_q8.comp", &["-DQ8_0", "-DACT256"]),
+        ("qmmq256_q2_k", "shaders/qmm_q8.comp", &["-DQ2_K", "-DACT256"]),
+        ("qmmq256_q3_k", "shaders/qmm_q8.comp", &["-DQ3_K", "-DACT256"]),
+        ("qmmq256_iq4_nl", "shaders/qmm_q8.comp", &["-DIQ4_NL", "-DACT256"]),
+        ("qmmq256_iq4_xs", "shaders/qmm_q8.comp", &["-DIQ4_XS", "-DACT256"]),
+        ("qmmq256_iq3_s", "shaders/qmm_q8.comp", &["-DIQ3_S", "-DACT256"]),
+        ("qmmq256_iq3_xxs", "shaders/qmm_q8.comp", &["-DIQ3_XXS", "-DACT256"]),
+        ("qmmq256_iq2_xs", "shaders/qmm_q8.comp", &["-DIQ2_XS", "-DACT256"]),
+        ("qmmq256_iq2_s", "shaders/qmm_q8.comp", &["-DIQ2_S", "-DACT256"]),
+        ("qmmq256_iq2_xxs", "shaders/qmm_q8.comp", &["-DIQ2_XXS", "-DACT256"]),
+        ("qmmq256_iq1_s", "shaders/qmm_q8.comp", &["-DIQ1_S", "-DACT256"]),
+        ("qmmq256_iq1_m", "shaders/qmm_q8.comp", &["-DIQ1_M", "-DACT256"]),
+        ("qmmq256_nvfp4", "shaders/qmm_q8.comp", &["-DNVFP4", "-DACT256"]),
         ("qmmq_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K"]),
         ("qmmq_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K"]),
         ("qmmq_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K"]),
