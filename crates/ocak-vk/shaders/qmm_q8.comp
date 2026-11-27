@@ -19,7 +19,7 @@
 #define TM 4u
 #define BM 64u
 #ifdef GROUPED
-#define TN 2u
+#define TN 4u
 #else
 #define TN 8u
 #endif
@@ -59,7 +59,6 @@ shared float xsm[2u * BN];         // dx * sum(qx) per column and half
 
 #include "dequant_i8.glsl"
 
-uint xs_word(uint kw, uint c) { return xs[kw * (BN / 4u) + (c >> 2)][c & 3u]; }
 
 void main() {
     uint lid = gl_LocalInvocationID.x;
@@ -145,8 +144,7 @@ void main() {
                 uint kw = h * 4u + c;
                 uvec4 wv = ws[kw * (BM / 4u) + tx];
 #ifdef GROUPED
-                uint xr[TN];
-                for (uint j = 0u; j < TN; j++) xr[j] = xs_word(kw, ty * TN + j);
+                uvec4 xr = xs[kw * (BN / 4u) + ty];
                 for (uint i = 0u; i < TM; i++)
                     for (uint j = 0u; j < TN; j++)
                         ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xr[j]));
@@ -189,8 +187,7 @@ void main() {
             for (uint kw = 0u; kw < 8u; kw++) {
                 uvec4 wv = ws[kw * (BM / 4u) + tx];
 #ifdef GROUPED
-                uint xr[TN];
-                for (uint j = 0u; j < TN; j++) xr[j] = xs_word(kw, ty * TN + j);
+                uvec4 xr = xs[kw * (BN / 4u) + ty];
                 for (uint i = 0u; i < TM; i++)
                     for (uint j = 0u; j < TN; j++)
                         ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xr[j]));

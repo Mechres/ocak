@@ -282,6 +282,8 @@ const QMMT_BM: u32 = 64;
 const QMMT_BN: u32 = 128;
 /// Column tile of the grouped variant (16 * TN with -DGROUPED).
 const QMMG_BN: u32 = 32;
+/// Column tile of the grouped integer-dot kernel (qmm_q8.comp -DGROUPED: TN = 4).
+const QMMQG_BN: u32 = 64;
 
 /// Whether the generic multi-token matvec (qmv_multi.comp) is faster than the hand-written
 /// single-token qmv shader for this format at batch 1. Measured on RX 6700 XT end to end
@@ -1877,7 +1879,7 @@ impl<'a> Recorder<'a> {
                         x_div, off_u32(slice_bytes), n_groups, cols, use_list, cols,
                     ];
                     let q8 = self.ctx.q8_scratch;
-                    self.dispatch_raw(&self.ctx.pipelines.qmmqg[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf, lbuf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), n_groups, cols.div_ceil(QMMG_BN));
+                    self.dispatch_raw(&self.ctx.pipelines.qmmqg[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf, lbuf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), n_groups, cols.div_ceil(QMMQG_BN));
                     self.q8_cache = Some((x.buf, x_off, k, x_rows, q_off));
                     return true;
                 }
