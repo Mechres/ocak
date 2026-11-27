@@ -203,6 +203,8 @@ struct Pipelines {
     mla_attn_prefill: PipelineBundle,
     attention_prefill_128: PipelineBundle,
     attention_prefill_256: PipelineBundle,
+    attention_prefill_128_f2: Option<PipelineBundle>,
+    attention_prefill_256_f2: Option<PipelineBundle>,
     argmax: PipelineBundle,
     sum_splits: PipelineBundle,
     quant_q8: PipelineBundle,
@@ -325,6 +327,8 @@ impl Pipelines {
         .chain(self.qmvm.iter())
         .chain(self.qmvi.iter())
         .chain(self.qmmq.iter())
+        .chain(self.attention_prefill_128_f2.iter())
+        .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
         .chain([
             &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill,
@@ -412,6 +416,32 @@ pub fn take_gpu_profile_report() -> Option<String> {
 fn gpu_profile() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("OCAK_GPU_PROFILE").is_ok_and(|v| v != "0"))
+}
+
+const MIXED_DOT_EXT: &CStr = c"VK_VALVE_shader_mixed_float_dot_product";
+
+/// VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE (not in ash 0.38).
+#[repr(C)]
+struct MixedDotFeatures {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    f16_acc32: vk::Bool32,
+    f16_acc16: vk::Bool32,
+    bf16_acc: vk::Bool32,
+    f8_acc32: vk::Bool32,
+}
+
+impl Default for MixedDotFeatures {
+    fn default() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_673_000),
+            p_next: std::ptr::null_mut(),
+            f16_acc32: 0,
+            f16_acc16: 0,
+            bf16_acc: 0,
+            f8_acc32: 0,
+        }
+    }
 }
 
 const STAGING_SIZE: u64 = 64 * 1024 * 1024;
@@ -560,6 +590,19 @@ impl VkContext {
             if use_push_desc {
                 dev_exts.push(ash::khr::push_descriptor::NAME.as_ptr());
             }
+            // VK_VALVE_shader_mixed_float_dot_product: fp16 x fp16 dot with fp32 accumulate
+            // (v_dot2_f32_f16 on RDNA), used by the prefill attention kernels when present.
+            let has_mixed_dot = exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == MIXED_DOT_EXT)
+                && std::env::var("OCAK_NO_FDOT2").is_err()
+                && {
+                    let mut q = MixedDotFeatures::default();
+                    let mut f2 = vk::PhysicalDeviceFeatures2 { p_next: &mut q as *mut MixedDotFeatures as *mut std::ffi::c_void, ..Default::default() };
+                    instance.get_physical_device_features2(phys, &mut f2);
+                    q.f16_acc32 != 0
+                };
+            if has_mixed_dot {
+                dev_exts.push(MIXED_DOT_EXT.as_ptr());
+            }
 
             let prio = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
@@ -570,6 +613,11 @@ impl VkContext {
             // shaderIntegerDotProduct is a required Vulkan 1.3 feature (int8 dot matmul).
             let mut feat13 = vk::PhysicalDeviceVulkan13Features::default().shader_integer_dot_product(true);
             let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feat12).push_next(&mut feat13);
+            let mut mixed = MixedDotFeatures { f16_acc32: 1, ..Default::default() };
+            if has_mixed_dot {
+                mixed.p_next = feat2.p_next;
+                feat2.p_next = &mut mixed as *mut MixedDotFeatures as *mut std::ffi::c_void;
+            }
             let dci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qci)
                 .enabled_extension_names(&dev_exts)
@@ -753,6 +801,8 @@ impl VkContext {
                 mla_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill.spv")), "mla_attn_prefill", 4, 20)?,
                 inkling_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill.spv")), "inkling_attn_prefill", 10, 92)?,
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
+                attention_prefill_128_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128_f2.spv")), "attention_prefill_128_f2", 4, 40)?) } else { None },
+                attention_prefill_256_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256_f2.spv")), "attention_prefill_256_f2", 4, 40)?) } else { None },
                 attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), "attention_prefill_256", 4, 40)?,
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 2, 8)?,
                 sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
@@ -2046,8 +2096,8 @@ impl<'a> Recorder<'a> {
     pub fn attention_prefill(&mut self, q: &Buffer, q_off: u64, kv: &Buffer, layer_kv_off: u64, page_table: &Buffer, pt_off: u64, out: &Buffer, out_off: u64, n_heads: u32, n_kv_heads: u32, head_dim: u32, pos: u32, sliding_window: u32, batch: u32) {
         let group = n_heads / n_kv_heads.max(1);
         let pipe = match head_dim {
-            0..=128 => &self.ctx.pipelines.attention_prefill_128,
-            129..=256 => &self.ctx.pipelines.attention_prefill_256,
+            0..=128 => self.ctx.pipelines.attention_prefill_128_f2.as_ref().unwrap_or(&self.ctx.pipelines.attention_prefill_128),
+            129..=256 => self.ctx.pipelines.attention_prefill_256_f2.as_ref().unwrap_or(&self.ctx.pipelines.attention_prefill_256),
             _ => {
                 self.attention_batch(q, q_off, kv, layer_kv_off, page_table, pt_off, out, out_off, n_heads, n_kv_heads, head_dim, pos, sliding_window, batch);
                 return;

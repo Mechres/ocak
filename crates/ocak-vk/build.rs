@@ -122,9 +122,11 @@ fn main() {
     }
     // Sources compiled several times with different defines: (output name, source, defines).
     println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
-    let variants: [(&str, &str, &[&str]); 35] = [
+    let variants: [(&str, &str, &[&str]); 37] = [
         ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
         ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
+        ("attention_prefill_128_f2", "shaders/attention_prefill.comp", &["-DHDMAX=128", "-DFDOT2"]),
+        ("attention_prefill_256_f2", "shaders/attention_prefill.comp", &["-DHDMAX=256", "-DFDOT2"]),
         ("quant_q8", "shaders/quant_q8.comp", &[]),
         ("qmmq_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K"]),
         ("qmmq_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K"]),

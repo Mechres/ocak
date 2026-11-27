@@ -1,5 +1,12 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
+#ifdef FDOT2
+// fp16 x fp16 dot with fp32 accumulate (VK_VALVE_shader_mixed_float_dot_product).
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float fdot2mix(f16vec2 a, f16vec2 b, float c);
+#endif
 // Flash-attention style causal prefill over the paged FP16 KV cache.
 // Workgroup (kvh, tile) owns R = 64 query rows: the `group` query heads that share KV head kvh,
 // for 64 / group consecutive tokens. Each step stages a BK-key tile of K and V in shared memory
@@ -97,51 +104,42 @@ void main() {
 
     // K/V tile staging with a register prefetch of the next tile (loads in flight during compute).
     #define LPT ((BK * HHD) / 256u)
+    // Word u of the tile: (key, dim pair) from idx = tid + 256 u.
+    #define V_KEY_DIM(u, kk, e, ok) { uint idx_ = tid + 256u * (u); kk = idx_ / hhd; e = idx_ % hhd; ok = idx_ < BK * hhd; }
+    #define KV_ADDR(t, e) (pc.layer_kv_off + ((pt[pc.pt_off + ((t) >> 4)] * 2u) * 16u + ((t) & 15u)) * half_kv_dim + kvh * hhd + (e))
+    #define LOAD_KV(T0, u) { \
+        uint idx_k = tid + 256u * (u); uint kk_k = idx_k / hhd; uint t_k = (T0) + kk_k; \
+        pk[u] = (idx_k < BK * hhd && t_k <= max_qpos) ? kv[KV_ADDR(t_k, idx_k % hhd)] : 0u; \
+        uint kk_v, e_v; bool ok_v; V_KEY_DIM(u, kk_v, e_v, ok_v); uint t_v = (T0) + kk_v; \
+        pv[u] = (ok_v && t_v <= max_qpos) ? kv[KV_ADDR(t_v, e_v) + 16u * half_kv_dim] : 0u; }
     uint pk[LPT];
     uint pv[LPT];
-    for (uint u = 0u; u < LPT; u++) {
-        uint idx = tid + 256u * u;
-        uint kk = idx / hhd;
-        uint e = idx % hhd;
-        uint t = t_lo + kk;
-        pk[u] = 0u; pv[u] = 0u;
-        if (idx < BK * hhd && t <= max_qpos) {
-            uint kb = pc.layer_kv_off + ((pt[pc.pt_off + (t >> 4)] * 2u) * 16u + (t & 15u)) * half_kv_dim + kvh * hhd + e;
-            pk[u] = kv[kb];
-            pv[u] = kv[kb + 16u * half_kv_dim];
-        }
-    }
+    for (uint u = 0u; u < LPT; u++) LOAD_KV(t_lo, u);
     for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
         for (uint u = 0u; u < LPT; u++) {
             uint idx = tid + 256u * u;
-            if (idx < BK * hhd) {
-                uint kk = idx / hhd;
-                uint e = idx % hhd;
-                ks[kk * HS + e] = pk[u];
-                vs[kk * HS + e] = pv[u];
-            }
+            if (idx < BK * hhd) ks[(idx / hhd) * HS + idx % hhd] = pk[u];
+            if (idx < BK * hhd) vs[(idx / hhd) * HS + idx % hhd] = pv[u];
         }
         barrier();
         uint t1 = t0 + BK;
         if (t1 <= max_qpos) {
-            for (uint u = 0u; u < LPT; u++) {
-                uint idx = tid + 256u * u;
-                uint kk = idx / hhd;
-                uint e = idx % hhd;
-                uint t = t1 + kk;
-                pk[u] = 0u; pv[u] = 0u;
-                if (idx < BK * hhd && t <= max_qpos) {
-                    uint kb = pc.layer_kv_off + ((pt[pc.pt_off + (t >> 4)] * 2u) * 16u + (t & 15u)) * half_kv_dim + kvh * hhd + e;
-                    pk[u] = kv[kb];
-                    pv[u] = kv[kb + 16u * half_kv_dim];
-                }
-            }
+            for (uint u = 0u; u < LPT; u++) LOAD_KV(t1, u);
         }
 
         float sa[KP2];
         float sb[KP2];
         for (uint j = 0u; j < KP2; j++) { sa[j] = 0.0; sb[j] = 0.0; }
         for (uint e = 0u; e < hhd; e++) {
+#ifdef FDOT2
+            f16vec2 qa = unpackFloat2x16(qs[ra * HS + e]);
+            f16vec2 qb = unpackFloat2x16(qs[rb * HS + e]);
+            for (uint j = 0u; j < KP2; j++) {
+                f16vec2 kv2 = unpackFloat2x16(ks[(sub + 8u * j) * HS + e]);
+                sa[j] = fdot2mix(qa, kv2, sa[j]);
+                sb[j] = fdot2mix(qb, kv2, sb[j]);
+            }
+#else
             vec2 qa = unpackHalf2x16(qs[ra * HS + e]);
             vec2 qb = unpackHalf2x16(qs[rb * HS + e]);
             for (uint j = 0u; j < KP2; j++) {
@@ -149,6 +147,7 @@ void main() {
                 sa[j] += dot(qa, kv2);
                 sb[j] += dot(qb, kv2);
             }
+#endif
         }
         float tma = -1e30, tmb = -1e30;
         for (uint j = 0u; j < KP2; j++) {
