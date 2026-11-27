@@ -118,7 +118,7 @@ fn main() {
     }
     // Sources compiled several times with different defines: (output name, source, defines).
     println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
-    let variants: [(&str, &str, &[&str]); 7] = [
+    let variants: [(&str, &str, &[&str]); 35] = [
         ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
         ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
         ("quant_q8", "shaders/quant_q8.comp", &[]),
@@ -126,6 +126,34 @@ fn main() {
         ("qmmq_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K"]),
         ("qmmq_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K"]),
         ("qmmq_q8_0", "shaders/qmm_q8.comp", &["-DQ8_0"]),
+        ("qmmq_q2_k", "shaders/qmm_q8.comp", &["-DQ2_K"]),
+        ("qmmq_q3_k", "shaders/qmm_q8.comp", &["-DQ3_K"]),
+        ("qmmq_iq4_nl", "shaders/qmm_q8.comp", &["-DIQ4_NL"]),
+        ("qmmq_iq4_xs", "shaders/qmm_q8.comp", &["-DIQ4_XS"]),
+        ("qmmq_iq3_s", "shaders/qmm_q8.comp", &["-DIQ3_S"]),
+        ("qmmq_iq3_xxs", "shaders/qmm_q8.comp", &["-DIQ3_XXS"]),
+        ("qmmq_iq2_xs", "shaders/qmm_q8.comp", &["-DIQ2_XS"]),
+        ("qmmq_iq2_s", "shaders/qmm_q8.comp", &["-DIQ2_S"]),
+        ("qmmq_iq2_xxs", "shaders/qmm_q8.comp", &["-DIQ2_XXS"]),
+        ("qmmq_iq1_s", "shaders/qmm_q8.comp", &["-DIQ1_S"]),
+        ("qmmq_iq1_m", "shaders/qmm_q8.comp", &["-DIQ1_M"]),
+        ("qmmq_nvfp4", "shaders/qmm_q8.comp", &["-DNVFP4"]),
+        ("qmmqg_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K", "-DGROUPED"]),
+        ("qmmqg_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K", "-DGROUPED"]),
+        ("qmmqg_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K", "-DGROUPED"]),
+        ("qmmqg_q8_0", "shaders/qmm_q8.comp", &["-DQ8_0", "-DGROUPED"]),
+        ("qmmqg_q2_k", "shaders/qmm_q8.comp", &["-DQ2_K", "-DGROUPED"]),
+        ("qmmqg_q3_k", "shaders/qmm_q8.comp", &["-DQ3_K", "-DGROUPED"]),
+        ("qmmqg_iq4_nl", "shaders/qmm_q8.comp", &["-DIQ4_NL", "-DGROUPED"]),
+        ("qmmqg_iq4_xs", "shaders/qmm_q8.comp", &["-DIQ4_XS", "-DGROUPED"]),
+        ("qmmqg_iq3_s", "shaders/qmm_q8.comp", &["-DIQ3_S", "-DGROUPED"]),
+        ("qmmqg_iq3_xxs", "shaders/qmm_q8.comp", &["-DIQ3_XXS", "-DGROUPED"]),
+        ("qmmqg_iq2_xs", "shaders/qmm_q8.comp", &["-DIQ2_XS", "-DGROUPED"]),
+        ("qmmqg_iq2_s", "shaders/qmm_q8.comp", &["-DIQ2_S", "-DGROUPED"]),
+        ("qmmqg_iq2_xxs", "shaders/qmm_q8.comp", &["-DIQ2_XXS", "-DGROUPED"]),
+        ("qmmqg_iq1_s", "shaders/qmm_q8.comp", &["-DIQ1_S", "-DGROUPED"]),
+        ("qmmqg_iq1_m", "shaders/qmm_q8.comp", &["-DIQ1_M", "-DGROUPED"]),
+        ("qmmqg_nvfp4", "shaders/qmm_q8.comp", &["-DNVFP4", "-DGROUPED"]),
     ];
     for (name, src, defs) in variants {
         println!("cargo:rerun-if-changed={src}");

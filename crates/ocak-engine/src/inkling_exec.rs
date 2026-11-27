@@ -1628,7 +1628,7 @@ impl InklingExec {
         rec.barrier();
         rec.moe_group(&bb.top_ids, &bb.moe_list, b * nu, n_exp, b);
         rec.barrier();
-        let ok_gu = rec.qmm_grouped(*wt_gu, gu_buf, 0, p.exps.gu_stride as u64, &bb.x_moe, 0, ne, nu, &bb.moe_gu, 0, ne, 2 * n_ff, n_exp, Some(&bb.moe_list), b);
+        let ok_gu = rec.qmm_grouped(*wt_gu, gu_buf, 0, p.exps.gu_stride as u64, &bb.x_moe, 0, ne, nu, b, &bb.moe_gu, 0, ne, 2 * n_ff, n_exp, Some(&bb.moe_list), b);
         if !ok_gu {
             for t in 0..b {
                 rec.qmv_id_batch(*wt_gu, gu_buf, &bb.top_ids, t * nu, nu, &bb.x_moe, (t * ne) as u64, 0, &bb.moe_gu, (t * nu * 2 * n_ff) as u64, ne, 2 * n_ff, p.exps.gu_stride as u64);
@@ -1637,7 +1637,7 @@ impl InklingExec {
         rec.barrier();
         rec.situ_id_batch(&bb.moe_gu, &bb.moe_mid, &bb.top_ids, &gph.gu_scale, n_ff, 0, b * nu, self.situ_beta, self.situ_lin_beta);
         rec.barrier();
-        let ok_dn = rec.qmm_grouped(*wt_dn, dn_buf, 0, p.exps.dn_stride as u64, &bb.moe_mid, 0, n_ff, 1, &bb.moe_tmp, 0, n_ff, ne, n_exp, Some(&bb.moe_list), b);
+        let ok_dn = rec.qmm_grouped(*wt_dn, dn_buf, 0, p.exps.dn_stride as u64, &bb.moe_mid, 0, n_ff, 1, b * nu, &bb.moe_tmp, 0, n_ff, ne, n_exp, Some(&bb.moe_list), b);
         if !ok_dn {
             for t in 0..b {
                 rec.qmv_id_batch(*wt_dn, dn_buf, &bb.top_ids, t * nu, nu, &bb.moe_mid, (t * nu * n_ff) as u64, n_ff, &bb.moe_tmp, (t * nu * ne) as u64, n_ff, ne, p.exps.dn_stride as u64);

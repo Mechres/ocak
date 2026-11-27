@@ -204,6 +204,8 @@ struct Pipelines {
     quant_q8: PipelineBundle,
     /// Integer-dot tiled matmuls, indexed by qmmq_index.
     qmmq: Vec<PipelineBundle>,
+    /// Grouped (MoE) integer-dot matmuls, indexed by qmmq_index.
+    qmmqg: Vec<PipelineBundle>,
 }
 
 /// Weight formats with a tiled prefill matmul (`qmm_tiled.comp`), in `Pipelines::qmmt` order.
@@ -239,8 +241,27 @@ fn qmmq_index(ty: WType) -> Option<usize> {
         WType::Q5K => Some(1),
         WType::Q6K => Some(2),
         WType::Q8_0 => Some(3),
+        WType::Q2K => Some(4),
+        WType::Q3K => Some(5),
+        WType::IQ4NL => Some(6),
+        WType::IQ4XS => Some(7),
+        WType::IQ3S => Some(8),
+        WType::IQ3XXS => Some(9),
+        WType::IQ2XS => Some(10),
+        WType::IQ2S => Some(11),
+        WType::IQ2XXS => Some(12),
+        WType::IQ1S => Some(13),
+        WType::IQ1M => Some(14),
+        WType::NVFP4 => Some(15),
         _ => None,
     }
+}
+
+/// Formats whose scale changes every 16 columns (two fix-ups per 32-column block). In the
+/// grouped (MoE) kernel's narrow 32-column tiles that overhead outweighs the int8 gain, so they
+/// keep the fp16-tile grouped path.
+fn qmmq_scale16(ty: WType) -> bool {
+    matches!(ty, WType::Q6K | WType::Q2K | WType::Q3K | WType::IQ2XS | WType::IQ2S | WType::IQ1M | WType::NVFP4)
 }
 
 /// Integer-dot prefill matmuls are on unless OCAK_MMQ=0.
@@ -729,10 +750,40 @@ impl VkContext {
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 2, 8)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
                 qmmq: vec![
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 4, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q5_k.spv")), "qmmq_q5_k", 4, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q6_k.spv")), "qmmq_q6_k", 4, 32)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q8_0.spv")), "qmmq_q8_0", 4, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q5_k.spv")), "qmmq_q5_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q6_k.spv")), "qmmq_q6_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q8_0.spv")), "qmmq_q8_0", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q2_k.spv")), "qmmq_q2_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q3_k.spv")), "qmmq_q3_k", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_nl.spv")), "qmmq_iq4_nl", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq4_xs.spv")), "qmmq_iq4_xs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_s.spv")), "qmmq_iq3_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq3_xxs.spv")), "qmmq_iq3_xxs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xs.spv")), "qmmq_iq2_xs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_s.spv")), "qmmq_iq2_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq2_xxs.spv")), "qmmq_iq2_xxs", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_s.spv")), "qmmq_iq1_s", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_iq1_m.spv")), "qmmq_iq1_m", 5, 32)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_nvfp4.spv")), "qmmq_nvfp4", 5, 32)?,
+                ],
+                qmmqg: vec![
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q4_k.spv")), "qmmqg_q4_k", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q5_k.spv")), "qmmqg_q5_k", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q6_k.spv")), "qmmqg_q6_k", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q8_0.spv")), "qmmqg_q8_0", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q2_k.spv")), "qmmqg_q2_k", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_q3_k.spv")), "qmmqg_q3_k", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq4_nl.spv")), "qmmqg_iq4_nl", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq4_xs.spv")), "qmmqg_iq4_xs", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq3_s.spv")), "qmmqg_iq3_s", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq3_xxs.spv")), "qmmqg_iq3_xxs", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq2_xs.spv")), "qmmqg_iq2_xs", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq2_s.spv")), "qmmqg_iq2_s", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq2_xxs.spv")), "qmmqg_iq2_xxs", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq1_s.spv")), "qmmqg_iq1_s", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_iq1_m.spv")), "qmmqg_iq1_m", 6, 52)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmqg_nvfp4.spv")), "qmmqg_nvfp4", 6, 52)?,
                 ],
             };
 
@@ -1337,38 +1388,52 @@ impl<'a> Recorder<'a> {
     /// Integer-dot prefill matmul: quantizes X to int8 blocks (reusing the previous
     /// quantization when the same X feeds consecutive matmuls), then runs qmm_q8.comp.
     /// Returns false when the format / shape is not supported.
+    /// Quantize `rows` activation rows of k floats (contiguous at x_off) to int8 blocks in the
+    /// q8 scratch, or reuse the previous quantization of the same rows. Returns the scratch
+    /// byte offset of the quantized words (scales follow at + rows * k), or None if unsupported.
+    fn quantize_q8(&mut self, x: &Buffer, x_off: u64, k: u32, rows: u32) -> Option<u64> {
+        let n = rows as u64 * k as u64;
+        let bytes = (n + n / 2).next_multiple_of(256);
+        if !self.mmq || !x_off.is_multiple_of(4) || !k.is_multiple_of(32) || bytes > Q8_SCRATCH_BYTES {
+            return None;
+        }
+        let key = (x.buf, x_off, k, rows);
+        if let Some((b, o, kk, rr, q_off)) = self.q8_cache {
+            if (b, o, kk, rr) == key {
+                return Some(q_off);
+            }
+        }
+        if self.q8_cursor + bytes > Q8_SCRATCH_BYTES {
+            // Earlier matmuls may still read the region being reused.
+            self.barrier();
+            self.q8_cursor = 0;
+        }
+        let q_off = self.q8_cursor;
+        self.q8_cursor += bytes;
+        let n_blocks = off_u32(n / 32);
+        let pc = [off_u32(x_off / 4), off_u32(q_off / 4), off_u32((q_off + n) / 16), n_blocks];
+        let q8 = self.ctx.q8_scratch;
+        self.dispatch_raw(&self.ctx.pipelines.quant_q8, &[x.buf, q8, q8], bytemuck::cast_slice(&pc), n_blocks.div_ceil(32), 1, 1);
+        if self.defer_barriers {
+            self.barrier();
+        }
+        Some(q_off)
+    }
+
+    /// Integer-dot prefill matmul: quantizes X to int8 blocks (reusing the previous
+    /// quantization when the same X feeds consecutive matmuls), then runs qmm_q8.comp.
+    /// Returns false when the format / shape is not supported.
     fn qmm_int8(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, batch: u32) -> bool {
         let Some(qi) = qmmq_index(ty) else { return false };
-        let n = batch as u64 * k as u64;
-        let bytes = (n + n / 2).next_multiple_of(256);
-        if !self.mmq || !x_off.is_multiple_of(4) || !w_off.is_multiple_of(4) || bytes > Q8_SCRATCH_BYTES {
+        if !w_off.is_multiple_of(4) {
             return false;
         }
-        let key = (x.buf, x_off, k, batch);
-        let q_off = match self.q8_cache {
-            Some((b, o, kk, bb, q_off)) if (b, o, kk, bb) == key => q_off,
-            _ => {
-                if self.q8_cursor + bytes > Q8_SCRATCH_BYTES {
-                    // Earlier matmuls may still read the region being reused.
-                    self.barrier();
-                    self.q8_cursor = 0;
-                }
-                let q_off = self.q8_cursor;
-                self.q8_cursor += bytes;
-                let n_blocks = off_u32(n / 32);
-                let pc = [off_u32(x_off / 4), off_u32(q_off / 4), off_u32((q_off + n) / 16), n_blocks];
-                let q8 = self.ctx.q8_scratch;
-                self.dispatch_raw(&self.ctx.pipelines.quant_q8, &[x.buf, q8, q8], bytemuck::cast_slice(&pc), n_blocks.div_ceil(32), 1, 1);
-                if self.defer_barriers {
-                    self.barrier();
-                }
-                q_off
-            }
-        };
+        let Some(q_off) = self.quantize_q8(x, x_off, k, batch) else { return false };
+        let n = batch as u64 * k as u64;
         let pc = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k), batch];
         let q8 = self.ctx.q8_scratch;
-        self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, y.buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
-        self.q8_cache = Some((key.0, key.1, key.2, key.3, q_off));
+        self.dispatch_raw(&self.ctx.pipelines.qmmq[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
+        self.q8_cache = Some((x.buf, x_off, k, batch, q_off));
         true
     }
 
@@ -1758,14 +1823,31 @@ impl<'a> Recorder<'a> {
     ///
     /// Entry e reads X row `(e / x_div) * x_stride` (in floats from x_off) and writes Y row
     /// `e * m`. Returns false (nothing recorded) when the weight format has no tiled kernel.
-    pub fn qmm_grouped(&mut self, ty: WType, w: &Buffer, w_off: u64, slice_bytes: u64, x: &Buffer, x_off: u64, x_stride: u32, x_div: u32, y: &Buffer, y_off: u64, k: u32, m: u32, n_groups: u32, list: Option<&Buffer>, cols: u32) -> bool {
+    /// `x_rows`: number of X rows the entries address (max entry / x_div + 1), used to size the
+    /// int8 quantization of X.
+    pub fn qmm_grouped(&mut self, ty: WType, w: &Buffer, w_off: u64, slice_bytes: u64, x: &Buffer, x_off: u64, x_stride: u32, x_div: u32, x_rows: u32, y: &Buffer, y_off: u64, k: u32, m: u32, n_groups: u32, list: Option<&Buffer>, cols: u32) -> bool {
         let i = qmmt_index(ty);
         if !k.is_multiple_of(32) {
             return false;
         }
         let use_list = list.is_some() as u32;
-        let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), x_stride, x_div, off_u32(slice_bytes), n_groups, cols, use_list, cols];
         let lbuf = list.map(|b| b.buf).unwrap_or(self.ctx.iq_buf);
+        if let Some(qi) = qmmq_index(ty).filter(|_| !qmmq_scale16(ty)) {
+            if x_stride == k && w_off.is_multiple_of(4) && slice_bytes.is_multiple_of(4) {
+                if let Some(q_off) = self.quantize_q8(x, x_off, k, x_rows) {
+                    let n = x_rows as u64 * k as u64;
+                    let pc = [
+                        off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(y_off), k, m, ty.row_bytes(k),
+                        x_div, off_u32(slice_bytes), n_groups, cols, use_list, cols,
+                    ];
+                    let q8 = self.ctx.q8_scratch;
+                    self.dispatch_raw(&self.ctx.pipelines.qmmqg[qi], &[w.buf, q8, q8, y.buf, self.ctx.iq_buf, lbuf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), n_groups, cols.div_ceil(QMMG_BN));
+                    self.q8_cache = Some((x.buf, x_off, k, x_rows, q_off));
+                    return true;
+                }
+            }
+        }
+        let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), x_stride, x_div, off_u32(slice_bytes), n_groups, cols, use_list, cols];
         let p = &self.ctx.pipelines.qmmg[i];
         self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, lbuf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), n_groups, cols.div_ceil(QMMG_BN));
         true
@@ -2441,7 +2523,7 @@ mod tests {
             let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
             c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
             let by = c.create_device_buffer((batch * n_used * m * 4) as u64).unwrap();
-            for wt in [WType::IQ3XXS, WType::IQ3S] {
+            for wt in [WType::IQ3XXS, WType::IQ3S, WType::Q4K, WType::Q6K, WType::Q8_0, WType::IQ2S, WType::IQ4XS, WType::NVFP4] {
                 let slice = m * wt.row_bytes(k as u32) as usize;
                 let raw: Vec<u8> = (0..n_exp * slice).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
                 let bw = c.create_device_buffer(raw.len() as u64).unwrap();
@@ -2451,7 +2533,7 @@ mod tests {
                     rec.moe_group(&bids, &blist, (batch * n_used) as u32, n_exp as u32, batch as u32);
                     rec.barrier();
                     for _ in 0..n {
-                        rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, if k > m { n_used as u32 } else { 1 }, &by, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32);
+                        rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, if k > m { n_used as u32 } else { 1 }, if k > m { batch as u32 } else { (batch * n_used) as u32 }, &by, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32);
                     }
                     rec.finish_and_wait().unwrap();
                 };
@@ -2563,7 +2645,10 @@ mod tests {
         let n_ent = batch * n_used;
         let by_g = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
         let by_r = c.create_device_buffer((n_ent * m * 4) as u64).unwrap();
-        for wt in [WType::IQ3S, WType::Q4K, WType::IQ4NL, WType::Q8_0, WType::NVFP4] {
+        for (wt, mmq) in [WType::IQ3S, WType::Q4K, WType::IQ4NL, WType::Q8_0, WType::NVFP4, WType::Q6K, WType::IQ2S]
+            .into_iter()
+            .flat_map(|wt| [(wt, false), (wt, true)])
+        {
             let rb = wt.row_bytes(k as u32) as usize;
             let slice = m * rb;
             let raw: Vec<u8> = (0..n_exp * slice).map(|_| (next() & 0x3F) as u8).collect();
@@ -2571,9 +2656,10 @@ mod tests {
             c.upload(&bw, 0, &raw).unwrap();
             // Expert mode: entry e = t * n_used + slot reads X row t.
             let mut rec = c.begin();
+            rec.set_mmq(mmq);
             rec.moe_group(&bids, &blist, n_ent as u32, n_exp as u32, batch as u32);
             rec.barrier();
-            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, n_used as u32, &by_g, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32));
+            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bx, 0, k as u32, n_used as u32, batch as u32, &by_g, 0, k as u32, m as u32, n_exp as u32, Some(&blist), batch as u32));
             for (e, &ex) in ids.iter().enumerate() {
                 rec.qmv_classic(wt, &bw, ex as u64 * slice as u64, &bx, ((e / n_used) * k) as u64, &by_r, (e * m) as u64, k as u32, m as u32);
             }
@@ -2583,8 +2669,10 @@ mod tests {
             c.download(&by_g, 0, bytemuck::cast_slice_mut(&mut yg)).unwrap();
             c.download(&by_r, 0, bytemuck::cast_slice_mut(&mut yr)).unwrap();
             let scale = yr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            // fp16 tiles: ~5e-4 of scale; int8 activations: ~2e-4 mean, up to ~1e-2 per element.
+            let tol = if mmq && qmmq_index(wt).is_some() && !qmmq_scale16(wt) { 2e-2 } else { 3e-3 };
             for i in 0..n_ent * m {
-                assert!((yg[i] - yr[i]).abs() <= 3e-3 * scale, "grouped(list) {wt:?} idx={i}: {} vs {}", yg[i], yr[i]);
+                assert!((yg[i] - yr[i]).abs() <= tol * scale, "grouped(list) {wt:?} mmq={mmq} idx={i}: {} vs {}", yg[i], yr[i]);
             }
             // Head mode: group g = head, entry = t * n_groups + g, X rows strided.
             let (nh, stride) = (3usize, k + 64);
@@ -2593,7 +2681,7 @@ mod tests {
             let bxh = c.create_device_buffer((xh.len() * 4) as u64).unwrap();
             c.upload(&bxh, 0, bytemuck::cast_slice(&xh)).unwrap();
             let mut rec = c.begin();
-            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bxh, 0, stride as u32, 1, &by_g, 0, k as u32, m as u32, nh as u32, None, cols as u32));
+            assert!(rec.qmm_grouped(wt, &bw, 0, slice as u64, &bxh, 0, stride as u32, 1, (cols * nh) as u32, &by_g, 0, k as u32, m as u32, nh as u32, None, cols as u32));
             for t in 0..cols {
                 for h in 0..nh {
                     let e = t * nh + h;
@@ -2772,7 +2860,7 @@ mod tests {
         let by_a = c.create_device_buffer((batch * m * 4) as u64).unwrap();
         let by_b = c.create_device_buffer((batch * m * 4) as u64).unwrap();
         let by_ref = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        for wt in [WType::Q4K, WType::Q5K, WType::Q6K, WType::Q8_0] {
+        for wt in [WType::Q4K, WType::Q5K, WType::Q6K, WType::Q8_0, WType::Q2K, WType::Q3K, WType::IQ4NL, WType::IQ4XS, WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::NVFP4] {
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = (0..m * rb).map(|_| next_u8() & 0x3F).collect();
             let bw = c.create_device_buffer(raw.len() as u64).unwrap();

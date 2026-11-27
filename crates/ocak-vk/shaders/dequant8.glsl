@@ -126,7 +126,7 @@ void dq8(uint rb, uint k0, out float v[8]) {
     uint qo = b + 4u + sbk * 8u;
     for (uint i = 0u; i < 8u; i++) {
         uint q = (uint(w[qo + i]) >> sh) & 0xFu;
-        float mag = float[8](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)[q & 7u];
+        float mag = float((0xC8643210u >> (4u * (q & 7u))) & 0xFu);   // {0,1,2,3,4,6,8,12}
         v[i] = d * ((q >= 8u) ? -mag : mag);
     }
 #elif defined(F32)

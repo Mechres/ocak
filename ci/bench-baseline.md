@@ -6,9 +6,9 @@
 | Qwen3.5-4B-Q4_K_M | qwen35 | 2.55 GiB | 559 | 1589.1 | 75.7 | - |
 | Qwopus3.5-9B-coder-Exp-Q4_K_M | qwen35 | 5.24 GiB | 925 | 866.9 | 44.3 | - |
 | Ornith-1.5-9B-Q4_K_M | qwen35 | 5.38 GiB | 3493 | 734.8 | 49.7 | 31/31 (100%) |
-| Qwen3.8-27B-UD-IQ2_S | qwen35 | 7.80 GiB | 7393 | 169.8 | 15.9 | - |
-| RVN-IQ2_S-mtp | qwen35 | 9.14 GiB | 7025 | 168.4 | 22.0 | 31/31 (100%) |
-| Qwen3.8-27B.i1-Q2_K | qwen35 | 10.12 GiB | 6060 | 174.6 | 22.9 | 31/31 (100%) |
-| Xing4.0-29B-A4B-IQ3_XXS | xing4_0 | 10.79 GiB | 6848 | 430.2 | 32.4 | - |
-| Xing4.0-29B-A4B-IQ3_M | xing4_0 | 12.92 GiB | 8372 | 409.4 | 29.4 | - |
-| Inkling-2-Mini-UD-Q4_K_XL | inkling2_loop | 16.42 GiB | 12814 | 177.4 | 15.4 | - |
+| Qwen3.8-27B-UD-IQ2_S | qwen35 | 7.80 GiB | 5321 | 230.5 | 15.9 | - |
+| RVN-IQ2_S-mtp | qwen35 | 9.14 GiB | 6212 | 201.8 | 21.3 | 31/31 (100%) |
+| Qwen3.8-27B.i1-Q2_K | qwen35 | 10.12 GiB | 1798 | 228.6 | 23.3 | 31/31 (100%) |
+| Xing4.0-29B-A4B-IQ3_XXS | xing4_0 | 10.79 GiB | 7621 | 464.3 | 32.9 | - |
+| Xing4.0-29B-A4B-IQ3_M | xing4_0 | 12.92 GiB | 9425 | 436.4 | 29.6 | - |
+| Inkling-2-Mini-UD-Q4_K_XL | inkling2_loop | 16.42 GiB | 13322 | 185.5 | 15.3 | - |

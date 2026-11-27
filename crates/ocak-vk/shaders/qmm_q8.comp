@@ -9,21 +9,40 @@
 // product is dotPacked4x8EXT (4 MACs per instruction) with one float scale fix-up per
 // 16-column group:  sum_i (d q_i - m) * dx qx_i = d dx (q . qx) - m (dx sum qx).
 // Compiled once per weight format with -D<TYPE> (see build.rs).
-#if defined(Q6_K)
+#if defined(Q6_K) || defined(Q2_K) || defined(Q3_K) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ1_M) || defined(NVFP4)
 #define SCALE16
 #endif
 #define TM 4u
-#define TN 8u
 #define BM 64u
-#define BN 128u
+#ifdef GROUPED
+#define TN 2u
+#else
+#define TN 8u
+#endif
+#define BN (16u * TN)
+#define WPT (BN / 32u)          // activation words loaded per thread per K block
+#define TPC (8u / WPT)          // loader threads per activation column
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 0) readonly buffer W32 { uint w32[]; };
-layout(set = 0, binding = 1) readonly buffer XQ { uvec4 xq4[]; };
+layout(set = 0, binding = 1) readonly buffer XQ { uint xq[]; };
 layout(set = 0, binding = 2) readonly buffer XS { vec4 xsc[]; };
 layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 4) readonly buffer T { uint tbl[]; };
 // q_off4 / s_off: uvec4 / vec4 offsets of the quantized activations and their scales.
+#ifdef GROUPED
+// Grouped ("mul_mat_id") variant, as in qmm_tiled.comp: workgroup y = group (expert), z =
+// column tile; group g uses weight slice w_off + g * slice_bytes; its columns are entries from
+// the moe_group.comp list (use_list != 0) or entry = j * n_groups + g. Entry e reads quantized
+// activation row e / x_div and writes Y row e * m.
+layout(set = 0, binding = 5) readonly buffer L { uint glist[]; };
+layout(push_constant) uniform PC {
+    uint w_off; uint q_off4; uint s_off; uint y_off; uint k; uint m; uint row_bytes;
+    uint x_div; uint slice_bytes; uint n_groups; uint count; uint use_list; uint cap;
+} pc;
+#else
 layout(push_constant) uniform PC { uint w_off; uint q_off4; uint s_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+#endif
 
 shared uvec4 ws[8u * (BM / 4u)];   // [k word][row / 4] (4 consecutive rows per uvec4)
 shared uvec4 xs[8u * (BN / 4u)];   // [k word][col / 4]
@@ -32,24 +51,41 @@ shared vec4 xss[BN];               // (dx, dx*sum0, dx*sum1, -)
 
 #include "dequant_i8.glsl"
 
+uint xs_word(uint kw, uint c) { return xs[kw * (BN / 4u) + (c >> 2)][c & 3u]; }
+
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint row0 = gl_WorkGroupID.x * BM;
+#ifdef GROUPED
+    uint grp = gl_WorkGroupID.y;
+    uint tok0 = gl_WorkGroupID.z * BN;
+    uint ncols = (pc.use_list != 0u) ? glist[grp] : pc.count;
+    if (tok0 >= ncols) return;
+    uint wbase = pc.w_off + grp * pc.slice_bytes;
+#else
     uint tok0 = gl_WorkGroupID.y * BN;
+    uint ncols = pc.batch;
+    uint wbase = pc.w_off;
+#endif
 
     // Weight loader: row lid/4, 8 columns (2 words) per thread.
     uint ld_row = lid >> 2;
     uint ld_part = lid & 3u;
-    uint rb = pc.w_off + min(row0 + ld_row, pc.m - 1u) * pc.row_bytes;
-    // Activation loader: column lid/2, 4 words (16 values) per thread.
-    uint x_col = lid >> 1;
-    uint x_half = lid & 1u;
-    uint col = min(tok0 + x_col, pc.batch - 1u);
+    uint rb = wbase + min(row0 + ld_row, pc.m - 1u) * pc.row_bytes;
+    // Activation loader: column lid / TPC, WPT words per thread.
+    uint x_col = lid / TPC;
+    uint x_part = lid % TPC;
+    uint col = min(tok0 + x_col, ncols - 1u);
     uint kblocks = pc.k >> 5;
+#ifdef GROUPED
+    uint xentry = (pc.use_list != 0u) ? glist[pc.n_groups + grp * pc.cap + col] : col * pc.n_groups + grp;
+    uint xblk0 = (xentry / pc.x_div) * kblocks;
+#else
     uint xblk0 = col * kblocks;
+#endif
 
     uint tx = lid & 15u;   // rows tx*4 .. +3
-    uint ty = lid >> 4;    // cols ty*8 .. +7
+    uint ty = lid >> 4;    // cols ty*TN .. +TN-1
     float acc[TN][TM];
     for (uint j = 0u; j < TN; j++)
         for (uint i = 0u; i < TM; i++) acc[j][i] = 0.0;
@@ -58,10 +94,10 @@ void main() {
     // while the current one is computed from shared memory.
     uint pq0, pq1;
     float pd, pm;
-    uvec4 pxv;
+    uint pxv[WPT];
     vec4 pxs;
     dqi8(rb, ld_part * 8u, pq0, pq1, pd, pm);
-    pxv = xq4[pc.q_off4 + xblk0 * 2u + x_half];
+    for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + xblk0 * 8u + x_part * WPT + c];
     pxs = xsc[pc.s_off + xblk0];
 
     for (uint kb = 0u; kb < kblocks; kb++) {
@@ -71,15 +107,14 @@ void main() {
             ws[(kw + 1u) * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq1;
             if (ld_part == 0u) { wsc[ld_row].x = pd; wsc[ld_row].y = pm; }
             if (ld_part == 2u) { wsc[ld_row].z = pd; wsc[ld_row].w = pm; }
-            uint xw = x_half * 4u;
-            for (uint c = 0u; c < 4u; c++)
-                xs[(xw + c) * (BN / 4u) + (x_col >> 2)][x_col & 3u] = pxv[c];
-            if (x_half == 0u) xss[x_col] = pxs;
+            for (uint c = 0u; c < WPT; c++)
+                xs[(x_part * WPT + c) * (BN / 4u) + (x_col >> 2)][x_col & 3u] = pxv[c];
+            if (x_part == 0u) xss[x_col] = pxs;
         }
         barrier();
         if (kb + 1u < kblocks) {
             dqi8(rb, ((kb + 1u) << 5) + ld_part * 8u, pq0, pq1, pd, pm);
-            pxv = xq4[pc.q_off4 + (xblk0 + kb + 1u) * 2u + x_half];
+            for (uint c = 0u; c < WPT; c++) pxv[c] = xq[pc.q_off4 * 4u + (xblk0 + kb + 1u) * 8u + x_part * WPT + c];
             pxs = xsc[pc.s_off + xblk0 + kb + 1u];
         }
 #ifdef SCALE16
@@ -91,6 +126,13 @@ void main() {
             for (uint c = 0u; c < 4u; c++) {
                 uint kw = h * 4u + c;
                 uvec4 wv = ws[kw * (BM / 4u) + tx];
+#ifdef GROUPED
+                uint xr[TN];
+                for (uint j = 0u; j < TN; j++) xr[j] = xs_word(kw, ty * TN + j);
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xr[j]));
+#else
                 uvec4 xa = xs[kw * (BN / 4u) + ty * 2u];
                 uvec4 xb = xs[kw * (BN / 4u) + ty * 2u + 1u];
                 for (uint i = 0u; i < TM; i++) {
@@ -99,6 +141,7 @@ void main() {
                         ia[j + 4u][i] += dotPacked4x8EXT(int(wv[i]), int(xb[j]));
                     }
                 }
+#endif
             }
             vec2 wdm[TM];
             for (uint i = 0u; i < TM; i++) {
@@ -120,6 +163,13 @@ void main() {
                 for (uint i = 0u; i < TM; i++) ia[j][i] = 0;
             for (uint kw = 0u; kw < 8u; kw++) {
                 uvec4 wv = ws[kw * (BM / 4u) + tx];
+#ifdef GROUPED
+                uint xr[TN];
+                for (uint j = 0u; j < TN; j++) xr[j] = xs_word(kw, ty * TN + j);
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xr[j]));
+#else
                 uvec4 xa = xs[kw * (BN / 4u) + ty * 2u];
                 uvec4 xb = xs[kw * (BN / 4u) + ty * 2u + 1u];
                 for (uint i = 0u; i < TM; i++) {
@@ -128,6 +178,7 @@ void main() {
                         ia[j + 4u][i] += dotPacked4x8EXT(int(wv[i]), int(xb[j]));
                     }
                 }
+#endif
             }
             vec2 wdm[TM];
             for (uint i = 0u; i < TM; i++) wdm[i] = wsc[tx * TM + i].xy;
@@ -144,10 +195,15 @@ void main() {
 
     for (uint j = 0u; j < TN; j++) {
         uint c = tok0 + ty * TN + j;
-        if (c >= pc.batch) break;
+        if (c >= ncols) break;
+#ifdef GROUPED
+        uint yentry = (pc.use_list != 0u) ? glist[pc.n_groups + grp * pc.cap + c] : c * pc.n_groups + grp;
+#else
+        uint yentry = c;
+#endif
         for (uint i = 0u; i < TM; i++) {
             uint row = row0 + tx * TM + i;
-            if (row < pc.m) y[pc.y_off + c * pc.m + row] = acc[j][i];
+            if (row < pc.m) y[pc.y_off + yentry * pc.m + row] = acc[j][i];
         }
     }
 }

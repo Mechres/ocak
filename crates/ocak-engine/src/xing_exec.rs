@@ -1457,7 +1457,7 @@ impl XingExec {
             );
             rec.barrier();
             // Per-head absorbed K projection: one grouped matmul (group = head, entry = t*nh + h).
-            if !rec.qmm_grouped(vkb.ty, &vkb.buf, 0, vkb.slice_bytes, &gp.q_full, 0, c.key_dim as u32, 1, &gp.q_lat, 0, vkb.k, vkb.m, nh as u32, None, batch) {
+            if !rec.qmm_grouped(vkb.ty, &vkb.buf, 0, vkb.slice_bytes, &gp.q_full, 0, c.key_dim as u32, 1, batch * nh as u32, &gp.q_lat, 0, vkb.k, vkb.m, nh as u32, None, batch) {
                 for t in 0..bs {
                     for h in 0..nh {
                         rec.qmv(
@@ -1476,7 +1476,7 @@ impl XingExec {
                 pos0 as u32, kv_layer_off, kq_scale, batch,
             );
             rec.barrier();
-            if !rec.qmm_grouped(vvb.ty, &vvb.buf, 0, vvb.slice_bytes, &gp.attn_lat, 0, latent as u32, 1, &gp.val_all, 0, vvb.k, vvb.m, nh as u32, None, batch) {
+            if !rec.qmm_grouped(vvb.ty, &vvb.buf, 0, vvb.slice_bytes, &gp.attn_lat, 0, latent as u32, 1, batch * nh as u32, &gp.val_all, 0, vvb.k, vvb.m, nh as u32, None, batch) {
                 for t in 0..bs {
                     for h in 0..nh {
                         rec.qmv(
@@ -1561,8 +1561,8 @@ impl XingExec {
                         rec.barrier();
                         rec.moe_group(&gp.top_ids, &gp.moe_list, batch * n_used, n_exp, batch);
                         rec.barrier();
-                        rec.qmm_grouped(vg.ty, wg_buf, 0, vg.slice_bytes, &gp.normed, 0, ne as u32, n_used, bg, 0, vg.k, vg.m, n_exp, Some(&gp.moe_list), batch);
-                        rec.qmm_grouped(vu.ty, wu_buf, 0, vu.slice_bytes, &gp.normed, 0, ne as u32, n_used, bu, 0, vu.k, vu.m, n_exp, Some(&gp.moe_list), batch);
+                        rec.qmm_grouped(vg.ty, wg_buf, 0, vg.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bg, 0, vg.k, vg.m, n_exp, Some(&gp.moe_list), batch);
+                        rec.qmm_grouped(vu.ty, wu_buf, 0, vu.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bu, 0, vu.k, vu.m, n_exp, Some(&gp.moe_list), batch);
                     } else {
                         for t in 0..bs {
                             let slot_base = (t * c.n_used) as u32;
@@ -1575,7 +1575,7 @@ impl XingExec {
                     rec.swiglu(bg, 0, bu, 0, ba, 0, batch * n_used * c.n_ff_exp as u32);
                     rec.barrier();
                     if grouped {
-                        rec.qmm_grouped(vd.ty, wd_buf, 0, vd.slice_bytes, ba, 0, c.n_ff_exp as u32, 1, &gp.moe_tmp, 0, vd.k, vd.m, n_exp, Some(&gp.moe_list), batch);
+                        rec.qmm_grouped(vd.ty, wd_buf, 0, vd.slice_bytes, ba, 0, c.n_ff_exp as u32, 1, batch * n_used, &gp.moe_tmp, 0, vd.k, vd.m, n_exp, Some(&gp.moe_list), batch);
                     } else {
                         for t in 0..bs {
                             let slot_base = (t * c.n_used) as u32;
