@@ -159,6 +159,8 @@ cargo test --release --workspace
 - [x] **M6**: Native `Qwen3.5`/`RVN` NextN MTP draft head (`MtpDrafter` with prompt KV warmup + GPU argmax), native `Qwen3-ASR-1.7B` audio frontend (`qwen3a` + `qwen3vl` on Vulkan), `ocak bench`, `O(n log n)` BPE/SPM tokenizer, and GitHub Actions CI.
 - [ ] **Future**: Native vision (`Qwen3-VL` `mmproj` image input).
 
+Performance work log (methodology, what helped, and what was tried and rejected): [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
 ---
 
 ## License
