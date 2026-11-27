@@ -19,8 +19,9 @@ pub const IQ1S_GRID: [u64; 2048] = [0xffffffffffffffff, 0xffffffffffffff01, 0xff
 /// - [1936..2448): IQ2XXS_GRID as (lo, hi) u32 pairs
 /// - [2448..4496): IQ2S_GRID as (lo, hi) u32 pairs
 /// - [4496..8592): IQ1S_GRID as (lo, hi) u32 pairs
+/// - [8592..12688): IQ1S_GRID with each byte g mapped to 8 * (g + 1) (int8 decoders)
 pub fn packed_gpu_table() -> Vec<u32> {
-    let mut v = Vec::with_capacity(8592);
+    let mut v = Vec::with_capacity(12688);
     for &g in &IQ2XS_GRID { v.push(g as u32); v.push((g >> 32) as u32); }
     v.extend_from_slice(&IQ3XXS_GRID);
     v.extend_from_slice(&IQ3S_GRID);
@@ -29,5 +30,16 @@ pub fn packed_gpu_table() -> Vec<u32> {
     for &g in &IQ2XXS_GRID { v.push(g as u32); v.push((g >> 32) as u32); }
     for &g in &IQ2S_GRID { v.push(g as u32); v.push((g >> 32) as u32); }
     for &g in &IQ1S_GRID { v.push(g as u32); v.push((g >> 32) as u32); }
+    // [8592..12688): IQ1S_GRID transformed for the int8 decoders: each byte g in {-1, 0, 1}
+    // becomes 8 * (g + 1) in {0, 8, 16}, so 8 g +- 1 is one borrow-free per-byte subtraction.
+    for &g in &IQ1S_GRID {
+        let mut t = 0u64;
+        for i in 0..8 {
+            let b = ((g >> (8 * i)) & 0xFF) as u8 as i8 as i64;
+            t |= (((b + 1) * 8) as u64 & 0xFF) << (8 * i);
+        }
+        v.push(t as u32);
+        v.push((t >> 32) as u32);
+    }
     v
 }

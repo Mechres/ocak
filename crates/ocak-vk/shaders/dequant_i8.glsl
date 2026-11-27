@@ -233,15 +233,10 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
 #endif
     d = dl * 0.125;
     m = 0.0;
-    uint glo = TBL(4496u + 2u * gidx);
-    uint ghi = TBL(4496u + 2u * gidx + 1u);
-    // Grid bytes b are 0xFF / 0x00 / 0x01 (g = -1 / 0 / 1). Packed, borrow-free:
-    // g + 1 = 1 + (b & 1) - 2 ((b >> 1) & 1), then 8 g +- 1 = 8 (g + 1) - (7 or 9).
+    // Pre-transformed grid (bytes 8 (g + 1), g in {-1, 0, 1}): 8 g +- 1 = 8 (g + 1) - (7 or 9).
     uint c = neg ? 0x09090909u : 0x07070707u;
-    uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
-    uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
-    q0 = sub_bytes(g1lo << 3, c);
-    q1 = sub_bytes(g1hi << 3, c);
+    q0 = sub_bytes(TBL(8592u + 2u * gidx), c);
+    q1 = sub_bytes(TBL(8592u + 2u * gidx + 1u), c);
 #elif defined(NVFP4)
     // 36-byte blocks of 64: 4 UE4M3 scales (one per 16) + E2M1 nibbles. E2M1 magnitudes are
     // {0, .5, 1, 1.5, 2, 3, 4, 6}: exact as integers {0, 1, 2, 3, 4, 6, 8, 12} with d = scale / 2.
@@ -361,11 +356,9 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     uint c = ((qhb & 0x8000u) != 0u) ? 0x09090909u : 0x07070707u;
     for (uint l = 0u; l < 4u; l++) {
         uint gidx = byte_of(qs, l) | (((qhb >> (3u * l)) & 7u) << 8);
-        uint glo = TBL(4496u + 2u * gidx), ghi = TBL(4496u + 2u * gidx + 1u);
-        uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
-        uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
-        q[2u * l] = sub_bytes(g1lo << 3, c);
-        q[2u * l + 1u] = sub_bytes(g1hi << 3, c);
+        // Pre-transformed grid: bytes 8 (g + 1); 8 g +- 1 = 8 (g + 1) - (7 or 9).
+        q[2u * l] = sub_bytes(TBL(8592u + 2u * gidx), c);
+        q[2u * l + 1u] = sub_bytes(TBL(8592u + 2u * gidx + 1u), c);
     }
     dm = vec4(d, d, 0.0, 0.0);
 #elif defined(IQ1_M)
@@ -385,11 +378,9 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
         uint gidx = byte_of(qs, l) | hi;
         bool neg = (qb & ((l & 1u) == 0u ? 0x08u : 0x80u)) != 0u;
         uint c = neg ? 0x09090909u : 0x07070707u;
-        uint glo = TBL(4496u + 2u * gidx), ghi = TBL(4496u + 2u * gidx + 1u);
-        uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
-        uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
-        q[2u * l] = sub_bytes(g1lo << 3, c);
-        q[2u * l + 1u] = sub_bytes(g1hi << 3, c);
+        // Pre-transformed grid: bytes 8 (g + 1); 8 g +- 1 = 8 (g + 1) - (7 or 9).
+        q[2u * l] = sub_bytes(TBL(8592u + 2u * gidx), c);
+        q[2u * l + 1u] = sub_bytes(TBL(8592u + 2u * gidx + 1u), c);
     }
     dm = vec4(dsup * float(2u * ((s16 >> ssh) & 7u) + 1u), dsup * float(2u * ((s16 >> (ssh + 3u)) & 7u) + 1u), 0.0, 0.0) * 0.125;
 #elif defined(IQ4_XS)

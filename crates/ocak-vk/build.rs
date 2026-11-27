@@ -183,7 +183,15 @@ fn main() {
         let dst = out_dir.join(format!("{name}.spv"));
         let status = if has_glslc || has_usr_glslc {
             let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
-            Command::new(bin).args(["--target-env=vulkan1.3", "-O"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc")
+            let st = Command::new(bin).args(["--target-env=vulkan1.3", "-O"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc");
+            if st.success() {
+                st
+            } else {
+                // Older spirv-opt builds reject newer capabilities (e.g. the VALVE mixed-float dot
+                // in the *_f2 attention variants): fall back to an unoptimized module.
+                println!("cargo:warning=glslc -O failed on {name}; retrying without optimization");
+                Command::new(bin).args(["--target-env=vulkan1.3"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc")
+            }
         } else {
             Command::new("glslangValidator").args(["-V", "--target-env", "vulkan1.3"]).args(defs).arg("-o").arg(&dst).arg(src).status().expect("failed to invoke glslangValidator")
         };

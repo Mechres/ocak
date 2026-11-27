@@ -83,6 +83,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | MoE chunk size (Inkling VRAM-sized, Xing 1024) + 64-col grouped tiles | Inkling prefill ~2-3x on long prompts |
 | int8 decode matvec + block-level unpack | Qwen3.8 IQ2_S decode 15 -> 35 tok/s |
 | IQ1 grid in shared memory | IQ1_S matvec 258 -> 121 us |
+| IQ1 grid pre-transformed to 8 (g + 1) per byte (new 4096-word table at [8592, 12688)), so the unpack is one `sub_bytes` per word instead of the borrow-free g + 1 formula; that table in shared memory (the block decoder had been reading the global copy) | IQ1_S matvec 75.6 -> 56.5 us (225 -> 308 GB/s); batch 2 68 us |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -97,8 +98,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
-IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 225, Q2_K 351, Q3_K 246, Q4_K 336, Q6_K 368,
-Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; IQ1_S and Q3_K lag.
+IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 308, Q2_K 351, Q3_K 246, Q4_K 336, Q6_K 368,
+Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; Q3_K lags.
 
 ## Tried and rejected (do not repeat without a new idea)
 
@@ -128,12 +129,13 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | Fixed 3 MTP drafts per step | slower than 2 (Q2_K 41.0 vs 44.7) | third-draft acceptance too low for its drafter pass + verify row |
 | Fixed 2 drafts on low-acceptance text | IQ2_S story 46.7 vs 47.7 with 1 draft | replaced by the adaptive choice |
 | Decode Q3_K strided decoder (lane = 8 byte columns -> 8 weights of each of the 4 sub-blocks; each qs / hmask byte loaded once) | slower (155 -> 205 us at 5120x17408) | activation loads quadruple (4 segments x (uvec2 + scale)) and the per-lane scale decode diverges; the block decoder's redundant weight loads hit cache |
+| IQ1 decode with 32 rows per workgroup (amortize the 16 KB table copy) | no change (60 us either way) | the copy is not the bottleneck |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
 ## Open ideas (not tried yet)
 
-- Decode: IQ1_S and Q3_K block decoders reach only ~225-246 GB/s (others 320-370).
+- Decode: the Q3_K block decoder reaches only ~246 GB/s (others 300-370).
 - MTP: drafting the second token without the extra drafter round trip (embedding lookup on the GPU).
 - Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
   input).

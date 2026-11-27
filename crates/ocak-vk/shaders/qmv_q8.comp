@@ -18,8 +18,8 @@
 // workgroup to amortize the copy, instead of competing with the weight stream in the L0 cache.
 // [TBL_LO, TBL_HI): the table words the format reads (see ocak_gguf::iq_tables layout).
 #if defined(IQ1_S) || defined(IQ1_M)
-#define TBL_LO 4496u
-#define TBL_HI 8592u
+#define TBL_LO 8592u    // transformed IQ1 grid (the block decoders read only this one)
+#define TBL_HI 12688u
 #elif defined(IQ2_XS)
 #define TBL_LO 0u
 #define TBL_HI 1920u
@@ -39,7 +39,7 @@
 #define TBL_LO 1920u
 #define TBL_HI 1936u
 #endif
-#ifdef TBL_LO
+#if defined(TBL_LO)
 #define RPW 16u
 #define TBL(i) stab[(i) - TBL_LO]
 #else
