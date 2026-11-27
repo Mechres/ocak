@@ -1,4 +1,7 @@
 #version 460
+// Causal depthwise conv + SiLU over `batch` tokens. One thread per channel; the d_conv-tap
+// history lives in registers across the token loop (written back once at the end).
+#define MAXD 8u
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer W { float cw[]; };
@@ -11,17 +14,17 @@ void main() {
     uint d_conv = pc.k_conv - 1u;
     uint sb = ch * d_conv;
     uint wb = ch * pc.k_conv;
+    float h[MAXD];
+    float w[MAXD + 1u];
+    for (uint t = 0u; t < MAXD; t++) h[t] = (t < d_conv) ? st[sb + t] : 0.0;
+    for (uint t = 0u; t <= MAXD; t++) w[t] = (t <= d_conv) ? cw[wb + t] : 0.0;
     for (uint ti = 0u; ti < pc.batch; ti++) {
         float xv = x[ti * pc.channels + ch];
-        float acc = 0.0;
-        for (uint t = 0u; t < d_conv; t++) {
-            acc += st[sb + t] * cw[wb + t];
-        }
-        acc += xv * cw[wb + d_conv];
-        for (uint t = 0u; t + 1u < d_conv; t++) {
-            st[sb + t] = st[sb + t + 1u];
-        }
-        st[sb + d_conv - 1u] = xv;
+        float acc = xv * w[d_conv];
+        for (uint t = 0u; t < MAXD; t++) if (t < d_conv) acc += h[t] * w[t];
+        for (uint t = 0u; t + 1u < MAXD; t++) if (t + 1u < d_conv) h[t] = h[t + 1u];
+        for (uint t = 0u; t < MAXD; t++) if (t == d_conv - 1u) h[t] = xv;
         o[ti * pc.channels + ch] = acc / (1.0 + exp(-acc));
     }
+    for (uint t = 0u; t < MAXD; t++) if (t < d_conv) st[sb + t] = h[t];
 }

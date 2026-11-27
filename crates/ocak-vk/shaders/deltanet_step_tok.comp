@@ -1,0 +1,93 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Gated DeltaNet recurrence over `batch` tokens, small-batch variant (decode / MTP verify; the
+// prefill kernel is deltanet_step.comp).
+// Each 32-lane cluster owns one state row (head h, value index j) and keeps it in registers
+// (lane holds elements i = lane + 32 * r). All dot products are cluster reductions, so a token
+// step needs no shared memory and no workgroup barriers. 8 rows per 256-thread workgroup.
+// Requires head_dim <= 128.
+#define RPW 8u
+#define MAXR 4u
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 1) readonly buffer AB { float alpha[]; };
+layout(set = 0, binding = 2) readonly buffer BT { float beta[]; };
+layout(set = 0, binding = 3) readonly buffer DT { float dt_bias[]; };
+layout(set = 0, binding = 4) readonly buffer SA { float ssm_a[]; };
+layout(set = 0, binding = 5) buffer ST { float st[]; };
+layout(set = 0, binding = 6) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint head_dim;
+    float eps;
+    uint batch;
+} pc;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x & 31u;
+    uint row = gl_WorkGroupID.x * RPW + (gl_LocalInvocationID.x >> 5);
+    uint hd = pc.head_dim;
+    uint h = row / hd;
+    uint j = row % hd;
+    // Whole clusters exit together, so the clustered reductions below stay uniform.
+    if (h >= pc.n_v_heads) return;
+    uint kh = h % pc.n_k_heads;
+    uint k_total = pc.n_k_heads * hd;
+    uint v_total = pc.n_v_heads * hd;
+    uint conv_ch = 2u * k_total + v_total;
+
+    uint s_base = (h * hd + j) * hd;
+    float s[MAXR];
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        s[r] = (i < hd) ? st[s_base + i] : 0.0;
+    }
+    float dt_b = dt_bias[h];
+    float sa_h = ssm_a[h];
+    float inv_sqrt_hd = inversesqrt(float(hd));
+
+    for (uint t = 0u; t < pc.batch; t++) {
+        uint qo = t * conv_ch + kh * hd;
+        uint ko = qo + k_total;
+        float q[MAXR];
+        float k[MAXR];
+        float qq = 0.0, kk = 0.0;
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            q[r] = (i < hd) ? qkv[qo + i] : 0.0;
+            k[r] = (i < hd) ? qkv[ko + i] : 0.0;
+            qq += q[r] * q[r];
+            kk += k[r] * k[r];
+        }
+        qq = subgroupClusteredAdd(qq, 32u);
+        kk = subgroupClusteredAdd(kk, 32u);
+        float qs = inversesqrt(qq + pc.eps) * inv_sqrt_hd;
+        float ks = inversesqrt(kk + pc.eps);
+
+        float ab = alpha[t * pc.n_v_heads + h] + dt_b;
+        float sp = (ab > 20.0) ? ab : log(1.0 + exp(ab));
+        float g = exp(sp * sa_h);
+        float b = 1.0 / (1.0 + exp(-beta[t * pc.n_v_heads + h]));
+
+        float sk = 0.0;
+        for (uint r = 0u; r < MAXR; r++) {
+            s[r] *= g;
+            sk += s[r] * k[r];
+        }
+        sk = subgroupClusteredAdd(sk, 32u) * ks;
+        float vj = qkv[t * conv_ch + 2u * k_total + h * hd + j];
+        float dj = (vj - sk) * b;
+        float sq = 0.0;
+        for (uint r = 0u; r < MAXR; r++) {
+            s[r] += k[r] * ks * dj;
+            sq += s[r] * q[r];
+        }
+        sq = subgroupClusteredAdd(sq, 32u) * qs;
+        if (lane == 0u) o[t * v_total + h * hd + j] = sq;
+    }
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        if (i < hd) st[s_base + i] = s[r];
+    }
+}

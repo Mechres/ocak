@@ -140,6 +140,7 @@ struct Pipelines {
     shortconv_step: PipelineBundle,
     ssm_conv_silu: PipelineBundle,
     deltanet_step: PipelineBundle,
+    deltanet_step_tok: PipelineBundle,
     gated_rms_norm: PipelineBundle,
     split_qg: PipelineBundle,
     mul_sigmoid: PipelineBundle,
@@ -302,7 +303,7 @@ impl Pipelines {
             &self.kv_write, &self.attention, &self.attention_split, &self.attention_merge, &self.embed,
             &self.qmv_f32, &self.qmv_f16, &self.qmv_bf16, &self.qmv_q8_0, &self.qmv_q4_0,
             &self.qmv_q4_k, &self.qmv_q5_k, &self.qmv_q6_k, &self.qmv_q2_k, &self.qmv_q3_k,
-            &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step,
+            &self.rms_norm_heads, &self.shortconv_step, &self.ssm_conv_silu, &self.deltanet_step, &self.deltanet_step_tok,
             &self.gated_rms_norm, &self.split_qg, &self.mul_sigmoid, &self.mul_head_sigmoid, &self.rope_ext,
             &self.qmv_iq2_xxs, &self.qmv_iq2_xs, &self.qmv_iq2_s, &self.qmv_iq3_xxs, &self.qmv_iq3_s,
             &self.qmv_iq1_s, &self.qmv_iq1_m, &self.qmv_iq4_nl, &self.qmv_iq4_xs, &self.qmv_nvfp4,
@@ -607,6 +608,7 @@ impl VkContext {
                 shortconv_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_step.spv")), "shortconv_step", 4, 12)?,
                 ssm_conv_silu: bp(include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), "ssm_conv_silu", 4, 12)?,
                 deltanet_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step.spv")), "deltanet_step", 7, 20)?,
+                deltanet_step_tok: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step_tok.spv")), "deltanet_step_tok", 7, 20)?,
                 gated_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), "gated_rms_norm", 4, 12)?,
                 split_qg: bp(include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), "split_qg", 3, 8)?,
                 mul_sigmoid: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), "mul_sigmoid", 2, 4)?,
@@ -2084,6 +2086,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn shortconv_step_batch(&mut self, bcx: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, n_embd: u32, l_cache: u32, batch: u32) {
+        assert!((2..=9).contains(&l_cache), "conv kernels keep at most 8 history taps (l_cache = {l_cache})");
         let pc = [n_embd, l_cache, batch];
         self.dispatch_raw(&self.ctx.pipelines.shortconv_step, &[bcx.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), n_embd.div_ceil(256), 1, 1);
     }
@@ -2093,6 +2096,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn ssm_conv_silu_batch(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32, batch: u32) {
+        assert!((2..=9).contains(&k_conv), "conv kernels keep at most 8 history taps (k_conv = {k_conv})");
         let pc = [channels, k_conv, batch];
         self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), channels.div_ceil(256), 1, 1);
     }
@@ -2105,8 +2109,14 @@ impl<'a> Recorder<'a> {
     pub fn deltanet_step_batch(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32, batch: u32) {
         assert!(head_dim <= 128, "deltanet_step supports head_dim <= 128 (got {head_dim})");
         let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits(), batch];
-        // 8 state rows (32-lane clusters) per 256-thread workgroup.
-        self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &[qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(8), 1, 1);
+        let bufs = [qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf];
+        if batch < 16 || !head_dim.is_multiple_of(32) {
+            // Decode / MTP verify: 8 rows (32-lane clusters) per workgroup, no token staging.
+            self.dispatch_raw(&self.ctx.pipelines.deltanet_step_tok, &bufs, bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(8), 1, 1);
+            return;
+        }
+        // 32 state rows (8-lane clusters) per 256-thread workgroup.
+        self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &bufs, bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(32), 1, 1);
     }
 
     pub fn gated_rms_norm(&mut self, x: &Buffer, w: &Buffer, z: &Buffer, out: &Buffer, n_heads: u32, head_dim: u32, eps: f32) {
@@ -2404,6 +2414,89 @@ mod tests {
         let mut o_gpu = vec![0f32; nvh * hd];
         c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
         for i in 0..o_cpu.len() { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-3, "deltanet[{i}]: cpu={} gpu={}", o_cpu[i], o_gpu[i]); }
+    }
+
+    #[test]
+    fn vk_recurrent_batch_matches_cpu() {
+        // Multi-token (prefill) paths of the short convs and DeltaNet vs the CPU per-token ops,
+        // with a chunk length that is not a multiple of the kernels' 16-token staging.
+        let c = ctx();
+        let mut rng = Lcg(9191);
+        let nt = 37usize;
+        let up = |v: &[f32]| {
+            let b = c.create_device_buffer((v.len() * 4) as u64).unwrap();
+            c.upload(&b, 0, bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        // ShortConv
+        let (ne, lc) = (300usize, 3usize);
+        let bcx: Vec<f32> = (0..nt * 3 * ne).map(|_| rng.f()).collect();
+        let cw: Vec<f32> = (0..ne * lc).map(|_| rng.f()).collect();
+        let st0: Vec<f32> = (0..ne * (lc - 1)).map(|_| rng.f()).collect();
+        let mut st = st0.clone();
+        let mut o_cpu = vec![0f32; nt * ne];
+        for t in 0..nt {
+            ocak_cpu::ops::shortconv_step(&bcx[t * 3 * ne..(t + 1) * 3 * ne], &cw, &mut st, &mut o_cpu[t * ne..(t + 1) * ne], ne, lc);
+        }
+        let (b_bcx, b_cw, b_st) = (up(&bcx), up(&cw), up(&st0));
+        let b_o = c.create_device_buffer((nt * ne * 4) as u64).unwrap();
+        let mut rec = c.begin();
+        rec.shortconv_step_batch(&b_bcx, &b_cw, &b_st, &b_o, ne as u32, lc as u32, nt as u32);
+        rec.finish_and_wait().unwrap();
+        let mut o_gpu = vec![0f32; nt * ne];
+        c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..o_cpu.len() { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-4, "shortconv batch[{i}]"); }
+        let mut st_gpu = vec![0f32; st.len()];
+        c.download(&b_st, 0, bytemuck::cast_slice_mut(&mut st_gpu)).unwrap();
+        assert_eq!(st, st_gpu, "shortconv state");
+
+        // Depthwise conv + SiLU
+        let (ch, kc) = (300usize, 4usize);
+        let x: Vec<f32> = (0..nt * ch).map(|_| rng.f()).collect();
+        let cw: Vec<f32> = (0..ch * kc).map(|_| rng.f()).collect();
+        let st0: Vec<f32> = (0..ch * (kc - 1)).map(|_| rng.f()).collect();
+        let mut st = st0.clone();
+        let mut o_cpu = vec![0f32; nt * ch];
+        for t in 0..nt {
+            ocak_cpu::ops::ssm_conv_silu(&x[t * ch..(t + 1) * ch], &cw, &mut st, &mut o_cpu[t * ch..(t + 1) * ch], ch, kc);
+        }
+        let (b_x, b_cw, b_st) = (up(&x), up(&cw), up(&st0));
+        let b_o = c.create_device_buffer((nt * ch * 4) as u64).unwrap();
+        let mut rec = c.begin();
+        rec.ssm_conv_silu_batch(&b_x, &b_cw, &b_st, &b_o, ch as u32, kc as u32, nt as u32);
+        rec.finish_and_wait().unwrap();
+        let mut o_gpu = vec![0f32; nt * ch];
+        c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..o_cpu.len() { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-4, "ssm_conv batch[{i}]"); }
+
+        // Gated DeltaNet
+        let (nkh, nvh, hd) = (2usize, 4usize, 128usize);
+        let cc = (2 * nkh + nvh) * hd;
+        let qkv: Vec<f32> = (0..nt * cc).map(|_| rng.f()).collect();
+        let alpha: Vec<f32> = (0..nt * nvh).map(|_| rng.f()).collect();
+        let beta: Vec<f32> = (0..nt * nvh).map(|_| rng.f()).collect();
+        let dt_bias: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let ssm_a: Vec<f32> = (0..nvh).map(|_| -rng.f().abs()).collect();
+        let st0: Vec<f32> = (0..nvh * hd * hd).map(|_| rng.f() * 0.1).collect();
+        let mut st = st0.clone();
+        let mut o_cpu = vec![0f32; nt * nvh * hd];
+        for t in 0..nt {
+            ocak_cpu::ops::deltanet_step(
+                &qkv[t * cc..(t + 1) * cc], &alpha[t * nvh..(t + 1) * nvh], &beta[t * nvh..(t + 1) * nvh], &dt_bias, &ssm_a,
+                &mut st, &mut o_cpu[t * nvh * hd..(t + 1) * nvh * hd], nkh, nvh, hd, 1e-6,
+            );
+        }
+        let (b_qkv, b_al, b_bt, b_dt, b_sa, b_st) = (up(&qkv), up(&alpha), up(&beta), up(&dt_bias), up(&ssm_a), up(&st0));
+        let b_o = c.create_device_buffer((nt * nvh * hd * 4) as u64).unwrap();
+        let mut rec = c.begin();
+        rec.deltanet_step_batch(&b_qkv, &b_al, &b_bt, &b_dt, &b_sa, &b_st, &b_o, nkh as u32, nvh as u32, hd as u32, 1e-6, nt as u32);
+        rec.finish_and_wait().unwrap();
+        let mut o_gpu = vec![0f32; o_cpu.len()];
+        c.download(&b_o, 0, bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..o_cpu.len() { assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-3, "deltanet batch[{i}]: cpu={} gpu={}", o_cpu[i], o_gpu[i]); }
+        let mut st_gpu = vec![0f32; st.len()];
+        c.download(&b_st, 0, bytemuck::cast_slice_mut(&mut st_gpu)).unwrap();
+        for i in 0..st.len() { assert!((st[i] - st_gpu[i]).abs() < 1e-3, "deltanet state[{i}]"); }
     }
 
     #[test]

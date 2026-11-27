@@ -1,12 +1,18 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
 // Gated DeltaNet recurrence over `batch` tokens.
-// Each 32-lane cluster owns one state row (head h, value index j) and keeps it in registers
-// (lane holds elements i = lane + 32 * r). All dot products are cluster reductions, so a token
-// step needs no shared memory and no workgroup barriers. 8 rows per 256-thread workgroup.
-// Requires head_dim <= 128.
-#define RPW 8u
-#define MAXR 4u
+// Each 8-lane cluster owns one state row (head h, value index j) and keeps it in registers
+// (lane holds elements i = lane + 8 * r). A workgroup's 32 rows belong to the same head, so per
+// chunk of TC tokens the workgroup stages q, k, the 8 rows' v values and the per-token scalars
+// (q/k norms, k.q, gate g, beta b) in shared memory once; the token step then needs only two
+// independent cluster reductions, both on the state from before the update:
+//   s1 = g s0;  sk = s1 . kn = g (s0 . kn);  dj = (v_j - sk) b;  s2 = s1 + kn dj
+//   out = s2 . qn = g (s0 . qn) + dj (kn . qn)            (kn, qn: normalized k, q)
+// Requires head_dim <= 128 and head_dim % 32 == 0.
+#define RPW 32u
+#define CL 8u
+#define MAXR 16u
+#define TC 16u
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
 layout(set = 0, binding = 1) readonly buffer AB { float alpha[]; };
@@ -23,14 +29,22 @@ layout(push_constant) uniform PC {
     uint batch;
 } pc;
 
+shared float sq[TC * 128u];
+shared float sk[TC * 128u];
+shared float sv[TC * RPW];
+shared vec4 sc[TC];   // (q scale, k scale, raw k.q, -)
+shared vec2 sgb[TC];  // (g, b)
+
 void main() {
-    uint lane = gl_LocalInvocationID.x & 31u;
-    uint row = gl_WorkGroupID.x * RPW + (gl_LocalInvocationID.x >> 5);
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 7u;
+    uint c = tid >> 3;
     uint hd = pc.head_dim;
-    uint h = row / hd;
-    uint j = row % hd;
-    // Whole clusters exit together, so the clustered reductions below stay uniform.
-    if (h >= pc.n_v_heads) return;
+    uint row0 = gl_WorkGroupID.x * RPW;
+    uint h = row0 / hd;              // same head for all 32 rows (hd % 32 == 0)
+    if (h >= pc.n_v_heads) return;   // whole workgroup exits together
+    uint j0 = row0 % hd;
+    uint j = j0 + c;
     uint kh = h % pc.n_k_heads;
     uint k_total = pc.n_k_heads * hd;
     uint v_total = pc.n_v_heads * hd;
@@ -39,54 +53,75 @@ void main() {
     uint s_base = (h * hd + j) * hd;
     float s[MAXR];
     for (uint r = 0u; r < MAXR; r++) {
-        uint i = lane + 32u * r;
+        uint i = lane + CL * r;
         s[r] = (i < hd) ? st[s_base + i] : 0.0;
     }
     float dt_b = dt_bias[h];
     float sa_h = ssm_a[h];
     float inv_sqrt_hd = inversesqrt(float(hd));
 
-    for (uint t = 0u; t < pc.batch; t++) {
-        uint qo = t * conv_ch + kh * hd;
-        uint ko = qo + k_total;
-        float q[MAXR];
-        float k[MAXR];
-        float qq = 0.0, kk = 0.0;
-        for (uint r = 0u; r < MAXR; r++) {
-            uint i = lane + 32u * r;
-            q[r] = (i < hd) ? qkv[qo + i] : 0.0;
-            k[r] = (i < hd) ? qkv[ko + i] : 0.0;
-            qq += q[r] * q[r];
-            kk += k[r] * k[r];
+    for (uint t0 = 0u; t0 < pc.batch; t0 += TC) {
+        uint nt = min(TC, pc.batch - t0);
+        for (uint idx = tid; idx < nt * hd; idx += 256u) {
+            uint tt = idx / hd;
+            uint i = idx % hd;
+            uint qo = (t0 + tt) * conv_ch + kh * hd + i;
+            sq[tt * 128u + i] = qkv[qo];
+            sk[tt * 128u + i] = qkv[qo + k_total];
         }
-        qq = subgroupClusteredAdd(qq, 32u);
-        kk = subgroupClusteredAdd(kk, 32u);
-        float qs = inversesqrt(qq + pc.eps) * inv_sqrt_hd;
-        float ks = inversesqrt(kk + pc.eps);
+        for (uint idx = tid; idx < nt * RPW; idx += 256u) {
+            uint tt = idx / RPW;
+            sv[idx] = qkv[(t0 + tt) * conv_ch + 2u * k_total + h * hd + j0 + idx % RPW];
+        }
+        if (tid < nt) {
+            uint t = t0 + tid;
+            float ab = alpha[t * pc.n_v_heads + h] + dt_b;
+            float sp = (ab > 20.0) ? ab : log(1.0 + exp(ab));
+            sgb[tid] = vec2(exp(sp * sa_h), 1.0 / (1.0 + exp(-beta[t * pc.n_v_heads + h])));
+        }
+        barrier();
+        // Per-token norms and k.q: cluster c handles tokens c, c + 32, ...
+        for (uint tt = c; tt < nt; tt += RPW) {
+            float qq = 0.0, kk = 0.0, kq = 0.0;
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + CL * r;
+                float qv = (i < hd) ? sq[tt * 128u + i] : 0.0;
+                float kv = (i < hd) ? sk[tt * 128u + i] : 0.0;
+                qq += qv * qv;
+                kk += kv * kv;
+                kq += kv * qv;
+            }
+            qq = subgroupClusteredAdd(qq, CL);
+            kk = subgroupClusteredAdd(kk, CL);
+            kq = subgroupClusteredAdd(kq, CL);
+            if (lane == 0u) sc[tt] = vec4(inversesqrt(qq + pc.eps) * inv_sqrt_hd, inversesqrt(kk + pc.eps), kq, 0.0);
+        }
+        barrier();
 
-        float ab = alpha[t * pc.n_v_heads + h] + dt_b;
-        float sp = (ab > 20.0) ? ab : log(1.0 + exp(ab));
-        float g = exp(sp * sa_h);
-        float b = 1.0 / (1.0 + exp(-beta[t * pc.n_v_heads + h]));
-
-        float sk = 0.0;
-        for (uint r = 0u; r < MAXR; r++) {
-            s[r] *= g;
-            sk += s[r] * k[r];
+        for (uint tt = 0u; tt < nt; tt++) {
+            float k[MAXR];
+            float sk0 = 0.0, sq0 = 0.0;
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + CL * r;
+                float qv = (i < hd) ? sq[tt * 128u + i] : 0.0;
+                k[r] = (i < hd) ? sk[tt * 128u + i] : 0.0;
+                sk0 += s[r] * k[r];
+                sq0 += s[r] * qv;
+            }
+            sk0 = subgroupClusteredAdd(sk0, CL);
+            sq0 = subgroupClusteredAdd(sq0, CL);
+            vec4 scl = sc[tt];
+            vec2 gb = sgb[tt];
+            float g = gb.x;
+            float dj = (sv[tt * RPW + c] - g * sk0 * scl.y) * gb.y;
+            float kd = scl.y * dj;
+            for (uint r = 0u; r < MAXR; r++) s[r] = g * s[r] + k[r] * kd;
+            if (lane == 0u) o[(t0 + tt) * v_total + h * hd + j] = (g * sq0 + dj * scl.z * scl.y) * scl.x;
         }
-        sk = subgroupClusteredAdd(sk, 32u) * ks;
-        float vj = qkv[t * conv_ch + 2u * k_total + h * hd + j];
-        float dj = (vj - sk) * b;
-        float sq = 0.0;
-        for (uint r = 0u; r < MAXR; r++) {
-            s[r] += k[r] * ks * dj;
-            sq += s[r] * q[r];
-        }
-        sq = subgroupClusteredAdd(sq, 32u) * qs;
-        if (lane == 0u) o[t * v_total + h * hd + j] = sq;
+        barrier();
     }
     for (uint r = 0u; r < MAXR; r++) {
-        uint i = lane + 32u * r;
+        uint i = lane + CL * r;
         if (i < hd) st[s_base + i] = s[r];
     }
 }

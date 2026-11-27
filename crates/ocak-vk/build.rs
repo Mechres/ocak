@@ -34,6 +34,7 @@ fn main() {
         "shortconv_step",
         "ssm_conv_silu",
         "deltanet_step",
+        "deltanet_step_tok",
         "gated_rms_norm",
         "split_qg",
         "mul_sigmoid",

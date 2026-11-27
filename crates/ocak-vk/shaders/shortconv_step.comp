@@ -1,4 +1,7 @@
 #version 460
+// LFM2-style gated short conv over `batch` tokens: o = c * conv(b * x). One thread per channel;
+// the d_conv-tap history lives in registers across the token loop (written back once at the end).
+#define MAXD 8u
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer BCX { float bcx[]; };
 layout(set = 0, binding = 1) readonly buffer W { float cw[]; };
@@ -11,21 +14,19 @@ void main() {
     uint d_conv = pc.l_cache - 1u;
     uint sb = e * d_conv;
     uint wb = e * pc.l_cache;
+    float h[MAXD];
+    float w[MAXD + 1u];
+    for (uint t = 0u; t < MAXD; t++) h[t] = (t < d_conv) ? st[sb + t] : 0.0;
+    for (uint t = 0u; t <= MAXD; t++) w[t] = (t <= d_conv) ? cw[wb + t] : 0.0;
     for (uint ti = 0u; ti < pc.batch; ti++) {
         uint bo = ti * 3u * pc.n_embd;
-        float b = bcx[bo + e];
+        float bx = bcx[bo + e] * bcx[bo + 2u * pc.n_embd + e];
         float c = bcx[bo + pc.n_embd + e];
-        float x = bcx[bo + 2u * pc.n_embd + e];
-        float bx = b * x;
-        float acc = 0.0;
-        for (uint t = 0u; t < d_conv; t++) {
-            acc += st[sb + t] * cw[wb + t];
-        }
-        acc += bx * cw[wb + d_conv];
-        for (uint t = 0u; t + 1u < d_conv; t++) {
-            st[sb + t] = st[sb + t + 1u];
-        }
-        st[sb + d_conv - 1u] = bx;
+        float acc = bx * w[d_conv];
+        for (uint t = 0u; t < MAXD; t++) if (t < d_conv) acc += h[t] * w[t];
+        for (uint t = 0u; t + 1u < MAXD; t++) if (t + 1u < d_conv) h[t] = h[t + 1u];
+        for (uint t = 0u; t < MAXD; t++) if (t == d_conv - 1u) h[t] = bx;
         o[ti * pc.n_embd + e] = c * acc;
     }
+    for (uint t = 0u; t < MAXD; t++) if (t < d_conv) st[sb + t] = h[t];
 }

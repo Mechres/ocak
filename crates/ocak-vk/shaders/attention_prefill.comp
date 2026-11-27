@@ -18,6 +18,10 @@
 #define HHD (uint(HDMAX) / 2u)   // packed f16x2 per row
 #define KPT (BK / 4u)      // keys per lane
 #define DPT (HHD / 4u)     // packed output dims per lane
+#define HS (HHD + 1u)      // padded shared row stride (rows land in different banks)
+#define KP2 (BK / 8u)      // keys per lane (8 lanes per row pair)
+#define DP2 (HHD / 8u)     // packed output dims per lane
+#define PS (BK + 1u)       // padded P row stride
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
 layout(set = 0, binding = 1) readonly buffer KV { uint kv[]; };
@@ -36,10 +40,10 @@ layout(push_constant) uniform PC {
     uint n_tok;
 } pc;
 
-shared uint qs[R * HHD];
-shared uint ks[BK * HHD];
-shared uint vs[BK * HHD];
-shared float ps[R * BK];
+shared uint qs[R * HS];
+shared uint ks[BK * HS];
+shared uint vs[BK * HS];
+shared float ps[R * PS];
 
 void main() {
     uint kvh = gl_WorkGroupID.x;
@@ -62,91 +66,147 @@ void main() {
             uint qb = pc.q_off + (tok * pc.n_heads + h) * pc.head_dim + 2u * e;
             v = vec2(q[qb], q[qb + 1u]) * scale;
         }
-        qs[r * HHD + e] = packHalf2x16(v);
+        qs[r * HS + e] = packHalf2x16(v);
     }
 
-    uint r = tid >> 2;
-    uint sub = tid & 3u;
-    uint tok_r = q0 + r / group;
-    bool row_valid = tok_r < pc.n_tok;
-    uint qpos = pc.pos0 + tok_r;
+    // Thread = (row pair rp, sub): rows 2 rp and 2 rp + 1; the 8 lanes of a row pair split the
+    // keys (scores, key = sub + 8 j) and the packed output dims (dim = sub + 8 j), so each K / V
+    // word read from shared memory serves two query rows.
+    uint rp = tid >> 3;
+    uint sub = tid & 7u;
+    uint ra = 2u * rp;
+    uint rb = ra + 1u;
+    uint tok_a = q0 + ra / group;
+    uint tok_b = q0 + rb / group;
+    bool valid_a = tok_a < pc.n_tok;
+    bool valid_b = tok_b < pc.n_tok;
+    uint qpos_a = pc.pos0 + tok_a;
+    uint qpos_b = pc.pos0 + tok_b;
     uint ntq = min(bq, pc.n_tok - q0);
     uint max_qpos = pc.pos0 + q0 + ntq - 1u;
     uint min_qpos = pc.pos0 + q0;
     uint t_lo = (pc.sliding_window > 0u && min_qpos + 1u > pc.sliding_window) ? (min_qpos + 1u - pc.sliding_window) : 0u;
     t_lo = (t_lo / BK) * BK;
 
-    float m = -1e30;
-    float l = 0.0;
-    vec2 acc[DPT];
-    for (uint j = 0u; j < DPT; j++) acc[j] = vec2(0.0);
+    float ma = -1e30, mb = -1e30;
+    float la = 0.0, lb = 0.0;
+    vec2 acca[DP2];
+    vec2 accb[DP2];
+    for (uint j = 0u; j < DP2; j++) { acca[j] = vec2(0.0); accb[j] = vec2(0.0); }
     barrier();
 
+    // K/V tile staging with a register prefetch of the next tile (loads in flight during compute).
+    #define LPT ((BK * HHD) / 256u)
+    uint pk[LPT];
+    uint pv[LPT];
+    for (uint u = 0u; u < LPT; u++) {
+        uint idx = tid + 256u * u;
+        uint kk = idx / hhd;
+        uint e = idx % hhd;
+        uint t = t_lo + kk;
+        pk[u] = 0u; pv[u] = 0u;
+        if (idx < BK * hhd && t <= max_qpos) {
+            uint kb = pc.layer_kv_off + ((pt[pc.pt_off + (t >> 4)] * 2u) * 16u + (t & 15u)) * half_kv_dim + kvh * hhd + e;
+            pk[u] = kv[kb];
+            pv[u] = kv[kb + 16u * half_kv_dim];
+        }
+    }
     for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
-        // Stage the K/V tile.
-        for (uint idx = tid; idx < BK * hhd; idx += 256u) {
-            uint kk = idx / hhd;
-            uint e = idx % hhd;
-            uint t = t0 + kk;
-            uint kval = 0u, vval = 0u;
-            if (t <= max_qpos) {
-                uint page = pt[pc.pt_off + (t >> 4)];
-                uint slot = t & 15u;
-                uint kb = pc.layer_kv_off + ((page * 2u) * 16u + slot) * half_kv_dim + kvh * hhd + e;
-                kval = kv[kb];
-                vval = kv[kb + 16u * half_kv_dim];
+        for (uint u = 0u; u < LPT; u++) {
+            uint idx = tid + 256u * u;
+            if (idx < BK * hhd) {
+                uint kk = idx / hhd;
+                uint e = idx % hhd;
+                ks[kk * HS + e] = pk[u];
+                vs[kk * HS + e] = pv[u];
             }
-            ks[kk * HHD + e] = kval;
-            vs[kk * HHD + e] = vval;
         }
         barrier();
+        uint t1 = t0 + BK;
+        if (t1 <= max_qpos) {
+            for (uint u = 0u; u < LPT; u++) {
+                uint idx = tid + 256u * u;
+                uint kk = idx / hhd;
+                uint e = idx % hhd;
+                uint t = t1 + kk;
+                pk[u] = 0u; pv[u] = 0u;
+                if (idx < BK * hhd && t <= max_qpos) {
+                    uint kb = pc.layer_kv_off + ((pt[pc.pt_off + (t >> 4)] * 2u) * 16u + (t & 15u)) * half_kv_dim + kvh * hhd + e;
+                    pk[u] = kv[kb];
+                    pv[u] = kv[kb + 16u * half_kv_dim];
+                }
+            }
+        }
 
-        // Scores for this row's KPT keys.
-        float s[KPT];
-        for (uint j = 0u; j < KPT; j++) s[j] = 0.0;
+        float sa[KP2];
+        float sb[KP2];
+        for (uint j = 0u; j < KP2; j++) { sa[j] = 0.0; sb[j] = 0.0; }
         for (uint e = 0u; e < hhd; e++) {
-            vec2 qv = unpackHalf2x16(qs[r * HHD + e]);
-            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HHD + e]));
+            vec2 qa = unpackHalf2x16(qs[ra * HS + e]);
+            vec2 qb = unpackHalf2x16(qs[rb * HS + e]);
+            for (uint j = 0u; j < KP2; j++) {
+                vec2 kv2 = unpackHalf2x16(ks[(sub + 8u * j) * HS + e]);
+                sa[j] += dot(qa, kv2);
+                sb[j] += dot(qb, kv2);
+            }
         }
-        float tmax = -1e30;
-        for (uint j = 0u; j < KPT; j++) {
-            uint t = t0 + sub * KPT + j;
-            bool ok = row_valid && t <= qpos && (pc.sliding_window == 0u || qpos - t < pc.sliding_window);
-            s[j] = ok ? s[j] : -3.0e38;
-            tmax = max(tmax, s[j]);
+        float tma = -1e30, tmb = -1e30;
+        for (uint j = 0u; j < KP2; j++) {
+            uint t = t0 + sub + 8u * j;
+            bool oka = valid_a && t <= qpos_a && (pc.sliding_window == 0u || qpos_a - t < pc.sliding_window);
+            bool okb = valid_b && t <= qpos_b && (pc.sliding_window == 0u || qpos_b - t < pc.sliding_window);
+            sa[j] = oka ? sa[j] : -3.0e38;
+            sb[j] = okb ? sb[j] : -3.0e38;
+            tma = max(tma, sa[j]);
+            tmb = max(tmb, sb[j]);
         }
-        tmax = subgroupClusteredMax(tmax, 4u);
-        float m_new = max(m, tmax);
-        float alpha = exp(m - m_new);
-        float psum = 0.0;
-        for (uint j = 0u; j < KPT; j++) {
-            float p = (s[j] > -1.0e38) ? exp(s[j] - m_new) : 0.0;
-            ps[r * BK + sub * KPT + j] = p;
-            psum += p;
+        tma = subgroupClusteredMax(tma, 8u);
+        tmb = subgroupClusteredMax(tmb, 8u);
+        float mna = max(ma, tma), mnb = max(mb, tmb);
+        float ala = exp(ma - mna), alb = exp(mb - mnb);
+        float psa = 0.0, psb = 0.0;
+        for (uint j = 0u; j < KP2; j++) {
+            float pa = (sa[j] > -1.0e38) ? exp(sa[j] - mna) : 0.0;
+            float pb = (sb[j] > -1.0e38) ? exp(sb[j] - mnb) : 0.0;
+            ps[ra * PS + sub + 8u * j] = pa;
+            ps[rb * PS + sub + 8u * j] = pb;
+            psa += pa;
+            psb += pb;
         }
-        psum = subgroupClusteredAdd(psum, 4u);
-        l = l * alpha + psum;
-        m = m_new;
-        for (uint j = 0u; j < DPT; j++) acc[j] *= alpha;
+        psa = subgroupClusteredAdd(psa, 8u);
+        psb = subgroupClusteredAdd(psb, 8u);
+        la = la * ala + psa;
+        lb = lb * alb + psb;
+        ma = mna;
+        mb = mnb;
+        for (uint j = 0u; j < DP2; j++) { acca[j] *= ala; accb[j] *= alb; }
         barrier();
 
-        // O += P V over this row's DPT packed dims.
         for (uint kk = 0u; kk < BK; kk++) {
-            float p = ps[r * BK + kk];
-            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HHD + sub * DPT + j]);
+            float pa = ps[ra * PS + kk];
+            float pb = ps[rb * PS + kk];
+            for (uint j = 0u; j < DP2; j++) {
+                vec2 v = unpackHalf2x16(vs[kk * HS + sub + 8u * j]);
+                acca[j] += pa * v;
+                accb[j] += pb * v;
+            }
         }
         barrier();
     }
 
-    if (row_valid) {
+    for (uint w = 0u; w < 2u; w++) {
+        uint r = ra + w;
+        uint tok_r = (w == 0u) ? tok_a : tok_b;
+        if (tok_r >= pc.n_tok) continue;
         uint h = kvh * group + r % group;
-        float inv = 1.0 / l;
+        float inv = 1.0 / ((w == 0u) ? la : lb);
         uint ob = pc.out_off + (tok_r * pc.n_heads + h) * pc.head_dim;
-        for (uint j = 0u; j < DPT; j++) {
-            uint d2 = sub * DPT + j;
+        for (uint j = 0u; j < DP2; j++) {
+            uint d2 = sub + 8u * j;
+            vec2 a = (w == 0u) ? acca[j] : accb[j];
             if (d2 < hhd) {
-                o[ob + 2u * d2] = acc[j].x * inv;
-                o[ob + 2u * d2 + 1u] = acc[j].y * inv;
+                o[ob + 2u * d2] = a.x * inv;
+                o[ob + 2u * d2 + 1u] = a.y * inv;
             }
         }
     }
