@@ -181,6 +181,9 @@ struct XingGpuState {
     kv_cache: Buffer,
     router_logits: Buffer,
     top_ids: Buffer,
+    /// Identity ids 0..n_head: the per-head absorbed projections (wk_b / wv_b) run as one indexed
+    /// matvec over the head slices instead of n_head dispatches each.
+    head_ids: Buffer,
     top_w: Buffer,
     dummy_bias: Buffer,
     out_norm: Buffer,
@@ -560,6 +563,7 @@ impl XingExec {
                 let pb = XING_PREFILL_BATCH;
                 let ones_v = vec![1.0f32; 4 * cfg.n_embd];
                 let zero_b = vec![0.0f32; cfg.n_expert];
+                let head_ids_v: Vec<f32> = (0..cfg.n_head as u32).map(f32::from_bits).collect();
                 if ok {
                     match (
                         upload_f32_buf(c, &ones_v), mk(pb * 4 * cfg.n_embd), mk(pb * 4 * cfg.n_embd), mk(pb * 4 * cfg.n_embd),
@@ -570,6 +574,7 @@ impl XingExec {
                         mk(pb * cfg.n_expert), mk(pb * cfg.n_used), mk(pb * cfg.n_used), upload_f32_buf(c, &zero_b),
                         upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(pb * cfg.n_used * cfg.n_embd),
                         mk(cfg.n_expert.max(1) * (pb + 1)),
+                        upload_f32_buf(c, &head_ids_v),
                     ) {
                         (
                             Some(ones), Some(streams_a), Some(streams_b), Some(streams_norm),
@@ -580,10 +585,11 @@ impl XingExec {
                             Some(router_logits), Some(top_ids), Some(top_w), Some(dummy_bias),
                             Some(out_norm_b), Some(hidden_buf), Some(logits_buf), Some(moe_tmp),
                             Some(moe_list),
+                            Some(head_ids),
                         ) => Some(XingGpuState {
                             layers: g_layers, ones, streams_a, streams_b, streams_norm, hc_mixes, hc_out,
                             inp, normed, block_out, q_a, q_an, kv_raw, q_full, q_lat, attn_lat, val_all,
-                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, moe_tmp, moe_list,
+                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, moe_tmp, moe_list, head_ids,
                         }),
                         _ => None,
                     }
@@ -848,9 +854,8 @@ impl Executor for XingExec {
                     pos as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale,
                 );
                 rec.barrier();
-                for h in 0..nh {
-                    rec.qmv(vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes, &gp.q_full, (h * c.key_dim) as u64, &gp.q_lat, (h * latent) as u64, vkb.k, vkb.m);
-                }
+                // All heads in one indexed matvec (slice h * slice_bytes, input stride key_dim).
+                rec.qmv_id_batch(vkb.ty, &vkb.buf, &gp.head_ids, 0, nh as u32, &gp.q_full, 0, c.key_dim as u32, &gp.q_lat, 0, vkb.k, vkb.m, vkb.slice_bytes);
                 rec.barrier();
                 rec.mla_attn(
                     &gp.q_lat, &gp.q_full, &gp.kv_cache, &gp.attn_lat,
@@ -858,9 +863,7 @@ impl Executor for XingExec {
                     pos as u32, kv_layer_off, kq_scale,
                 );
                 rec.barrier();
-                for h in 0..nh {
-                    rec.qmv(vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes, &gp.attn_lat, (h * latent) as u64, &gp.val_all, (h * vdim) as u64, vvb.k, vvb.m);
-                }
+                rec.qmv_id_batch(vvb.ty, &vvb.buf, &gp.head_ids, 0, nh as u32, &gp.attn_lat, 0, latent as u32, &gp.val_all, 0, vvb.k, vvb.m, vvb.slice_bytes);
                 rec.barrier();
                 rec.qmv(vwo.ty, &vwo.buf, 0, &gp.val_all, 0, &gp.block_out, 0, vwo.k, vwo.m);
                 rec.barrier();
