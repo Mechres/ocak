@@ -32,6 +32,9 @@ uint apply_signs4(uint g, uint bits) {
 uint neg_bytes(uint g, uint m) { return (g ^ m) + ((m >> 7) & 0x01010101u); }
 #define SIGNED2(lo, hi, si, qa, qb) qa = neg_bytes(lo, smask[2u * (si)]); qb = neg_bytes(hi, smask[2u * (si) + 1u]);
 #endif
+// 16 bits at an even byte offset with one aligned 32-bit load (single-byte loads are separate
+// memory instructions: merging adjacent scale bytes made Q3_K 30% faster).
+uint u16at(uint o) { return (w32[o >> 2] >> ((o & 2u) << 3)) & 0xFFFFu; }
 // Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
 uint sub_bytes(uint x, uint c) { return ((x | 0x80808080u) - c) ^ 0x80808080u; }
 
@@ -376,7 +379,7 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
 #elif defined(IQ1_S)
     uint b = rb + (blk >> 3) * 50u;
     uint qs = bytes4(b + 2u + ib * 4u);
-    uint qhb = uint(w[b + 34u + 2u * ib]) | (uint(w[b + 35u + 2u * ib]) << 8);
+    uint qhb = u16at(b + 34u + 2u * ib);
     float d = f16at(b) * float(2u * ((qhb >> 12) & 7u) + 1u) * 0.125;
     uint c = ((qhb & 0x8000u) != 0u) ? 0x09090909u : 0x07070707u;
     for (uint l = 0u; l < 4u; l++) {
@@ -389,14 +392,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
 #elif defined(IQ1_M)
     uint b = rb + (blk >> 3) * 56u;
     uint qs = bytes4(b + ib * 4u);
-    uint sc0 = uint(w[b + 48u]) | (uint(w[b + 49u]) << 8);
-    uint sc1 = uint(w[b + 50u]) | (uint(w[b + 51u]) << 8);
-    uint sc2 = uint(w[b + 52u]) | (uint(w[b + 53u]) << 8);
-    uint sc3 = uint(w[b + 54u]) | (uint(w[b + 55u]) << 8);
+    uint sca = w32[(b + 48u) >> 2], scb = w32[(b + 52u) >> 2];   // 56-byte superblocks: aligned
+    uint sc0 = sca & 0xFFFFu, sc1 = sca >> 16, sc2 = scb & 0xFFFFu, sc3 = scb >> 16;
     float dsup = unpackHalf2x16((sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u)).x;
     uint s16 = (ib < 2u) ? sc0 : ((ib < 4u) ? sc1 : ((ib < 6u) ? sc2 : sc3));
     uint ssh = 6u * (ib & 1u);
-    uint qb0 = uint(w[b + 32u + ib * 2u]), qb1 = uint(w[b + 33u + ib * 2u]);
+    uint qb01 = u16at(b + 32u + ib * 2u);
+    uint qb0 = qb01 & 0xFFu, qb1 = qb01 >> 8;
     for (uint l = 0u; l < 4u; l++) {
         uint qb = (l < 2u) ? qb0 : qb1;
         uint hi = (l & 1u) == 0u ? ((qb << 8) & 0x700u) : ((qb << 4) & 0x700u);
@@ -431,14 +433,17 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     uint b = rb + (blk >> 3) * 176u;
 #endif
     uint j = ib;
-    uint sb = b + 4u;
+    // The 12 scale bytes (b + 4 .. b + 15, aligned) as three words.
+    uint s0w = w32[(b >> 2) + 1u], s1w = w32[(b >> 2) + 2u], s2w = w32[(b >> 2) + 3u];
+    uint bsh = (j & 3u) << 3;
+    uint b0 = (s0w >> bsh) & 0xFFu, b1 = (s1w >> bsh) & 0xFFu, b2 = (s2w >> bsh) & 0xFFu;
     uint sc, mn;
     if (j < 4u) {
-        sc = uint(w[sb + j]) & 63u;
-        mn = uint(w[sb + j + 4u]) & 63u;
+        sc = b0 & 63u;
+        mn = b1 & 63u;
     } else {
-        sc = (uint(w[sb + j + 4u]) & 0xFu) | ((uint(w[sb + j - 4u]) >> 6) << 4);
-        mn = (uint(w[sb + j + 4u]) >> 4) | ((uint(w[sb + j]) >> 6) << 4);
+        sc = (b2 & 0xFu) | ((b0 >> 6) << 4);
+        mn = (b2 >> 4) | ((b1 >> 6) << 4);
     }
     uint dd = w32[b >> 2];
     float d = unpackHalf2x16(dd).x * float(sc);
@@ -462,18 +467,25 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     uint qho = b + 128u + half_ * 32u;
     uint sl = (g >> 1) * 4u;
     uint sh = g * 2u;
+    // 210-byte superblocks sit at offset 0 or 2 mod 4 (qlo / qho share it): decode aligned words
+    // (per-byte ops), then realign each result once.
+    uint ash = (b & 3u) << 3;
+    uint la = qlo >> 2, ha = qho >> 2;
+    uint prev = ((w32[la] >> sl) & 0x0F0F0F0Fu) | (((w32[ha] >> sh) & 0x03030303u) << 4);
     for (uint wv = 0u; wv < 8u; wv++) {
-        uint u = ((bytes4(qlo + 4u * wv) >> sl) & 0x0F0F0F0Fu) | (((bytes4(qho + 4u * wv) >> sh) & 0x03030303u) << 4);
-        q[wv] = sub_bytes(u, 0x20202020u);
+        uint next = ((w32[la + wv + 1u] >> sl) & 0x0F0F0F0Fu) | (((w32[ha + wv + 1u] >> sh) & 0x03030303u) << 4);
+        q[wv] = sub_bytes((prev >> ash) | ((next << 1) << (31u - ash)), 0x20202020u);
+        prev = next;
     }
     float d = f16at(b + 208u);
-    uint so = b + 192u + half_ * 8u + 2u * g;
-    dm = vec4(d * float(int8_t(w[so])), d * float(int8_t(w[so + 1u])), 0.0, 0.0);
+    uint s16 = u16at(b + 192u + half_ * 8u + 2u * g);
+    dm = vec4(d * float(int(s16 << 24) >> 24), d * float(int(s16 << 16) >> 24), 0.0, 0.0);
 #elif defined(Q2_K)
     uint b = rb + (blk >> 3) * 84u;
     uint half_ = ib >> 2;
     uint g = ib & 3u;
-    uint s0 = uint(w[b + half_ * 8u + 2u * g]), s1 = uint(w[b + half_ * 8u + 2u * g + 1u]);
+    uint s01 = u16at(b + half_ * 8u + 2u * g);
+    uint s0 = s01 & 0xFFu, s1 = s01 >> 8;
     uint qo = (b + 16u + half_ * 32u) >> 2;
     for (uint wv = 0u; wv < 8u; wv++) q[wv] = ((w32[qo + wv] >> (2u * g)) & 0x03030303u) * ((wv < 4u) ? (s0 & 0xFu) : (s1 & 0xFu));
     uint dd = w32[(b + 80u) >> 2];

@@ -87,6 +87,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Sign byte-mask table for IQ2_XS / IQ2_S block decoders (shared memory, per KSIGNS index / raw sign byte; negate as (g ^ M) + ((M >> 7) & 0x01010101) instead of deriving the mask from 4 sign bits) | IQ2_XS 77.8 -> 75.5 us, IQ2_S 84.4 -> 82.8 us; Qwen3.8 IQ2_S decode 36.2 -> 36.3 tok/s |
 | Opt-in `OCAK_PREFILL_Q256=1`: prefill activations with one int8 scale per 256 values (quant_q8 -DGROUP256, same layout); qmm_q8 -DACT256 keeps acc in units of the current activation scale and rescales once per 256, so the fix-up drops the d_w * d_x multiply (lossy: 1.6-1.9x the int8 rounding error in vk_qmm_int8_matches_qmv; Qwen3.8 greedy text identical for ~70 tokens of a summary, then a different wording; count-test passes) | matmul +1-7% (IQ2_XS 2.97 -> 2.78 ms, IQ2_S 2.96 -> 2.80); Qwen3.8 IQ2_S prefill 300.5 -> 313.6 tok/s |
 | Q3_K block decoder: the 12 scale bytes as three word loads instead of four byte loads per block (timing experiments: byte loads ~28% of the kernel, unaligned-word funnels ~11%), and decode from aligned words then realign each result once (110-byte superblocks sit at offset 0 or 2 mod 4) | Q3_K matvec 155 -> 110 us (247 -> 347 GB/s); Qwen3.8 Q2_K decode 27.0 -> 29.9 tok/s, with MTP 41.9 -> 45.8; output identical |
+| Same word-load treatment elsewhere: Q4_K / Q5_K scales as three aligned words, Q6_K realign-once + one 16-bit scale load, IQ1_S / IQ1_M / Q2_K adjacent scale bytes as one load | Q4_K 146.6 -> 140-142 us, Q6_K 198.5 -> 195.7 us; IQ1_S / Q2_K unchanged (already one or two loads); output identical |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -154,8 +155,8 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 
 ## Open ideas (not tried yet)
 
-- Decode: other block decoders with several single-byte scale loads per block (IQ1_M, the dqi8
-  prefill unpackers) may gain from the same word-load treatment as Q3_K.
+- Prefill: the dqi8 unpackers (qmm_q8 loader) still use single-byte scale loads (Q3_K, Q4_K,
+  IQ1_M); the prefill loop is issue-bound, so the gain is likely small.
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).
 - Prefill: the per-256 opt-in still converts every block's int32 dot to float; accumulating
   ia * integer weight sub-scale in int32 needs a 24-bit multiply ACO only emits when it can prove
