@@ -53,6 +53,17 @@ impl ThinkingGovernor {
 pub struct JsonGrammar {
     stack: Vec<Frame>,
     state: State,
+    /// Last vocabulary mask (bit set = token allowed) and the exact grammar state it was built
+    /// for: inside strings / numbers consecutive tokens usually see the same state, so masking is
+    /// a bitset apply instead of stepping every token's bytes.
+    mask_cache: std::cell::RefCell<Option<MaskCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct MaskCache {
+    stack: Vec<Frame>,
+    state: State,
+    bits: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +93,7 @@ impl Default for JsonGrammar {
 
 impl JsonGrammar {
     pub fn new() -> Self {
-        Self { stack: Vec::new(), state: State::ExpectValue }
+        Self { stack: Vec::new(), state: State::ExpectValue, mask_cache: std::cell::RefCell::new(None) }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -96,11 +107,13 @@ impl JsonGrammar {
     }
 
     pub fn feed_byte(&mut self, b: u8) -> bool {
-        let mut next = self.clone();
-        if next.step(b) {
-            *self = next;
+        // Roll back on rejection without cloning the mask cache.
+        let (stack, state) = (self.stack.clone(), self.state);
+        if self.step(b) {
             true
         } else {
+            self.stack = stack;
+            self.state = state;
             false
         }
     }
@@ -286,26 +299,42 @@ impl JsonGrammar {
     }
 
     pub fn mask_logits(&self, tok: &Tokenizer, logits: &mut [f32]) {
+        let n = logits.len();
+        let mut cache = self.mask_cache.borrow_mut();
+        let hit = matches!(&*cache, Some(c) if c.state == self.state && c.stack == self.stack && c.bits.len() == n.div_ceil(64));
+        if !hit {
+            *cache = Some(MaskCache { stack: self.stack.clone(), state: self.state, bits: self.build_mask(tok, n) });
+        }
+        let bits = &cache.as_ref().unwrap().bits;
         for (i, l) in logits.iter_mut().enumerate() {
-            if !l.is_finite() {
-                continue;
-            }
-            let id = i as u32;
-            if tok.is_eog(id) {
-                if !self.is_complete() {
-                    *l = f32::NEG_INFINITY;
-                }
-                continue;
-            }
-            let bytes = tok.token_bytes(id);
-            if bytes.is_empty() {
-                *l = f32::NEG_INFINITY;
-                continue;
-            }
-            let mut g = self.clone();
-            if !bytes.iter().all(|&b| g.feed_byte(b)) {
+            if (bits[i >> 6] >> (i & 63)) & 1 == 0 {
                 *l = f32::NEG_INFINITY;
             }
         }
+    }
+
+    /// Allowed-token bitset for the current state over a vocabulary of `n` ids.
+    fn build_mask(&self, tok: &Tokenizer, n: usize) -> Vec<u64> {
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        let complete = self.is_complete();
+        let mut g = JsonGrammar { stack: Vec::with_capacity(self.stack.len() + 8), state: self.state, mask_cache: Default::default() };
+        for i in 0..n {
+            let id = i as u32;
+            let ok = if tok.is_eog(id) {
+                complete
+            } else {
+                let bytes = tok.token_bytes_ref(id);
+                // One reset of a scratch copy per token (no allocation); `step` mutates it in place
+                // (a rejected token's state is dropped, so no per-byte rollback is needed).
+                g.stack.clear();
+                g.stack.extend_from_slice(&self.stack);
+                g.state = self.state;
+                !bytes.is_empty() && bytes.iter().all(|&b| g.step(b))
+            };
+            if ok {
+                bits[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        bits
     }
 }

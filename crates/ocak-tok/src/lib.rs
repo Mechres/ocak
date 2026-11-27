@@ -80,6 +80,28 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark"]
+    fn json_mask_bench() {
+        let Some(p) = home_model("models/Qwen3.5-4B-Q4_K_M.gguf") else { return; };
+        let gf = ocak_gguf::GgufFile::open(&p).unwrap();
+        let tok = Tokenizer::from_gguf(&gf).unwrap();
+        let n = tok.n_vocab();
+        let mut g = JsonGrammar::new();
+        assert!(br#"{"name": "a"#.iter().all(|&b| g.feed_byte(b)));
+        let mut logits = vec![0f32; n];
+        g.mask_logits(&tok, &mut logits);
+        let t = std::time::Instant::now();
+        let iters = 3;
+        let mut allowed = 0;
+        for _ in 0..iters {
+            logits.iter_mut().for_each(|l| *l = 0.0);
+            g.mask_logits(&tok, &mut logits);
+            allowed = logits.iter().filter(|l| l.is_finite()).count();
+        }
+        eprintln!("json mask over {n} tokens: {:.2} ms ({allowed} allowed)", t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+    }
+
+    #[test]
     fn qwen35_real_gguf_tokenizer() {
         let Some(p) = home_model("models/Qwen3.5-4B-Q4_K_M.gguf") else { return; };
         let gf = ocak_gguf::GgufFile::open(&p).unwrap();

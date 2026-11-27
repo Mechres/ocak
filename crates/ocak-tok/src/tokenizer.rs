@@ -33,6 +33,9 @@ pub struct Tokenizer {
     add_space_prefix: bool,
     llama3_pre: bool,
     chat_template: Option<String>,
+    /// Decoded bytes of every token, built on first use (JSON-mode masking reads all of them per
+    /// generated token).
+    bytes_table: std::sync::OnceLock<Vec<Box<[u8]>>>,
 }
 
 fn gpt2_byte_to_char() -> [char; 256] {
@@ -46,6 +49,12 @@ fn gpt2_byte_to_char() -> [char; 256] {
         map[b as usize] = char::from_u32(cp).unwrap();
     }
     map
+}
+
+/// Cached reverse of `gpt2_byte_to_char` (was rebuilt on every `token_bytes` call).
+fn gpt2_char_to_byte_cached() -> &'static FxHashMap<char, u8> {
+    static M: std::sync::OnceLock<FxHashMap<char, u8>> = std::sync::OnceLock::new();
+    M.get_or_init(gpt2_char_to_byte)
 }
 
 fn gpt2_char_to_byte() -> FxHashMap<char, u8> {
@@ -154,6 +163,7 @@ impl Tokenizer {
             add_space_prefix,
             llama3_pre,
             chat_template,
+            bytes_table: std::sync::OnceLock::new(),
         })
     }
 
@@ -444,6 +454,16 @@ impl Tokenizer {
     }
 
     pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        self.token_bytes_ref(id).to_vec()
+    }
+
+    /// Borrowed decoded bytes of a token (from a table built once per tokenizer).
+    pub fn token_bytes_ref(&self, id: u32) -> &[u8] {
+        let t = self.bytes_table.get_or_init(|| (0..self.tokens.len() as u32).map(|i| self.decode_token_bytes(i).into_boxed_slice()).collect());
+        t.get(id as usize).map(|b| &b[..]).unwrap_or(&[])
+    }
+
+    fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
         let Some(tok) = self.tokens.get(id as usize) else {
             return Vec::new();
         };
@@ -464,7 +484,7 @@ impl Tokenizer {
         match self.kind {
             VocabKind::Spm => tok.replace('\u{2581}', " ").into_bytes(),
             VocabKind::Bpe => {
-                let rev = gpt2_char_to_byte();
+                let rev = gpt2_char_to_byte_cached();
                 let mut bytes = Vec::with_capacity(tok.len());
                 for ch in tok.chars() {
                     if let Some(&b) = rev.get(&ch) {

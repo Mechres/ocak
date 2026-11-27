@@ -88,6 +88,10 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Opt-in `OCAK_PREFILL_Q256=1`: prefill activations with one int8 scale per 256 values (quant_q8 -DGROUP256, same layout); qmm_q8 -DACT256 keeps acc in units of the current activation scale and rescales once per 256, so the fix-up drops the d_w * d_x multiply (lossy: 1.6-1.9x the int8 rounding error in vk_qmm_int8_matches_qmv; Qwen3.8 greedy text identical for ~70 tokens of a summary, then a different wording; count-test passes) | matmul +1-7% (IQ2_XS 2.97 -> 2.78 ms, IQ2_S 2.96 -> 2.80); Qwen3.8 IQ2_S prefill 300.5 -> 313.6 tok/s |
 | Q3_K block decoder: the 12 scale bytes as three word loads instead of four byte loads per block (timing experiments: byte loads ~28% of the kernel, unaligned-word funnels ~11%), and decode from aligned words then realign each result once (110-byte superblocks sit at offset 0 or 2 mod 4) | Q3_K matvec 155 -> 110 us (247 -> 347 GB/s); Qwen3.8 Q2_K decode 27.0 -> 29.9 tok/s, with MTP 41.9 -> 45.8; output identical |
 | Same word-load treatment elsewhere: Q4_K / Q5_K scales as three aligned words, Q6_K realign-once + one 16-bit scale load, IQ1_S / IQ1_M / Q2_K adjacent scale bytes as one load | Q4_K 146.6 -> 140-142 us, Q6_K 198.5 -> 195.7 us; IQ1_S / Q2_K unchanged (already one or two loads); output identical |
+| JSON mode (`json_mode`): token bytes decoded once per tokenizer (the GPT-2 char->byte map was rebuilt per call), one grammar scratch state per token instead of a clone per byte, and the vocabulary mask cached as a bitset keyed by the exact grammar state (strings / numbers repeat it) | mask per generated token 990 ms -> 0.24 ms on a cache hit, ~11 ms on a state change (248k vocab) |
+| Sampler: streaming top-k scan for top_k <= 1024 (no full-vocabulary copy / partition); plain temperature computes each exp once | top_k=40: 0.66 -> 0.33 ms per draw; plain T: 1.60 -> 1.19 ms |
+| Batched path (prefill, MTP verify): `add` + `rms_norm_batch` fused into `add_rms_norm_batch` (one workgroup per row, bit-identical to decode's add_rms_norm), including the layer-closing add with the next layer's attn norm | Qwen3.8 IQ2_S MTP decode 50.1 -> 50.5 tok/s; output identical |
+| Page-table upload skipped when unchanged (it changes once per 16-token page; each upload was a submit + fence wait) | Qwen3.8 IQ2_S decode 36.2-36.3 -> 36.4-36.5 tok/s (small model: no measurable change) |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -140,6 +144,7 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit.
 | Prefill int8 matmul with double-buffered shared tiles (one barrier per K block instead of two) | no change (Q8_0 2.42 vs 2.45 ms, IQ2_S 2.95 vs 3.01 ms at 5120x17408x256) | barriers are not the limit; the loop is instruction-issue bound (see below) |
 | Fuse decode activation quantization into `add_rms_norm` / `rms_norm` (norm kernel also writes the int8 copy; bit-identical, MTP stays exact) | no change (Qwen3.8 IQ2_S 36.2-36.3 tok/s; standalone quant_q8 dispatches halved) | the separate quant dispatch + barrier was not on the critical path |
 | Q3_K: fold the -4 offset into the min term (unsigned 0..7 weights, dot(q - 4, x) = dot(q, x) - 4 sum(x)) | no change (154 vs 155 us; 110 us either way after the scale fix) | the kernel was load-bound (byte loads), not ALU-bound; dropped to keep the old bits |
+| int8 decode path for Q8_0 matvecs (Inkling's dense Q8_0 tensors, ~290 calls / token on the float kernel) | slower (Inkling decode 24.5 -> 23.8 tok/s) | the float Q8_0 kernel is already cheap per weight; the int8 path adds activation quantization |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
@@ -154,6 +159,12 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 (build d1e573195) pp512 on Qwen3.8 IQ2_S is 246 tok/s; ocak 296.
 
 ## Open ideas (not tried yet)
+
+- MTP prompt warmup: drafter KV warmup runs per prompt token with separate submits after a
+  hidden-state download; measured cost ~60 ms on a 500-token prompt (Qwen3.8 Q2_K prefill 319.8 ->
+  308.2 tok/s with MTP on). A batched GPU pass from the resident hidden buffer would remove it.
+- Inkling attention (`inkling_attn.comp`: shared-memory tree reductions, strided K reads, no
+  split-K) is ~3% of decode at short context; matters only for long contexts.
 
 - Prefill: the dqi8 unpackers (qmm_q8 loader) still use single-byte scale loads (Q3_K, Q4_K,
   IQ1_M); the prefill loop is issue-bound, so the gain is likely small.

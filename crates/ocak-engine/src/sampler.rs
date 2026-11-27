@@ -83,27 +83,40 @@ impl Sampler {
         if p.temperature <= 0.0 {
             return logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
         }
+        let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap();
+        if p.top_k > 0 && p.top_k <= 1024 {
+            // Small top-k: one streaming pass keeping the k largest (no copy of the whole
+            // vocabulary, no full partition).
+            let mut cand = top_k_scan(logits, p.top_k);
+            if cand.is_empty() {
+                return 0;
+            }
+            cand.sort_by(cmp);
+            return self.sample_sorted(&cand, &p);
+        }
         let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, &v)| (i as u32, v)).collect();
         if cand.is_empty() {
             return 0;
         }
-        let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap();
         if p.top_k == 0 || p.top_k >= cand.len() {
             // No top-k truncation: avoid sorting the whole vocabulary (8 ms for 248k tokens).
             let mx = cand.iter().fold(f32::NEG_INFINITY, |a, c| a.max(c.1));
             let inv_t = 1.0 / p.temperature;
-            let sum_all: f32 = cand.iter().map(|c| ((c.1 - mx) * inv_t).exp()).sum();
             if p.top_p >= 1.0 && p.min_p <= 0.0 {
-                // Plain temperature sampling: one O(n) pass, no ordering needed.
+                // Plain temperature sampling: no ordering needed; the weights are computed once
+                // and reused for the draw (same values and summation order as before).
+                let w: Vec<f32> = cand.iter().map(|c| ((c.1 - mx) * inv_t).exp()).collect();
+                let sum_all: f32 = w.iter().sum();
                 let mut r = self.next_f32() * sum_all;
-                for c in &cand {
-                    r -= ((c.1 - mx) * inv_t).exp();
+                for (c, &wi) in cand.iter().zip(&w) {
+                    r -= wi;
                     if r <= 0.0 {
                         return c.0;
                     }
                 }
                 return cand[cand.len() - 1].0;
             }
+            let sum_all: f32 = cand.iter().map(|c| ((c.1 - mx) * inv_t).exp()).sum();
             // Nucleus / min-p: sort only a top-M prefix, growing M until it covers the cut.
             let mut m = 256usize.min(cand.len());
             loop {
@@ -138,6 +151,11 @@ impl Sampler {
             cand.truncate(p.top_k);
             cand.sort_by(cmp);
         }
+        self.sample_sorted(&cand, &p)
+    }
+
+    /// Draw from candidates sorted by descending logit, applying temperature, min_p and top_p.
+    fn sample_sorted(&mut self, cand: &[(u32, f32)], p: &SamplerParams) -> u32 {
         let mx = cand[0].1;
         let mut probs: Vec<f32> = cand.iter().map(|c| ((c.1 - mx) / p.temperature).exp()).collect();
         let sum: f32 = probs.iter().sum();
@@ -167,6 +185,28 @@ impl Sampler {
         }
         cand[keep - 1].0
     }
+}
+
+/// The k largest finite logits as (id, logit), unordered, in one pass over the vocabulary.
+fn top_k_scan(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+    let (mut min_i, mut min_v) = (0usize, f32::INFINITY);
+    let refresh = |top: &[(u32, f32)]| top.iter().enumerate().fold((0usize, f32::INFINITY), |b, (i, c)| if c.1 < b.1 { (i, c.1) } else { b });
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            continue;
+        }
+        if top.len() < k {
+            top.push((i as u32, v));
+            if top.len() == k {
+                (min_i, min_v) = refresh(&top);
+            }
+        } else if v > min_v {
+            top[min_i] = (i as u32, v);
+            (min_i, min_v) = refresh(&top);
+        }
+    }
+    top
 }
 
 #[cfg(test)]

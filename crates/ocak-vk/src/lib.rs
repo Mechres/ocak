@@ -1745,8 +1745,15 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_rms_norm(&mut self, x: &Buffer, x_off: u64, r: &Buffer, r_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32) {
+        self.add_rms_norm_batch(x, x_off, r, r_off, w, w_off, out, out_off, n, eps, 1);
+    }
+
+    /// `batch` rows of `n` floats (back to back in x, r and out): x += r, out = rms_norm(x) * w,
+    /// bit-identical per row to `add_rms_norm` (one workgroup per row, same reduction).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rms_norm_batch(&mut self, x: &Buffer, x_off: u64, r: &Buffer, r_off: u64, w: &Buffer, w_off: u64, out: &Buffer, out_off: u64, n: u32, eps: f32, batch: u32) {
         let pc = [off_u32(x_off), off_u32(r_off), off_u32(w_off), off_u32(out_off), n, eps.to_bits()];
-        self.dispatch_raw(&self.ctx.pipelines.add_rms_norm, &[x.buf, r.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.add_rms_norm, &[x.buf, r.buf, w.buf, out.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
 
     pub fn argmax(&mut self, x: &Buffer, x_off: u64, out: &Buffer, n: u32) {

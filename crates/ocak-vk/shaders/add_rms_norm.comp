@@ -3,6 +3,7 @@
 // x += r; o = x * rsqrt(mean(x^2) + eps) * w. The reduction (512 threads, 32-lane clusters, 16
 // partials summed in order) is identical to rms_norm.comp, so the fused decode path and the
 // batched path (add + rms_norm_batch, used by MTP verification) produce the same bits.
+// Workgroup y = row: rows of n floats back to back in x, r and o (batched prefill / verify).
 layout(local_size_x = 512) in;
 layout(set = 0, binding = 0) buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer R { float r[]; };
@@ -19,10 +20,12 @@ layout(push_constant) uniform PC {
 shared float sm[16];
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y * pc.n;
+    uint xo = pc.x_off + row, ro = pc.r_off + row, oo = pc.out_off + row;
     float acc = 0.0;
     for (uint i = tid; i < pc.n; i += 512u) {
-        float v = x[pc.x_off + i] + r[pc.r_off + i];
-        x[pc.x_off + i] = v;
+        float v = x[xo + i] + r[ro + i];
+        x[xo + i] = v;
         acc += v * v;
     }
     float s32 = subgroupClusteredAdd(acc, 32u);
@@ -32,6 +35,6 @@ void main() {
     for (uint j = 0u; j < 16u; j++) tot += sm[j];
     float scale = inversesqrt(tot / float(pc.n) + pc.eps);
     for (uint i = tid; i < pc.n; i += 512u) {
-        o[pc.out_off + i] = x[pc.x_off + i] * scale * w[pc.w_off + i];
+        o[oo + i] = x[xo + i] * scale * w[pc.w_off + i];
     }
 }

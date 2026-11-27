@@ -92,6 +92,9 @@ pub struct VkExec {
     kv: Buffer,
     layer_stride: u64,
     pt_buf: Buffer,
+    /// Contents last uploaded to pt_buf: the page table changes once per 16-token page, so the
+    /// per-step synchronous upload (a submit + fence wait) is skipped when it is unchanged.
+    pt_last: Vec<u32>,
     max_pages: usize,
     x: Buffer,
     xn: Buffer,
@@ -262,6 +265,7 @@ impl VkExec {
             kv: mk(layer_stride as usize * cfg.n_kv_layers)?,
             layer_stride,
             pt_buf: mk((n_pages * 4).max(64))?,
+            pt_last: Vec::new(),
             max_pages: (n_pages * 4).max(64),
             x: mk(PREFILL_BATCH * cfg.n_embd)?,
             xn: mk(PREFILL_BATCH * cfg.n_embd)?,
@@ -341,7 +345,7 @@ impl Executor for VkExec {
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
 
         // Keep each single vkQueueSubmit well below Linux amdgpu's 2s TDR timeout on 27B+ models
         let chunk_max = std::env::var("OCAK_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.prefill_chunk).clamp(1, PREFILL_BATCH);
@@ -373,7 +377,7 @@ impl Executor for VkExec {
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
 
         let chunk_max = std::env::var("OCAK_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.prefill_chunk).clamp(1, PREFILL_BATCH);
         let mut hiddens = Vec::with_capacity(tokens.len());
@@ -398,7 +402,7 @@ impl Executor for VkExec {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
         self.ensure_rec_snaps()?;
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
         let c = &self.cfg;
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
@@ -452,7 +456,7 @@ impl Executor for VkExec {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
         self.ensure_rec_snaps()?;
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
         let c = &self.cfg;
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
@@ -491,7 +495,7 @@ impl Executor for VkExec {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
         self.ensure_rec_snaps()?;
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
         let c = &self.cfg;
         let ne = c.n_embd as u32;
         let mut rec = self.ctx.begin();
@@ -598,7 +602,7 @@ impl Executor for VkExec {
         if pt_packed.len() > self.max_pages {
             return Err(EngineError::Context("multi-slot page tables exceed GPU capacity".into()));
         }
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(&pt_packed)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(&pt_packed)?;
 
         if slots.len() > 2 {
             let need_alloc = self.multi_logits_buf.as_ref().is_none_or(|(cap, _)| *cap < slots.len());
@@ -751,7 +755,7 @@ impl VkExec {
         if page_table.len() > self.max_pages {
             return Err(EngineError::Context("page table exceeds GPU capacity".into()));
         }
-        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.upload_pt(page_table)?;
         if let Some(e) = embd {
             self.ctx.upload(&self.x, 0, bytemuck::cast_slice(e)).map_err(|er| EngineError::Backend(er.to_string()))?;
         }
@@ -897,6 +901,20 @@ impl VkExec {
         Ok(None)
     }
 
+    /// Upload the page table unless pt_buf already holds exactly these entries (prefix
+    /// comparison is not enough: entries are rewritten when sequences fork / reuse pages).
+    fn upload_pt(&mut self, page_table: &[u32]) -> Result<(), EngineError> {
+        if self.pt_last.len() >= page_table.len() && self.pt_last[..page_table.len()] == *page_table {
+            return Ok(());
+        }
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        if self.pt_last.len() < page_table.len() {
+            self.pt_last.resize(page_table.len(), 0);
+        }
+        self.pt_last[..page_table.len()].copy_from_slice(page_table);
+        Ok(())
+    }
+
     fn ensure_rec_snaps(&mut self) -> Result<(), EngineError> {
         if self.rec_snaps.is_none() {
             let mut snaps = Vec::new();
@@ -1009,9 +1027,14 @@ impl VkExec {
             rec.barrier();
         }
 
-        for l in &self.layers[layers] {
-            rec.rms_norm_batch(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, ne, c.eps, batch);
-            rec.barrier();
+        // The residual add closing each layer is fused with the next layer's attn norm
+        // (add_rms_norm_batch: bit-identical to the decode path's add_rms_norm).
+        let layer_list = &self.layers[layers];
+        for (li, l) in layer_list.iter().enumerate() {
+            if li == 0 {
+                rec.rms_norm_batch(&self.x, 0, &l.attn_norm, 0, &self.xn, 0, ne, c.eps, batch);
+                rec.barrier();
+            }
             match &l.mixer {
                 VkMixer::FullAttn { wq, wk, wv, wo, bq, bk, bv, q_norm, k_norm, gated_q, n_head_kv, kv_layer_idx, sliding_window, rope_base, use_rope_factors, head_gate_w } => {
                     let kv_dim = (*n_head_kv as usize) * c.head_dim;
@@ -1132,9 +1155,7 @@ impl VkExec {
                 rec.rms_norm_batch(&self.o, 0, pan, 0, &self.o, 0, ne, c.eps, batch);
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, batch * ne);
-            rec.barrier();
-            rec.rms_norm_batch(&self.x, 0, &l.ffn_norm, 0, &self.xn, 0, ne, c.eps, batch);
+            rec.add_rms_norm_batch(&self.x, 0, &self.o, 0, &l.ffn_norm, 0, &self.xn, 0, ne, c.eps, batch);
             rec.barrier();
             rec.qmm(l.gate.ty, &l.gate.buf, 0, &self.xn, 0, &self.gate, 0, l.gate.k, l.gate.m, batch);
             rec.qmm(l.up.ty, &l.up.buf, 0, &self.xn, 0, &self.up, 0, l.up.k, l.up.m, batch);
@@ -1147,7 +1168,11 @@ impl VkExec {
                 rec.rms_norm_batch(&self.o, 0, pfn, 0, &self.o, 0, ne, c.eps, batch);
                 rec.barrier();
             }
-            rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            if let Some(next) = layer_list.get(li + 1) {
+                rec.add_rms_norm_batch(&self.x, 0, &self.o, 0, &next.attn_norm, 0, &self.xn, 0, ne, c.eps, batch);
+            } else {
+                rec.add(&self.x, 0, &self.o, 0, batch * ne);
+            }
             rec.barrier();
         }
     }
