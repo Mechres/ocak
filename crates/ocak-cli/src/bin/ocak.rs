@@ -362,6 +362,10 @@ async fn main() -> Result<()> {
                             .is_none_or(|f| e.id.to_lowercase().contains(&f.to_lowercase()))
                 })
                 .collect();
+            // The scan follows symlinks (e.g. a stages/ directory linking to the same files):
+            // bench each underlying file once.
+            let mut seen = std::collections::HashSet::new();
+            entries.retain(|e| seen.insert(std::fs::canonicalize(&e.path).unwrap_or_else(|_| e.path.clone())));
             entries.sort_by_key(|e| e.size_bytes);
             if entries.is_empty() {
                 anyhow::bail!("no matching native GGUF models found");

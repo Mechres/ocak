@@ -1,0 +1,56 @@
+name: GPU
+
+# Runs on the self-hosted RX 6700 XT runner (label `ocak-gpu`), which has the Vulkan driver
+# and the test models (OCAK_MODELS_DIR is set in the runner's .env). Only pushes to master and
+# manual runs trigger it: fork pull requests must never reach the self-hosted machine (the repo
+# also requires approval for all external contributors' workflow runs).
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-runner
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gpu:
+    if: github.repository == 'Mechres/ocak'
+    runs-on: [self-hosted, ocak-gpu]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Tests (GPU kernels included)
+        run: cargo test --release --workspace
+
+      - name: Long-context counting test
+        run: cargo run --release --bin ocak -- count-test
+
+      - name: Benchmark
+        run: |
+          cargo run --release --bin ocak -- bench --prompt-tokens 512 --decode-tokens 64 | tee bench.md
+          {
+            echo "## Benchmark (prompt 512, decode 64)"
+            cat bench.md
+            echo
+            echo "## vs. baseline (ci/bench-baseline.md)"
+            python3 ci/bench_check.py ci/bench-baseline.md bench.md
+          } > report.md || true
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          python3 ci/bench_check.py ci/bench-baseline.md bench.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: |
+            bench.md
+            report.md
+          if-no-files-found: ignore
