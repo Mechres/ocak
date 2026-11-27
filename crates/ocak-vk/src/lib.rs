@@ -1590,6 +1590,18 @@ impl<'a> Recorder<'a> {
         if batch <= 8 && self.qmv_int8(ty, w, w_off, x, x_off, y, y_off, k, m, batch) {
             return;
         }
+        // 9..31 tokens (short prompts, below the tiled-matmul threshold): int8 matvec in groups of
+        // 8 tokens (one weight read per group) instead of the old 8-token float kernels.
+        if batch > 8 && batch < qmmt_min_batch() && x_off.is_multiple_of(4) && self.qmv_int8(ty, w, w_off, x, x_off, y, y_off, k, m, 8) {
+            let mut t = 8u32;
+            while t < batch {
+                let nb = (batch - t).min(8);
+                let ok = self.qmv_int8(ty, w, w_off, x, x_off + (t * k) as u64, y, y_off + (t * m) as u64, k, m, nb);
+                debug_assert!(ok, "int8 matvec accepted the first group but not a later one");
+                t += nb;
+            }
+            return;
+        }
         if batch <= 8 && k.is_multiple_of(32) {
             // Small batch: one weight read for all tokens.
             let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
@@ -2704,33 +2716,38 @@ mod tests {
     #[test]
     fn vk_matvec_batch_matches_single_bitwise() {
         // Speculative decoding (MTP) verifies drafts with a multi-token matvec; it must reproduce
-        // single-token decode exactly or greedy output changes when MTP is on.
+        // single-token decode exactly or greedy output changes when MTP is on. 3 tokens: the
+        // 2..8-token path (all formats). 13 tokens: the 9..31-token int8 path (two groups).
         let c = ctx();
         let (k, m) = (2048usize, 600usize);
         let mut rng = Lcg(77);
-        let x: Vec<f32> = (0..3 * k).map(|_| rng.f()).collect();
+        let x: Vec<f32> = (0..13 * k).map(|_| rng.f()).collect();
         let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
         c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
-        let ya = c.create_device_buffer((3 * m * 4) as u64).unwrap();
-        let yb = c.create_device_buffer((3 * m * 4) as u64).unwrap();
-        for wt in [WType::Q4K, WType::Q6K, WType::Q8_0, WType::IQ2S, WType::Q2K] {
+        let ya = c.create_device_buffer((13 * m * 4) as u64).unwrap();
+        let yb = c.create_device_buffer((13 * m * 4) as u64).unwrap();
+        for (wt, nb) in [WType::Q4K, WType::Q6K, WType::Q8_0, WType::IQ2S, WType::Q2K]
+            .into_iter()
+            .flat_map(|wt| [(wt, 3usize), (wt, 13)])
+            .filter(|&(wt, nb)| nb <= 8 || wt != WType::Q8_0)
+        {
             let raw: Vec<u8> = (0..m * wt.row_bytes(k as u32) as usize).map(|_| (rng.next() & 0x3F) as u8).collect();
             let bw = c.create_device_buffer(raw.len() as u64).unwrap();
             c.upload(&bw, 0, &raw).unwrap();
             let mut rec = c.begin();
-            rec.qmm(wt, &bw, 0, &bx, 0, &ya, 0, k as u32, m as u32, 3);
+            rec.qmm(wt, &bw, 0, &bx, 0, &ya, 0, k as u32, m as u32, nb as u32);
             rec.finish_and_wait().unwrap();
-            for t in 0..3 {
+            for t in 0..nb {
                 let mut rec = c.begin();
                 rec.qmv(wt, &bw, 0, &bx, (t * k) as u64, &yb, (t * m) as u64, k as u32, m as u32);
                 rec.finish_and_wait().unwrap();
             }
-            let mut a = vec![0f32; 3 * m];
-            let mut b = vec![0f32; 3 * m];
+            let mut a = vec![0f32; nb * m];
+            let mut b = vec![0f32; nb * m];
             c.download(&ya, 0, bytemuck::cast_slice_mut(&mut a)).unwrap();
             c.download(&yb, 0, bytemuck::cast_slice_mut(&mut b)).unwrap();
-            for i in 0..3 * m {
-                assert!(a[i].to_bits() == b[i].to_bits(), "{wt:?} idx {i}: batch {} vs single {}", a[i], b[i]);
+            for i in 0..nb * m {
+                assert!(a[i].to_bits() == b[i].to_bits(), "{wt:?} batch {nb} idx {i}: batch {} vs single {}", a[i], b[i]);
             }
         }
     }
