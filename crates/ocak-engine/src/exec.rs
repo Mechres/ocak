@@ -95,6 +95,16 @@ pub trait Executor: Send {
     ) -> Result<Option<(Vec<u32>, Vec<Vec<f32>>)>, EngineError> {
         Ok(None)
     }
+    /// Like `forward_verify_argmax` but returns the full logits of every position (for sampled
+    /// decoding). None if unsupported.
+    fn forward_verify_logits(
+        &mut self,
+        _tokens: &[u32],
+        _pos0: usize,
+        _page_table: &[u32],
+    ) -> Result<Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>, EngineError> {
+        Ok(None)
+    }
     /// Restore the recurrent state saved after token `k` of the last verification.
     fn restore_recurrent_to(&mut self, k: usize) -> Result<(), EngineError> {
         if k == 0 {

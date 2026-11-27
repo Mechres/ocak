@@ -438,6 +438,45 @@ impl Executor for VkExec {
         Ok(Some(([idx[0], idx[1]], [h0, h1])))
     }
 
+    fn forward_verify_logits(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>, EngineError> {
+        let n = tokens.len();
+        if !(2..=MAX_VERIFY).contains(&n) {
+            return Ok(None);
+        }
+        if page_table.len() > self.max_pages {
+            return Err(EngineError::Context("page table exceeds GPU capacity".into()));
+        }
+        self.ensure_rec_snaps()?;
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let c = &self.cfg;
+        let ne = c.n_embd as u32;
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        self.record_batch_layers(&mut rec, tokens, pos0, true, 0..self.layers.len());
+        for t in 0..n as u64 {
+            rec.rms_norm(&self.x, t * ne as u64, &self.out_norm, 0, &self.hidden_buf2, t * ne as u64, ne, c.eps);
+        }
+        rec.barrier();
+        let w = self.output.as_ref().unwrap_or(&self.embd);
+        rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, n as u32);
+        rec.barrier();
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mut l_all = vec![0f32; n * c.n_vocab];
+        self.ctx.download(&self.logits_buf2, 0, bytemuck::cast_slice_mut(&mut l_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mut h_all = vec![0f32; n * c.n_embd];
+        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let ls: Vec<Vec<f32>> = l_all.chunks(c.n_vocab).map(|l| l.to_vec()).collect();
+        let hs: Vec<Vec<f32>> = h_all.chunks(c.n_embd).map(|h| h.to_vec()).collect();
+        self.hidden.copy_from_slice(&hs[n - 1]);
+        self.logits.copy_from_slice(&ls[n - 1]);
+        Ok(Some((ls, hs)))
+    }
+
     fn forward_verify_argmax(
         &mut self,
         tokens: &[u32],

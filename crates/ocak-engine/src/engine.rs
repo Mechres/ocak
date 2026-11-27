@@ -429,7 +429,7 @@ impl NativeEngine {
             let nd = want
                 .min(req.max_tokens.saturating_sub(gen_tokens.len() + 1))
                 .min(self.max_ctx.saturating_sub(tokens.len() + 1));
-            if use_mtp && verify_greedy && nd >= 2 {
+            if use_mtp && nd >= 2 {
                 let t0 = Instant::now();
                 let mut drafts: Vec<u32> = Vec::with_capacity(nd);
                 if let Some(m) = self.mtp.as_mut() {
@@ -456,12 +456,25 @@ impl NativeEngine {
                     vtoks.push(next_tok);
                     vtoks.extend_from_slice(&drafts);
                     let t2 = Instant::now();
-                    match self.exec.forward_verify_argmax(&vtoks, pos, &pages) {
-                        Ok(Some((v, hs))) => {
+                    // Greedy: device argmax per position. Sampled: full logits per position; each
+                    // position's token is sampled from the target model's own logits (one draw per
+                    // token, as without MTP) and the draft is kept while it equals that sample.
+                    let res = if verify_greedy {
+                        self.exec.forward_verify_argmax(&vtoks, pos, &pages).map(|o| o.map(|(v, hs)| (v, Vec::new(), hs)))
+                    } else {
+                        self.exec.forward_verify_logits(&vtoks, pos, &pages).map(|o| o.map(|(ls, hs)| (Vec::new(), ls, hs)))
+                    };
+                    match res {
+                        Ok(Some((v, mut ls, hs))) => {
                             ms_v2 += t2.elapsed().as_secs_f64() * 1000.0;
                             mtp_drafted += nd;
                             let mut acc = 0usize;
-                            while acc < nd && v[acc] == drafts[acc] {
+                            // Token chosen at position acc (argmax, or a sample from its logits).
+                            let pick = |ls: &mut Vec<Vec<f32>>, i: usize, sampler: &mut crate::sampler::Sampler| -> u32 {
+                                if verify_greedy { v[i] } else { sampler.sample(&mut ls[i]) }
+                            };
+                            let mut chosen = pick(&mut ls, 0, &mut sampler);
+                            while acc < nd && chosen == drafts[acc] {
                                 if acc >= 1 {
                                     chain_ema = 0.9 * chain_ema + 0.1;
                                 }
@@ -494,6 +507,9 @@ impl NativeEngine {
                                     }
                                 }
                                 acc += 1;
+                                if acc < nd {
+                                    chosen = pick(&mut ls, acc, &mut sampler);
+                                }
                             }
                             if acc >= 1 && acc < nd {
                                 chain_ema *= 0.9; // a chained draft after an accepted one was rejected
@@ -507,7 +523,14 @@ impl NativeEngine {
                                 }
                                 ms_rej += t3.elapsed().as_secs_f64() * 1000.0;
                             }
-                            forced_tok = Some(v[acc]);
+                            if acc < nd || verify_greedy {
+                                // Rejected draft (its position's token was already chosen), or
+                                // greedy with all drafts accepted (argmax of the last row).
+                                forced_tok = Some(if acc < nd { chosen } else { v[nd] });
+                            } else {
+                                // Sampled, all drafts accepted: sample the last row next iteration.
+                                logits_buf.copy_from_slice(&ls[nd]);
+                            }
                             hidden_buf = hs[acc].clone();
                             continue;
                         }

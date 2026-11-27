@@ -31,7 +31,11 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(p: SamplerParams) -> Self {
-        let seed = if p.seed == 0 {
+        // seed 0 = random, unless OCAK_SEED fixes it (reproducible sampled runs for testing).
+        let env_seed = std::env::var("OCAK_SEED").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v != 0);
+        let seed = if p.seed == 0 && env_seed.is_some() {
+            env_seed.unwrap()
+        } else if p.seed == 0 {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
         } else {
             p.seed

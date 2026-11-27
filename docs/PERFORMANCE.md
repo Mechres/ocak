@@ -25,8 +25,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
   matvec at Qwen3.8's FFN shape, rotating 6 weight copies). A single small weight matrix stays in
   the 96 MB Infinity Cache across repeats and reports impossible bandwidth — rotate buffers that
   together exceed ~100 MB.
-- **Comparing sampled runs:** `SamplerParams::seed = 0` means a random seed per run, so two
-  sampled runs differ even when the logits are identical — hash the logits per position instead.
+- **Comparing sampled runs:** `SamplerParams::seed = 0` means a random seed per run; set
+  `OCAK_SEED=<n>` to fix it. With a fixed seed, sampled output must be identical with MTP on and off.
 - **MTP must stay lossless:** with greedy sampling, `OCAK_DISABLE_MTP=1` and the default must
   produce identical text. The verify step (`forward_verify2`, batched layer code) and single-token
   decode use different call paths, so every kernel pair must give bit-identical results: same
@@ -93,6 +93,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Sampler without a full-vocabulary sort when top_k = 0 (O(n) for plain temperature; growing top-M prefix for top_p / min_p) | top_k = 0 sampling 8.0 -> 1.8 ms per token (248k vocab) |
 | Drafter KV gap fill: feed the accepted (hidden, draft) pair to the MTP layer's KV (it skipped one position per accepted draft) | acceptance +1-2 points, ~+1% |
 | Multi-draft greedy MTP: chained drafts (drafter's own output hidden), one 2..4-token verify, per-token rollback snapshots written by the DeltaNet/conv kernels, adaptive 1 vs 2 drafts (EMA of second-draft acceptance) | Qwen3.8 Q2_K story 39 -> 44.4, code 48.7; IQ2_S (borrowed head) code 50.4 -> 54.8 tok/s; output identical |
+| Multi-draft MTP for sampled decoding (logits per verified position; sample each in turn, keep drafts while they equal the samples) | Qwen3.8 Q2_K at T=0.7: 34.8 -> 36.6 (story), 38.9 -> 41.7 (code); seeded output identical to MTP off |
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
@@ -126,13 +127,14 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | MTP draft head over only the first N vocab rows (BPE: low ids are common) | N=65536: ~+2-5% (within noise), acceptance 72 -> 69% | marginal, and acceptance would drop for text with high token ids (non-English, code) |
 | Fixed 3 MTP drafts per step | slower than 2 (Q2_K 41.0 vs 44.7) | third-draft acceptance too low for its drafter pass + verify row |
 | Fixed 2 drafts on low-acceptance text | IQ2_S story 46.7 vs 47.7 with 1 draft | replaced by the adaptive choice |
+| Decode Q3_K strided decoder (lane = 8 byte columns -> 8 weights of each of the 4 sub-blocks; each qs / hmask byte loaded once) | slower (155 -> 205 us at 5120x17408) | activation loads quadruple (4 segments x (uvec2 + scale)) and the per-lane scale decode diverges; the block decoder's redundant weight loads hit cache |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
 ## Open ideas (not tried yet)
 
 - Decode: IQ1_S and Q3_K block decoders reach only ~225-246 GB/s (others 320-370).
-- MTP: multi-draft for sampled decoding (greedy only so far); drafting the second token without the extra drafter round trip (embedding lookup on the GPU).
+- MTP: drafting the second token without the extra drafter round trip (embedding lookup on the GPU).
 - Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
   input).
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).
