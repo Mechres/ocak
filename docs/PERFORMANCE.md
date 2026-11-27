@@ -134,8 +134,19 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | Sign byte-mask table for IQ2_XXS / IQ3_XXS / IQ3_S | IQ2_XXS slower (72.3 -> 73-75 us), IQ3 unchanged | IQ2_XXS / IQ3_XXS replace one KSIGNS read per 8 weights with two mask reads; IQ3 is already near bandwidth |
 | int8 path for DeltaNet's 5120x48 Q8_0 `ssm_alpha` / `ssm_beta` when the q8 cache already holds the input | no change (10.6 vs 11.1 us serialized, 36.2 tok/s) | latency-bound: 12 workgroups each walk a serial load chain; skipping both matvecs entirely only gives +1.2% (36.1 -> 36.5), so the ceiling is small |
 | Drafting the second MTP token without the CPU round trip (GPU embedding lookup) | not built: estimated < 0.5% | profile: draft passes are 12% of MTP decode (~3.2 ms each, dominated by the 248k-vocab head matvec); a submit + wait + 4-byte read is ~0.1-0.2 ms per chained draft |
+| Prefill int8 matmul with double-buffered shared tiles (one barrier per K block instead of two) | no change (Q8_0 2.42 vs 2.45 ms, IQ2_S 2.95 vs 3.01 ms at 5120x17408x256) | barriers are not the limit; the loop is instruction-issue bound (see below) |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
+
+### Prefill matmul ISA (RADV_DEBUG=shaders, qmm_q8 non-SCALE16 main loop, Nov 2026)
+
+614 instructions per 32-deep K block per thread: 256 `v_dot4_i32_i8` (42%), 131 for the float
+scale fix-up (32 `v_cvt_f32_i32`, 33 `v_mul`, 66 FMA), 64 `ds_read_b64`, 41 `s_waitcnt`, the rest
+addressing / loader unpack; 128 VGPRs. Removing the fix-up entirely (wrong results, timing only)
+gives 18.9 -> 22.4 TOPS on Q8_0, so the kernel is issue-bound, not memory- or barrier-bound;
+SCALE16 formats (IQ2_XS / IQ2_S / IQ1_M / Q3_K / Q6_K) pay the fix-up twice per block. The remaining
+big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.cpp Vulkan
+(build d1e573195) pp512 on Qwen3.8 IQ2_S is 246 tok/s; ocak 296.
 
 ## Open ideas (not tried yet)
 

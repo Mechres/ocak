@@ -2990,7 +2990,7 @@ mod tests {
     #[ignore = "benchmark"]
     fn vk_qmm_tiled_bench() {
         let c = VkContext::new().expect("vulkan init");
-        let (k, m, batch) = (2560usize, 9216usize, 256usize);
+        let (k, m, batch) = (5120usize, 17408usize, 256usize);
         let x: Vec<f32> = (0..batch * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
         let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
         c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
