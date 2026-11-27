@@ -307,11 +307,8 @@ impl NativeEngine {
                 if hiddens.len() == prompt_len {
                     if let Some(m) = self.mtp.as_mut() {
                         let start = prompt_len.saturating_sub(256);
-                        for i in start..prompt_len - 1 {
-                            if m.warmup_kv(&hiddens[i], tokens[i + 1], mtp_pos).is_err() {
-                                break;
-                            }
-                            mtp_pos += 1;
+                        if let Ok(n) = m.warmup_kv_batch(&hiddens[start..prompt_len - 1], &tokens[start + 1..prompt_len], mtp_pos) {
+                            mtp_pos += n;
                         }
                     }
                 }

@@ -16,6 +16,21 @@ struct MtpGpuMat {
     m: u32,
 }
 
+/// Rows per batched warmup pass.
+#[cfg(feature = "vulkan")]
+const WARM_ROWS: usize = 128;
+
+#[cfg(feature = "vulkan")]
+struct WarmBufs {
+    tok_e: Buffer,
+    h: Buffer,
+    concat: Buffer,
+    x: Buffer,
+    xn: Buffer,
+    k: Buffer,
+    v: Buffer,
+}
+
 #[cfg(feature = "vulkan")]
 struct MtpGpu {
     ctx: Arc<VkContext>,
@@ -59,6 +74,8 @@ struct MtpGpu {
     h_out: Buffer,
     logits: Buffer,
     argmax_out: Buffer,
+    /// Batched prompt-warmup scratch (allocated on first use).
+    warm: Option<WarmBufs>,
 }
 
 pub struct MtpDrafter {
@@ -225,6 +242,7 @@ impl MtpDrafter {
             h_out: mk(c.n_embd)?,
             logits: mk(c.n_vocab)?,
             argmax_out: mk(4)?,
+            warm: None,
             ctx,
             head_buf,
             head_ty,
@@ -311,6 +329,77 @@ impl MtpDrafter {
         self.kv[k_base..k_base + kv_dim].copy_from_slice(&k);
         self.kv[v_base..v_base + kv_dim].copy_from_slice(&v);
         Ok(())
+    }
+
+    /// Batched `warmup_kv` for consecutive positions pos0.. (one upload pair and one submit per
+    /// WARM_ROWS rows instead of two uploads and a submit per token). Values can differ from
+    /// the single-token path in the last bits (batched kernels); they only steer drafts, which
+    /// verification checks, so output is unaffected. Returns the number of rows written.
+    pub fn warmup_kv_batch(&mut self, hs: &[Vec<f32>], tokens: &[u32], pos0: usize) -> Result<usize, EngineError> {
+        let n_all = hs.len().min(tokens.len()).min(self.max_ctx.saturating_sub(pos0));
+        #[cfg(feature = "vulkan")]
+        if self.gpu.is_some() {
+            let c = self.cfg.clone();
+            let (ne, nkv, hd) = (c.n_embd, c.n_head_kv, c.head_dim);
+            let kv_dim = nkv * hd;
+            let rb = self.embd.row_bytes();
+            let mut done = 0usize;
+            while done < n_all {
+                let n = (n_all - done).min(WARM_ROWS);
+                let mut tok_e = vec![0f32; n * ne];
+                let mut hcat = vec![0f32; n * ne];
+                for r in 0..n {
+                    let t = tokens[done + r] as usize;
+                    dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[t * rb..(t + 1) * rb], &mut tok_e[r * ne..(r + 1) * ne], ne);
+                    hcat[r * ne..(r + 1) * ne].copy_from_slice(&hs[done + r]);
+                }
+                let gp = self.gpu.as_mut().unwrap();
+                if gp.warm.is_none() {
+                    let mk = |elems: usize| gp.ctx.create_device_buffer((elems * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()));
+                    gp.warm = Some(WarmBufs {
+                        tok_e: mk(WARM_ROWS * ne)?,
+                        h: mk(WARM_ROWS * ne)?,
+                        concat: mk(WARM_ROWS * 2 * ne)?,
+                        x: mk(WARM_ROWS * ne)?,
+                        xn: mk(WARM_ROWS * ne)?,
+                        k: mk(WARM_ROWS * kv_dim)?,
+                        v: mk(WARM_ROWS * kv_dim)?,
+                    });
+                }
+                let gp = self.gpu.as_ref().unwrap();
+                let wb = gp.warm.as_ref().unwrap();
+                gp.ctx.upload(&wb.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                gp.ctx.upload(&wb.h, 0, bytemuck::cast_slice(&hcat)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                let (ne32, nb) = (ne as u32, n as u32);
+                let pos = (pos0 + done) as u32;
+                let mut rec = gp.ctx.begin();
+                rec.set_defer_barriers(true);
+                rec.rms_norm_batch_io(&wb.tok_e, 0, ne32, &gp.enorm, 0, &wb.concat, 0, 2 * ne32, ne32, c.eps, nb);
+                rec.rms_norm_batch_io(&wb.h, 0, ne32, &gp.hnorm, 0, &wb.concat, ne as u64, 2 * ne32, ne32, c.eps, nb);
+                rec.barrier();
+                rec.qmm(gp.eh_proj.ty, &gp.eh_proj.buf, 0, &wb.concat, 0, &wb.x, 0, gp.eh_proj.k, gp.eh_proj.m, nb);
+                rec.barrier();
+                rec.rms_norm_batch(&wb.x, 0, &gp.attn_norm, 0, &wb.xn, 0, ne32, c.eps, nb);
+                rec.barrier();
+                rec.qmm(gp.wk.ty, &gp.wk.buf, 0, &wb.xn, 0, &wb.k, 0, gp.wk.k, gp.wk.m, nb);
+                rec.qmm(gp.wv.ty, &gp.wv.buf, 0, &wb.xn, 0, &wb.v, 0, gp.wv.k, gp.wv.m, nb);
+                rec.barrier();
+                rec.rms_norm_heads_batch(&wb.k, 0, &gp.k_norm, nkv as u32, hd as u32, c.eps, nb);
+                rec.barrier();
+                // K only (no query heads): the q binding is unused.
+                rec.rope_ext_batch(&wb.k, 0, &wb.k, 0, &wb.k, false, 0, nkv as u32, hd as u32, c.n_rot as u32, pos, c.rope_base, 1, nb);
+                rec.barrier();
+                rec.kv_write_batch(&wb.k, 0, &wb.v, 0, &gp.kv, 0, &gp.pt_buf, 0, pos, kv_dim as u32, nb);
+                rec.barrier();
+                rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+                done += n;
+            }
+            return Ok(n_all);
+        }
+        for i in 0..n_all {
+            self.warmup_kv(&hs[i], tokens[i], pos0 + i)?;
+        }
+        Ok(n_all)
     }
 
     /// Fast greedy draft token using on-device GPU argmax (downloads 4 bytes instead of full vocab logits).

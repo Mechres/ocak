@@ -92,6 +92,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Sampler: streaming top-k scan for top_k <= 1024 (no full-vocabulary copy / partition); plain temperature computes each exp once | top_k=40: 0.66 -> 0.33 ms per draw; plain T: 1.60 -> 1.19 ms |
 | Batched path (prefill, MTP verify): `add` + `rms_norm_batch` fused into `add_rms_norm_batch` (one workgroup per row, bit-identical to decode's add_rms_norm), including the layer-closing add with the next layer's attn norm | Qwen3.8 IQ2_S MTP decode 50.1 -> 50.5 tok/s; output identical |
 | Page-table upload skipped when unchanged (it changes once per 16-token page; each upload was a submit + fence wait) | Qwen3.8 IQ2_S decode 36.2-36.3 -> 36.4-36.5 tok/s (small model: no measurable change) |
+| Batched MTP prompt warmup (`warmup_kv_batch`: two uploads + one submit per 128 rows with batched norms / qmm / rope / kv_write, instead of two uploads + a submit per token) | 500-token prompt with MTP on: 308.2 -> 317 tok/s (MTP off: 319.8); same acceptance (75/115 on an 833-token summary) |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -160,9 +161,8 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 
 ## Open ideas (not tried yet)
 
-- MTP prompt warmup: drafter KV warmup runs per prompt token with separate submits after a
-  hidden-state download; measured cost ~60 ms on a 500-token prompt (Qwen3.8 Q2_K prefill 319.8 ->
-  308.2 tok/s with MTP on). A batched GPU pass from the resident hidden buffer would remove it.
+- MTP prompt warmup still downloads all prompt hidden states (one ~10 MB read) before the
+  batched warmup; reading the last 255 rows from the GPU buffer directly would save a few ms.
 - Inkling attention (`inkling_attn.comp`: shared-memory tree reductions, strided K reads, no
   split-K) is ~3% of decode at short context; matters only for long contexts.
 
