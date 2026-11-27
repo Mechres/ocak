@@ -1,6 +1,7 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
-// Flash-style MLA (absorbed) attention for prefill batches over the contiguous FP16 latent KV
+// Flash-style MLA (absorbed) attention for prefill batches (fallback without the mixed-float dot
+// extension; mla_attn_prefill_f2.comp is the faster variant) over the contiguous FP16 latent KV
 // cache (latent = 512, n_rot = 64: rows of 288 packed f16 pairs, value = latent part).
 // Workgroup (head block, token b) owns 32 query rows = heads 32 * wg.x .. +31 of token b, which
 // all attend the same keys 0 .. pos + b. Each step stages a BK-key tile of the cache in shared
@@ -13,7 +14,13 @@
 #define HLAT 256u    // packed latent pairs
 #define QW 36u       // score pairs per lane (HHD / 8)
 #define VW 32u       // value pairs per lane (HLAT / 8)
-layout(local_size_x = 256) in;
+// TOKS consecutive tokens per workgroup (256 threads each) share every staged key tile, cutting
+// the latent-cache traffic per query row by TOKS (each token's rows still see only keys <= its own
+// position).
+#ifndef TOKS
+#define TOKS 2u
+#endif
+layout(local_size_x = 256 * TOKS) in;
 layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
 layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
 layout(set = 0, binding = 2) readonly buffer KvCache { uint kvc[]; };
@@ -24,19 +31,25 @@ layout(push_constant) uniform PC {
     uint pos;
     uint kv_layer_off;
     float kq_scale;
+    uint batch;
 } pc;
 
 shared uint ks[BK * HHD];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint r = tid >> 3;
-    uint sub = tid & 7u;
+    uint lt = tid & 255u;
+    uint r = lt >> 3;
+    uint sub = lt & 7u;
     uint nh = gl_NumWorkGroups.x * 32u;
     uint h = gl_WorkGroupID.x * 32u + r;
-    uint b = gl_WorkGroupID.y;
+    uint b0 = gl_WorkGroupID.y * TOKS;
+    uint b = b0 + (tid >> 8);
+    bool valid = b < pc.batch;
+    b = min(b, pc.batch - 1u);
     uint qh = b * nh + h;
-    uint n_t = pc.pos + b + 1u;
+    uint n_t = pc.pos + b + 1u;                              // this row's keys
+    uint n_max = pc.pos + min(b0 + TOKS, pc.batch);          // the group's longest context
 
     // This lane's 36 score pairs: concatenated [q_lat (256 pairs), q_rope (32 pairs)], pre-scaled.
     vec2 q[QW];
@@ -58,10 +71,10 @@ void main() {
     vec2 acc[VW];
     for (uint j = 0u; j < VW; j++) acc[j] = vec2(0.0);
 
-    for (uint t0 = 0u; t0 < n_t; t0 += BK) {
-        for (uint idx = tid; idx < BK * HHD; idx += 256u) {
+    for (uint t0 = 0u; t0 < n_max; t0 += BK) {
+        for (uint idx = tid; idx < BK * HHD; idx += 256u * TOKS) {
             uint t = t0 + idx / HHD;
-            ks[idx] = (t < n_t) ? kvc[pc.kv_layer_off + t0 * HHD + idx] : 0u;
+            ks[idx] = (t < n_max) ? kvc[pc.kv_layer_off + t0 * HHD + idx] : 0u;
         }
         barrier();
 
@@ -90,6 +103,7 @@ void main() {
         barrier();
     }
 
+    if (!valid) return;
     float inv = 1.0 / l;
     uint ob = qh * 512u;
     for (uint j = 0u; j < VW; j++) {

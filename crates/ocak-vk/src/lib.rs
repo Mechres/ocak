@@ -201,6 +201,8 @@ struct Pipelines {
     inkling_attn_batch: PipelineBundle,
     inkling_attn_prefill: PipelineBundle,
     mla_attn_prefill: PipelineBundle,
+    /// mla_attn_prefill.comp -DFDOT2 (when VK_VALVE_shader_mixed_float_dot_product is present).
+    mla_attn_prefill_f2: Option<PipelineBundle>,
     attention_prefill_128: PipelineBundle,
     attention_prefill_256: PipelineBundle,
     attention_prefill_128_f2: Option<PipelineBundle>,
@@ -295,6 +297,9 @@ const QMMT_BM: u32 = 64;
 const QMMT_BN: u32 = 128;
 /// Column tile of the grouped variant (16 * TN with -DGROUPED).
 const QMMG_BN: u32 = 32;
+/// Tokens per workgroup in mla_attn_prefill.comp (its TOKS).
+const MLA_PREFILL_TOKS: u32 = 2;
+
 /// Column tile of the grouped integer-dot kernel (qmm_q8.comp -DGROUPED: TN = 4).
 const QMMQG_BN: u32 = 64;
 
@@ -348,6 +353,7 @@ impl Pipelines {
         .chain(self.qmmq256.iter())
         .chain(self.qmvq.iter())
         .chain(self.attention_prefill_128_f2.iter())
+        .chain(self.mla_attn_prefill_f2.iter())
         .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
         .chain([
@@ -825,7 +831,8 @@ impl VkContext {
                 moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), "moe_group", 2, 12)?,
                 inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), "inkling_kv_store", 4, 44)?,
                 inkling_attn_batch: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_batch.spv")), "inkling_attn_batch", 10, 88)?,
-                mla_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill.spv")), "mla_attn_prefill", 4, 20)?,
+                mla_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill.spv")), "mla_attn_prefill", 4, 24)?,
+                mla_attn_prefill_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill_f2.spv")), "mla_attn_prefill_f2", 4, 24)?) } else { None },
                 inkling_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill.spv")), "inkling_attn_prefill", 10, 92)?,
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
                 attention_prefill_128_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128_f2.spv")), "attention_prefill_128_f2", 4, 40)?) } else { None },
@@ -2065,8 +2072,9 @@ impl<'a> Recorder<'a> {
         assert!(nh.is_multiple_of(8), "mla_attn processes heads in groups of 8 (n_heads = {nh})");
         if self.flash_attn && batch >= 16 && latent == 512 && n_rot == 64 && nh.is_multiple_of(32) {
             // Prefill: flash-style tiles (32 heads of one token share each staged key tile).
-            let pc = [key_dim, nope, pos, kv_layer_off, kq_scale.to_bits()];
-            self.dispatch_raw(&self.ctx.pipelines.mla_attn_prefill, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh / 32, batch, 1);
+            let pc = [key_dim, nope, pos, kv_layer_off, kq_scale.to_bits(), batch];
+            let p = self.ctx.pipelines.mla_attn_prefill_f2.as_ref().unwrap_or(&self.ctx.pipelines.mla_attn_prefill);
+            self.dispatch_raw(p, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh / 32, batch.div_ceil(MLA_PREFILL_TOKS), 1);
             return;
         }
         let max_nt = pos + batch; // longest context in the batch (token b attends pos + b + 1)

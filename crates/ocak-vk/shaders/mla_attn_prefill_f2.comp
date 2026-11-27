@@ -1,0 +1,157 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+#ifdef FDOT2
+// Scores with fp16 x fp16 dot, fp32 accumulate (VK_VALVE_shader_mixed_float_dot_product): Q is
+// kept as packed fp16 (half the registers) and each pair is one instruction instead of two
+// v_fma_mix.
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float fdot2mix(f16vec2 a, f16vec2 b, float c);
+#endif
+// Flash-style MLA (absorbed) attention for prefill batches over the contiguous FP16 latent KV
+// cache (latent = 512, n_rot = 64: rows of 288 packed f16 pairs, value = latent part).
+// Workgroup (head block, token pair) owns heads 32 * wg.x .. +31 of tokens 2 wg.y and 2 wg.y + 1,
+// which attend the same keys (the second one key more). Each step stages a BK-key tile of the cache
+// in shared memory once for all 64 rows. Thread layout: head r = tid / 16; the 16 lanes of a head
+// split the 576 score dims (18 packed pairs each) and the 512 value dims, and every lane computes
+// BOTH tokens of its head, so each shared-memory read feeds two rows (the kernel was
+// LDS-read-heavy: one read per dot pair). Clustered adds over 16 lanes give every lane the scores.
+#define BK 16u
+#define HHD 288u     // packed pairs per cache row (512 latent + 64 rope dims)
+#define HLAT 256u    // packed latent pairs
+#define QW 18u       // score pairs per lane (HHD / 16)
+#define VW 16u       // value pairs per lane (HLAT / 16)
+layout(local_size_x = 512) in;
+layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
+layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
+layout(set = 0, binding = 2) readonly buffer KvCache { uint kvc[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint key_dim;
+    uint nope;
+    uint pos;
+    uint kv_layer_off;
+    float kq_scale;
+    uint batch;
+} pc;
+
+shared uint ks[BK * HHD];
+
+// Without FDOT2 (vec2 Q, two v_fma_mix per pair) this layout spills registers and is much slower
+// (349 vs 485 tok/s): mla_attn_prefill.comp is the fallback.
+#ifdef FDOT2
+#define QT uint
+#define QSET(v) packHalf2x16(v)
+#else
+#define QT vec2
+#define QSET(v) (v)
+#endif
+
+QT load_q(uint qh, uint p) {
+    vec2 v;
+    if (p < HLAT) {
+        uint o2 = qh * 512u + 2u * p;
+        v = vec2(ql[o2], ql[o2 + 1u]);
+    } else {
+        uint o2 = qh * pc.key_dim + pc.nope + 2u * (p - HLAT);
+        v = vec2(qf[o2], qf[o2 + 1u]);
+    }
+    return QSET(v * pc.kq_scale);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint r = tid >> 4;
+    uint sub = tid & 15u;
+    uint nh = gl_NumWorkGroups.x * 32u;
+    uint h = gl_WorkGroupID.x * 32u + r;
+    uint b0 = gl_WorkGroupID.y * 2u;
+    bool valid1 = b0 + 1u < pc.batch;
+    uint b1 = valid1 ? b0 + 1u : b0;
+    uint qh0 = b0 * nh + h, qh1 = b1 * nh + h;
+    uint n_t0 = pc.pos + b0 + 1u;     // token b0's keys; b1 has one more
+    uint n_t1 = pc.pos + b1 + 1u;
+
+    QT q0[QW];
+    QT q1[QW];
+    for (uint e = 0u; e < QW; e++) {
+        q0[e] = load_q(qh0, sub * QW + e);
+        q1[e] = load_q(qh1, sub * QW + e);
+    }
+
+    float m0 = -3.0e38, m1 = -3.0e38;
+    float l0 = 0.0, l1 = 0.0;
+    vec2 acc0[VW];
+    vec2 acc1[VW];
+    for (uint j = 0u; j < VW; j++) { acc0[j] = vec2(0.0); acc1[j] = vec2(0.0); }
+
+    for (uint t0 = 0u; t0 < n_t1; t0 += BK) {
+        for (uint idx = tid; idx < BK * HHD; idx += 512u) {
+            uint t = t0 + idx / HHD;
+            ks[idx] = (t < n_t1) ? kvc[pc.kv_layer_off + t0 * HHD + idx] : 0u;
+        }
+        barrier();
+
+        float s0[BK];
+        float s1[BK];
+        for (uint k = 0u; k < BK; k++) { s0[k] = 0.0; s1[k] = 0.0; }
+        for (uint e = 0u; e < QW; e++) {
+            uint base = sub * QW + e;
+#ifdef FDOT2
+            f16vec2 qa = unpackFloat2x16(q0[e]);
+            f16vec2 qb = unpackFloat2x16(q1[e]);
+            for (uint k = 0u; k < BK; k++) {
+                f16vec2 kv = unpackFloat2x16(ks[k * HHD + base]);
+                s0[k] = fdot2mix(qa, kv, s0[k]);
+                s1[k] = fdot2mix(qb, kv, s1[k]);
+            }
+#else
+            for (uint k = 0u; k < BK; k++) {
+                vec2 kv = unpackHalf2x16(ks[k * HHD + base]);
+                s0[k] += dot(q0[e], kv);
+                s1[k] += dot(q1[e], kv);
+            }
+#endif
+        }
+        float tmax0 = -3.0e38, tmax1 = -3.0e38;
+        for (uint k = 0u; k < BK; k++) {
+            s0[k] = subgroupClusteredAdd(s0[k], 16u);
+            s1[k] = subgroupClusteredAdd(s1[k], 16u);
+            s0[k] = (t0 + k < n_t0) ? s0[k] : -3.0e38;
+            s1[k] = (t0 + k < n_t1) ? s1[k] : -3.0e38;
+            tmax0 = max(tmax0, s0[k]);
+            tmax1 = max(tmax1, s1[k]);
+        }
+        float mn0 = max(m0, tmax0), mn1 = max(m1, tmax1);
+        float a0 = exp(m0 - mn0), a1 = exp(m1 - mn1);
+        l0 *= a0;
+        l1 *= a1;
+        for (uint j = 0u; j < VW; j++) { acc0[j] *= a0; acc1[j] *= a1; }
+        for (uint k = 0u; k < BK; k++) {
+            float p0 = (s0[k] > -1.0e38) ? exp(s0[k] - mn0) : 0.0;
+            float p1 = (s1[k] > -1.0e38) ? exp(s1[k] - mn1) : 0.0;
+            l0 += p0;
+            l1 += p1;
+            for (uint j = 0u; j < VW; j++) {
+                vec2 v = unpackHalf2x16(ks[k * HHD + j * 16u + sub]);
+                acc0[j] += p0 * v;
+                acc1[j] += p1 * v;
+            }
+        }
+        m0 = mn0;
+        m1 = mn1;
+        barrier();
+    }
+
+    float inv0 = 1.0 / l0, inv1 = 1.0 / l1;
+    for (uint j = 0u; j < VW; j++) {
+        uint p = j * 16u + sub;
+        o[qh0 * 512u + 2u * p] = acc0[j].x * inv0;
+        o[qh0 * 512u + 2u * p + 1u] = acc0[j].y * inv0;
+        if (valid1) {
+            o[qh1 * 512u + 2u * p] = acc1[j].x * inv1;
+            o[qh1 * 512u + 2u * p + 1u] = acc1[j].y * inv1;
+        }
+    }
+}

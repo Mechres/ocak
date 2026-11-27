@@ -96,6 +96,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Batched MTP prompt warmup (`warmup_kv_batch`: two uploads + one submit per 128 rows with batched norms / qmm / rope / kv_write, instead of two uploads + a submit per token) | 500-token prompt with MTP on: 308.2 -> 317 tok/s (MTP off: 319.8); same acceptance (75/115 on an 833-token summary) |
 | Readbacks recorded into the compute submit (`Recorder::finish_and_read`) for decode / verify / drafter, and the drafter's inputs written with `vkCmdUpdateBuffer` (`Recorder::update`) instead of separate upload / download submits | Qwen3.8 IQ2_S MTP 51.7 -> ~51.9 tok/s (+0.5%, near noise); plain decode unchanged; output identical (greedy and seeded sampled) |
 | Model load: background sequential read of the file into the page cache when it is not already resident (mincore sample), and pipelined weight uploads (`upload_async`: two staging halves / fences, CPU copy of one tensor overlaps the DMA of the previous) | Qwen3.8 IQ2_S (8.4 GB) cold load 5.2-5.8 -> 4.3 s (disk reads 2.5 GB/s: ~3.4 s floor), warm 1.47 -> 1.15 s |
+| Xing MLA prefill attention: new `mla_attn_prefill_f2.comp` (scores with VK_VALVE mixed-float dot on packed-fp16 Q; 16 lanes per head, each lane computes two consecutive tokens so every shared-memory read feeds two rows; one key tile per token pair); the fallback kernel also shares tiles across 2 tokens | 15.7k-token prompt 481 -> 532.7 tok/s (fallback 488) |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -151,6 +152,9 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit.
 | int8 decode path for Q8_0 matvecs (Inkling's dense Q8_0 tensors, ~290 calls / token on the float kernel) | slower (Inkling decode 24.5 -> 23.8 tok/s) | the float Q8_0 kernel is already cheap per weight; the int8 path adds activation quantization |
 | Load: posix_fadvise(WILLNEED) readahead thread | no change (5.5 s cold) | real sequential reads were needed; on a warm cache a read-ahead pass costs ~110 ms, hence the residency check |
 | Lazy pipeline creation | not needed | VkContext::new (all ~240 pipelines) takes 16-17 ms warm thanks to Mesa's shader cache |
+| MLA prefill: 2 tokens per workgroup alone (halves latent-cache tile loads) | +1% (481 -> 487 tok/s at 15.7k) | not memory-bound: ACO already emits one v_fma_mix per f16 MAC (1088 per key per head), so only fewer MACs or 2-MAC instructions help |
+| MLA prefill 2-rows-per-lane layout without FDOT2 (vec2 Q) | slower (485 -> 349 tok/s) | register spills; kept only for the FDOT2 variant (packed fp16 Q) |
+| Unabsorbed MLA prefill (decompress K/V per layer: 192 + 128 dims per key instead of 576 + 512) | not built | needs a transposed copy of wk_b (IQ4_NL rows of 128; +160 MB as f16, but Xing already keeps 8-12 expert layers in GTT) and per-context decompressed V buffers (~134 MB at 16k) with key-range tiling; estimated ~2x long-prompt prefill if VRAM allowed |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
@@ -177,4 +181,6 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 - Prefill: the per-256 opt-in still converts every block's int32 dot to float; accumulating
   ia * integer weight sub-scale in int32 needs a 24-bit multiply ACO only emits when it can prove
   the operand ranges (otherwise quarter-rate `v_mul_lo_u32`).
-- MLA prefill attention is still ~55% of Xing's long-prompt prefill.
+- MLA prefill attention is still the largest share of Xing's long-prompt prefill (66% at 15.7k
+  tokens before the FDOT2 kernel); the value accumulation (2 v_fma_mix per pair per row) is now
+  the bigger half.
