@@ -1,6 +1,7 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
-layout(local_size_x = 256) in;
+// One 1024-thread workgroup (5 elements per thread for n = 5120: latency-bound otherwise).
+layout(local_size_x = 1024) in;
 layout(set = 0, binding = 0) buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer R { float r[]; };
 layout(set = 0, binding = 2) readonly buffer W { float w[]; };
@@ -13,11 +14,11 @@ layout(push_constant) uniform PC {
     uint n;
     float eps;
 } pc;
-shared float sm[8];
+shared float sm[32];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     float acc = 0.0;
-    for (uint i = tid; i < pc.n; i += 256u) {
+    for (uint i = tid; i < pc.n; i += 1024u) {
         float v = x[pc.x_off + i] + r[pc.r_off + i];
         x[pc.x_off + i] = v;
         acc += v * v;
@@ -25,9 +26,10 @@ void main() {
     float s_sub = subgroupClusteredAdd(acc, 32u);
     if ((tid & 31u) == 0u) sm[tid >> 5] = s_sub;
     barrier();
-    float tot = sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
+    float tot = 0.0;
+    for (uint j = 0u; j < 32u; j++) tot += sm[j];
     float sc = inversesqrt(tot / float(pc.n) + pc.eps);
-    for (uint i = tid; i < pc.n; i += 256u) {
+    for (uint i = tid; i < pc.n; i += 1024u) {
         o[pc.out_off + i] = x[pc.x_off + i] * sc * w[pc.w_off + i];
     }
 }

@@ -1,20 +1,31 @@
 #version 460
 #extension GL_KHR_shader_subgroup_arithmetic : require
+// Argmax (first index of the maximum) in two passes: mode 0 - workgroup g scans its slice and
+// writes (max, index) to part[2g..]; mode 1 - one workgroup reduces the n_parts partials.
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer Out { uint out_idx[]; };
-layout(push_constant) uniform PC { uint x_off; uint n; } pc;
-shared float sm_val[8];
-shared uint sm_idx[8];
+layout(set = 0, binding = 2) buffer Part { uint part[]; };
+layout(push_constant) uniform PC { uint x_off; uint n; uint mode; uint part_off; uint n_parts; } pc;
+shared float sm_val[32];
+shared uint sm_idx[32];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     float best_v = -3.402823466e38;
-    uint best_i = 0u;
-    for (uint i = tid; i < pc.n; i += 256u) {
-        float v = x[pc.x_off + i];
-        if (v > best_v) {
-            best_v = v;
-            best_i = i;
+    uint best_i = 0xFFFFFFFFu;
+    if (pc.mode == 0u) {
+        uint per = (pc.n + gl_NumWorkGroups.x - 1u) / gl_NumWorkGroups.x;
+        uint lo = gl_WorkGroupID.x * per;
+        uint hi = min(pc.n, lo + per);
+        for (uint i = lo + tid; i < hi; i += 256u) {
+            float v = x[pc.x_off + i];
+            if (v > best_v) { best_v = v; best_i = i; }
+        }
+    } else {
+        for (uint g = tid; g < pc.n_parts; g += 256u) {
+            float v = uintBitsToFloat(part[pc.part_off + 2u * g]);
+            uint idx = part[pc.part_off + 2u * g + 1u];
+            if (v > best_v || (v == best_v && idx < best_i)) { best_v = v; best_i = idx; }
         }
     }
     float sg_max = subgroupMax(best_v);
@@ -27,15 +38,16 @@ void main() {
     if (tid == 0u) {
         float bv = sm_val[0];
         uint bi = sm_idx[0];
-        uint n_sg = gl_NumSubgroups;
-        for (uint s = 1u; s < n_sg; s++) {
+        for (uint s = 1u; s < gl_NumSubgroups; s++) {
             float v = sm_val[s];
             uint idx = sm_idx[s];
-            if (v > bv || (v == bv && idx < bi)) {
-                bv = v;
-                bi = idx;
-            }
+            if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
         }
-        out_idx[0] = bi;
+        if (pc.mode == 0u) {
+            part[pc.part_off + 2u * gl_WorkGroupID.x] = floatBitsToUint(bv);
+            part[pc.part_off + 2u * gl_WorkGroupID.x + 1u] = bi;
+        } else {
+            out_idx[0] = bi;
+        }
     }
 }

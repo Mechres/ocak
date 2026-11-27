@@ -813,7 +813,7 @@ impl VkContext {
                 attention_prefill_128_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128_f2.spv")), "attention_prefill_128_f2", 4, 40)?) } else { None },
                 attention_prefill_256_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256_f2.spv")), "attention_prefill_256_f2", 4, 40)?) } else { None },
                 attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), "attention_prefill_256", 4, 40)?,
-                argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 2, 8)?,
+                argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 3, 20)?,
                 sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
                 qmmq: vec![
@@ -1697,8 +1697,22 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn argmax(&mut self, x: &Buffer, x_off: u64, out: &Buffer, n: u32) {
-        let pc = [off_u32(x_off), n];
-        self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf], bytemuck::cast_slice(&pc), 1, 1, 1);
+        // Two passes: partial maxima over up to 128 slices (in the attention scratch), then one
+        // workgroup reduces them (a single workgroup scanning a 200k+ vocabulary took ~250 us).
+        let parts = n.div_ceil(2048).clamp(1, 128);
+        let bytes = parts as u64 * 8;
+        if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+            self.barrier();
+            self.scratch_cursor = 0;
+        }
+        let p_off = off_u32(self.scratch_cursor / 4);
+        self.scratch_cursor += bytes.next_multiple_of(256);
+        let scratch = self.ctx.attn_scratch;
+        let pc0 = [off_u32(x_off), n, 0, p_off, parts];
+        self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc0), parts, 1, 1);
+        self.barrier();
+        let pc1 = [off_u32(x_off), n, 1, p_off, parts];
+        self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc1), 1, 1, 1);
     }
 
     pub fn add(&mut self, a: &Buffer, a_off: u64, b: &Buffer, b_off: u64, n: u32) {
@@ -2660,6 +2674,28 @@ mod tests {
         let mut st_gpu = vec![0f32; st.len()];
         c.download(&b_st, 0, bytemuck::cast_slice_mut(&mut st_gpu)).unwrap();
         for i in 0..st.len() { assert!((st[i] - st_gpu[i]).abs() < 1e-3, "deltanet state[{i}]"); }
+    }
+
+    #[test]
+    fn vk_argmax_first_max() {
+        let c = ctx();
+        let mut rng = Lcg(2024);
+        for &n in &[7usize, 4096, 201_024, 248_320] {
+            let mut x: Vec<f32> = (0..n).map(|_| rng.f() * 10.0).collect();
+            // Tie: the same maximum at two indices -> the lower one wins.
+            let (a, b) = (n / 3, (2 * n) / 3 + 1);
+            x[a] = 50.0;
+            x[b.min(n - 1)] = 50.0;
+            let bx = c.create_device_buffer((n * 4) as u64).unwrap();
+            c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+            let bo = c.create_device_buffer(16).unwrap();
+            let mut rec = c.begin();
+            rec.argmax(&bx, 0, &bo, n as u32);
+            rec.finish_and_wait().unwrap();
+            let mut out = [0u32; 1];
+            c.download(&bo, 0, bytemuck::cast_slice_mut(&mut out)).unwrap();
+            assert_eq!(out[0] as usize, a.min(b.min(n - 1)), "argmax n={n}");
+        }
     }
 
     #[test]

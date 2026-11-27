@@ -1,5 +1,8 @@
 #version 460
-layout(local_size_x = 256) in;
+#extension GL_KHR_shader_subgroup_clustered : require
+// RMS norm of `n`-float rows: o = x * rsqrt(mean(x^2) + eps) * w. Workgroup y = row (batched).
+// 512 threads with a subgroup reduction (no shared-memory tree / barriers per step).
+layout(local_size_x = 512) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer W { float w[]; };
 layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
@@ -12,25 +15,23 @@ layout(push_constant) uniform PC {
     uint stride;      // floats between consecutive input rows (batched: workgroup y = row)
     uint out_stride;  // floats between consecutive output rows
 } pc;
-shared float ssum[256];
+shared float sm[16];
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    // Batched: workgroup y = token, rows of n floats.
     uint xo = pc.x_off + gl_WorkGroupID.y * pc.stride;
     uint oo = pc.out_off + gl_WorkGroupID.y * pc.out_stride;
     float acc = 0.0;
-    for (uint i = tid; i < pc.n; i += 256) {
+    for (uint i = tid; i < pc.n; i += 512u) {
         float v = x[xo + i];
         acc += v * v;
     }
-    ssum[tid] = acc;
+    float s32 = subgroupClusteredAdd(acc, 32u);
+    if ((tid & 31u) == 0u) sm[tid >> 5] = s32;
     barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (tid < s) ssum[tid] += ssum[tid + s];
-        barrier();
-    }
-    float scale = inversesqrt(ssum[0] / float(pc.n) + pc.eps);
-    for (uint i = tid; i < pc.n; i += 256) {
+    float tot = 0.0;
+    for (uint j = 0u; j < 16u; j++) tot += sm[j];
+    float scale = inversesqrt(tot / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 512u) {
         o[oo + i] = x[xo + i] * scale * w[pc.w_off + i];
     }
 }
