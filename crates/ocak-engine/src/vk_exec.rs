@@ -469,11 +469,9 @@ impl Executor for VkExec {
         let w = self.output.as_ref().unwrap_or(&self.embd);
         rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, n as u32);
         rec.barrier();
-        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
         let mut l_all = vec![0f32; n * c.n_vocab];
-        self.ctx.download(&self.logits_buf2, 0, bytemuck::cast_slice_mut(&mut l_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
         let mut h_all = vec![0f32; n * c.n_embd];
-        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        rec.finish_and_read(&mut [(&self.logits_buf2, 0, bytemuck::cast_slice_mut(&mut l_all)), (&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all))]).map_err(|e| EngineError::Backend(e.to_string()))?;
         let ls: Vec<Vec<f32>> = l_all.chunks(c.n_vocab).map(|l| l.to_vec()).collect();
         let hs: Vec<Vec<f32>> = h_all.chunks(c.n_embd).map(|h| h.to_vec()).collect();
         self.hidden.copy_from_slice(&hs[n - 1]);
@@ -514,11 +512,9 @@ impl Executor for VkExec {
             rec.argmax_at(&self.logits_buf2, t as u64 * c.n_vocab as u64, &self.argmax_buf, t, c.n_vocab as u32);
         }
         rec.barrier();
-        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
         let mut idx = vec![0u32; n];
-        self.ctx.download(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)).map_err(|e| EngineError::Backend(e.to_string()))?;
         let mut h_all = vec![0f32; n * c.n_embd];
-        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        rec.finish_and_read(&mut [(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)), (&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_all))]).map_err(|e| EngineError::Backend(e.to_string()))?;
         let hs: Vec<Vec<f32>> = h_all.chunks(c.n_embd).map(|h| h.to_vec()).collect();
         self.hidden.copy_from_slice(&hs[n - 1]);
         Ok(Some((idx, hs)))
@@ -885,18 +881,24 @@ impl VkExec {
                 rec.barrier();
             }
         }
-        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
-
-        if out.hidden {
-            self.ctx.download(&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        }
-        if out.logits {
-            if gpu_argmax {
-                let mut idx = [0u32; 1];
-                self.ctx.download(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)).map_err(|e| EngineError::Backend(e.to_string()))?;
-                return Ok(Some(idx[0]));
+        // Reads recorded into the same submit (no separate download round trips).
+        let mut idx = [0u32; 1];
+        {
+            let mut reads: Vec<(&Buffer, u64, &mut [u8])> = Vec::with_capacity(2);
+            if out.hidden {
+                reads.push((&self.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)));
             }
-            self.ctx.download(&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            if out.logits {
+                if gpu_argmax {
+                    reads.push((&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)));
+                } else {
+                    reads.push((&self.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)));
+                }
+            }
+            rec.finish_and_read(&mut reads).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        if out.logits && gpu_argmax {
+            return Ok(Some(idx[0]));
         }
         Ok(None)
     }

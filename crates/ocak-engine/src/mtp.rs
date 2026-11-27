@@ -426,12 +426,13 @@ impl MtpDrafter {
             let rb = self.embd.row_bytes();
             let r = token as usize;
             dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
-            gp.ctx.upload(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
-            if let Some(h) = h_main {
-                gp.ctx.upload(&gp.h_in, 0, bytemuck::cast_slice(h)).map_err(|e| EngineError::Backend(e.to_string()))?;
-            }
+            // Inputs written inside the same submit (no separate upload round trips).
             let mut rec = gp.ctx.begin();
             rec.set_defer_barriers(true);
+            rec.update(&gp.tok_e, 0, bytemuck::cast_slice(&tok_e));
+            if let Some(h) = h_main {
+                rec.update(&gp.h_in, 0, bytemuck::cast_slice(h));
+            }
             if h_main.is_none() {
                 rec.copy(&gp.h_out, 0, &gp.h_in, 0, ne as u32);
                 rec.barrier();
@@ -481,9 +482,8 @@ impl MtpDrafter {
             rec.barrier();
             rec.argmax(&gp.logits, 0, &gp.argmax_out, c.n_vocab as u32);
             rec.barrier();
-            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
             let mut best = [0u32; 1];
-            gp.ctx.download(&gp.argmax_out, 0, bytemuck::cast_slice_mut(&mut best)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            rec.finish_and_read(&mut [(&gp.argmax_out, 0, bytemuck::cast_slice_mut(&mut best))]).map_err(|e| EngineError::Backend(e.to_string()))?;
             return Ok(best[0]);
         }
         let Some(h_main) = h_main else {

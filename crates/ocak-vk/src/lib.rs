@@ -2428,7 +2428,72 @@ impl<'a> Recorder<'a> {
         self.dispatch_raw(&self.ctx.pipelines.rope_ext, &[q.buf, k.buf, factors.buf], bytemuck::cast_slice(&pc), n_heads + n_kv_heads, batch, 1);
     }
 
+    /// Small host -> device write recorded in this command buffer (vkCmdUpdateBuffer, 64 KB
+    /// chunks) instead of a separate upload submit + fence wait. Offsets / sizes multiple of 4.
+    pub fn update(&mut self, dst: &Buffer, dst_off: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        assert!(dst_off.is_multiple_of(4) && data.len().is_multiple_of(4) && dst_off + data.len() as u64 <= dst.size);
+        self.q8_cache = None;
+        unsafe {
+            let pre = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &pre, &[], &[]);
+            for (i, ch) in data.chunks(65536).enumerate() {
+                self.ctx.device.cmd_update_buffer(self.exec.cmd_buf, dst.buf, dst_off + (i * 65536) as u64, ch);
+            }
+            let post = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            self.ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &post, &[], &[]);
+        }
+    }
+
+    /// finish_and_wait plus device -> host reads recorded at the end of the same command buffer
+    /// (one submit instead of one per `download`). Falls back to separate downloads when the
+    /// reads do not fit the staging buffer.
+    pub fn finish_and_read(self, reads: &mut [(&Buffer, u64, &mut [u8])]) -> Result<(), VkError> {
+        let total: u64 = reads.iter().map(|r| (r.2.len() as u64).next_multiple_of(16)).sum();
+        let ctx = self.ctx;
+        if total > self.exec.staging_cap {
+            self.finish_and_wait()?;
+            for r in reads.iter_mut() {
+                ctx.download(r.0, r.1, r.2)?;
+            }
+            return Ok(());
+        }
+        let mut offs = Vec::with_capacity(reads.len());
+        unsafe {
+            let pre = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+            ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &pre, &[], &[]);
+            let mut so = 0u64;
+            for r in reads.iter() {
+                if !r.2.is_empty() {
+                    assert!(r.1 + r.2.len() as u64 <= r.0.size, "vk read out of bounds");
+                    let region = [vk::BufferCopy::default().src_offset(r.1).dst_offset(so).size(r.2.len() as u64)];
+                    ctx.device.cmd_copy_buffer(self.exec.cmd_buf, r.0.buf, self.exec.staging_buf, &region);
+                }
+                offs.push(so);
+                so += (r.2.len() as u64).next_multiple_of(16);
+            }
+            let host = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)];
+            ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &host, &[], &[]);
+        }
+        let staging = self.exec.staging_ptr as usize;
+        self.end_submit()?;
+        for (r, &o) in reads.iter_mut().zip(&offs) {
+            unsafe { std::ptr::copy_nonoverlapping((staging + o as usize) as *const u8, r.2.as_mut_ptr(), r.2.len()) };
+        }
+        Ok(())
+    }
+
     pub fn finish_and_wait(self) -> Result<(), VkError> {
+        self.end_submit()
+    }
+
+    fn end_submit(&self) -> Result<(), VkError> {
         unsafe {
             self.ctx.device.end_command_buffer(self.exec.cmd_buf)?;
             self.ctx.submit_wait(&self.exec)?;
