@@ -1,0 +1,30 @@
+#version 460
+// Inkling decode attention, merge pass: combine the split partials (m, l, acc[128]) of head h
+// (workgroup) starting from the zero-logit sink (m = 0, l = 1, no value), then apply 1 / l and
+// the sigmoid output gate.
+#define HD 128u
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer Part { float part[]; };
+layout(set = 0, binding = 1) readonly buffer Gate { float gate[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC { uint g_off; uint n_head; uint splits; uint part_off; } pc;
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    float m = 0.0;
+    float l = 1.0;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.splits; s++) {
+        uint base = pc.part_off + (s * pc.n_head + h) * (HD + 2u);
+        float ms = part[base];
+        if (!(ms > -1.0e38)) continue;
+        float mn = max(m, ms);
+        float a = exp(m - mn);
+        float b = exp(ms - mn);
+        l = l * a + part[base + 1u] * b;
+        acc = acc * a + part[base + 2u + d] * b;
+        m = mn;
+    }
+    float gv = 1.0 / (1.0 + exp(-gate[pc.g_off + h * HD + d]));
+    o[h * HD + d] = acc / l * gv;
+}

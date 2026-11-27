@@ -55,6 +55,8 @@ fn main() {
         "rope_yarn_mla",
         "mla_attn",
         "mla_attn_prefill",
+        "inkling_attn_split",
+        "inkling_attn_merge",
         "moe_topk",
         "qmv_iq3_xxs_id",
         "qmv_iq3_s_id",

@@ -98,6 +98,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Model load: background sequential read of the file into the page cache when it is not already resident (mincore sample), and pipelined weight uploads (`upload_async`: two staging halves / fences, CPU copy of one tensor overlaps the DMA of the previous) | Qwen3.8 IQ2_S (8.4 GB) cold load 5.2-5.8 -> 4.3 s (disk reads 2.5 GB/s: ~3.4 s floor), warm 1.47 -> 1.15 s |
 | Xing MLA prefill attention: new `mla_attn_prefill_f2.comp` (scores with VK_VALVE mixed-float dot on packed-fp16 Q; 16 lanes per head, each lane computes two consecutive tokens so every shared-memory read feeds two rows; one key tile per token pair); the fallback kernel also shares tiles across 2 tokens | 15.7k-token prompt 481 -> 532.7 tok/s (fallback 488) |
 | Xing decode: per-head absorbed projections (wk_b, wv_b) as one indexed matvec over the head slices (`qmv_id_batch` with identity ids) instead of 32 dispatches each per layer (2,560 per token) | decode 45.0-45.4 -> 46.2-46.7 tok/s; output identical |
+| Inkling decode attention: split-K (`inkling_kv_store` + `inkling_attn_split` per (kv head, 256-key range) for all 3 query heads of the group, 16 lanes per key with coalesced rows and clustered-add scores incl. the relative-bias term + `inkling_attn_merge` with sink and gate) instead of one workgroup per head walking the whole context (old kernel: `OCAK_INKLING_ATTN_OLD=1`) | decode at 5.7k context 12.6 -> 24.2 tok/s (short context 23.8 -> 24.8); output identical at short context, last-bit differences at long context (current K/V now read back from the fp16 cache) |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -173,8 +174,6 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 
 - MTP prompt warmup still downloads all prompt hidden states (one ~10 MB read) before the
   batched warmup; reading the last 255 rows from the GPU buffer directly would save a few ms.
-- Inkling attention (`inkling_attn.comp`: shared-memory tree reductions, strided K reads, no
-  split-K) is ~3% of decode at short context; matters only for long contexts.
 
 - Prefill: the dqi8 unpackers (qmm_q8 loader) still use single-byte scale loads (Q3_K, Q4_K,
   IQ1_M); the prefill loop is issue-bound, so the gain is likely small.

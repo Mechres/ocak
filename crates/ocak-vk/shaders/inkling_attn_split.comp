@@ -1,0 +1,159 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Inkling decode attention, split-K pass (head_dim 128, n_rel <= 16, group = n_head / n_head_kv
+// <= 4). Workgroup (kv head, split) covers keys [t_start + split * chunk, +chunk) of the current
+// token for all `group` query heads sharing the KV head, so each K/V row is read once for them.
+// 16 lanes per key (8 dims each: coalesced 256-byte rows), 16 keys in flight; scores reduce with
+// clustered adds (the relative-bias term rides along: lane j < n_rel adds rbias[dist][j] * r[j]).
+// Each 16-lane group keeps an online-softmax state; the groups merge in shared memory and the
+// workgroup writes (m, l, acc[128]) per head to part[] for inkling_attn_merge.comp, which adds
+// the zero-logit sink and the sigmoid gate. K/V of the current token are already in the cache
+// (inkling_kv_store.comp).
+#define HD 128u
+#define GMAX 4u
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer R { float r[]; };
+layout(set = 0, binding = 2) readonly buffer Sinks { float sinks[]; };
+layout(set = 0, binding = 3) readonly buffer QClip { float qclip[]; };
+layout(set = 0, binding = 4) readonly buffer RClip { float rclip[]; };
+layout(set = 0, binding = 5) readonly buffer RelBias { float rbias[]; };
+layout(set = 0, binding = 6) readonly buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 7) readonly buffer VCache { uint vcache[]; };
+layout(set = 0, binding = 8) writeonly buffer Part { float part[]; };
+layout(push_constant) uniform PC {
+    uint q_off;
+    uint r_off;
+    uint s_off;
+    uint n_head;
+    uint n_head_kv;
+    uint n_rel;
+    uint n_extent;
+    uint is_swa;
+    uint cap;
+    uint pos;
+    uint kv_slot_off;
+    float qk_clip;
+    float rel_clip;
+    float tau;
+    uint t_start;
+    uint chunk;
+    uint part_off;
+} pc;
+
+shared float sm_m[16 * GMAX];
+shared float sm_l[16 * GMAX];
+shared float sm_acc[16 * GMAX * HD];
+
+void main() {
+    uint kvh = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint grp = tid >> 4;
+    uint sub = tid & 15u;
+    uint group = pc.n_head / pc.n_head_kv;
+    uint half_kv_dim = pc.n_head_kv * (HD / 2u);
+    float tau = (pc.is_swa == 0u) ? pc.tau : 1.0;
+    float scale = inversesqrt(float(HD));
+
+    // Q (this lane's 8 dims per head): clip by qclip, row L2 norm <= qk_clip, times tau / sqrt(hd).
+    // R (lane sub < n_rel): clip by rclip, norm <= rel_clip, times tau.
+    float qv[GMAX][8];
+    float rv[GMAX];
+    float sink[GMAX];
+    for (uint g = 0u; g < GMAX; g++) {
+        uint h = kvh * group + min(g, group - 1u);
+        float ss = 0.0;
+        for (uint d = 0u; d < 8u; d++) {
+            uint i = h * HD + sub * 8u + d;
+            float v = q[pc.q_off + i] * qclip[i];
+            qv[g][d] = v;
+            ss += v * v;
+        }
+        ss = subgroupClusteredAdd(ss, 16u);
+        float qn = sqrt(ss);
+        float qf = ((qn > pc.qk_clip) ? (pc.qk_clip / qn) : 1.0) * tau * scale;
+        for (uint d = 0u; d < 8u; d++) qv[g][d] *= qf;
+        float rr = (sub < pc.n_rel) ? r[pc.r_off + h * pc.n_rel + sub] * rclip[h * pc.n_rel + sub] : 0.0;
+        float rs = subgroupClusteredAdd(rr * rr, 16u);
+        float rn = sqrt(rs);
+        rv[g] = rr * ((rn > pc.rel_clip) ? (pc.rel_clip / rn) : 1.0) * tau;
+        sink[g] = sinks[pc.s_off + h];
+    }
+
+    float m[GMAX];
+    float l[GMAX];
+    vec2 acc[GMAX][4];
+    for (uint g = 0u; g < GMAX; g++) {
+        m[g] = -3.0e38;
+        l[g] = 0.0;
+        for (uint j = 0u; j < 4u; j++) acc[g][j] = vec2(0.0);
+    }
+
+    uint c0 = pc.t_start + split * pc.chunk;
+    uint c1 = min(c0 + pc.chunk, pc.pos + 1u);
+    for (uint tb = c0; tb < c1; tb += 16u) {
+        uint t = tb + grp;
+        bool live = t < c1;
+        uint tt = live ? t : c0;
+        uint sp = (pc.is_swa != 0u) ? (tt % pc.cap) : tt;
+        uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * (HD / 2u) + sub * 4u;
+        vec2 k2[4];
+        vec2 v2[4];
+        for (uint j = 0u; j < 4u; j++) {
+            k2[j] = unpackHalf2x16(kcache[kb + j]);
+            v2[j] = unpackHalf2x16(vcache[kb + j]);
+        }
+        uint dist = pc.pos - tt;
+        float rb = (sub < pc.n_rel && dist < pc.n_extent) ? rbias[dist * pc.n_rel + sub] : 0.0;
+        for (uint g = 0u; g < GMAX; g++) {
+            if (g >= group) break;
+            float part_s = rb * rv[g];
+            for (uint j = 0u; j < 4u; j++) part_s += qv[g][2u * j] * k2[j].x + qv[g][2u * j + 1u] * k2[j].y;
+            float s = subgroupClusteredAdd(part_s, 16u) - sink[g];
+            if (live) {
+                float mn = max(m[g], s);
+                float a = exp(m[g] - mn);
+                float p = exp(s - mn);
+                l[g] = l[g] * a + p;
+                for (uint j = 0u; j < 4u; j++) acc[g][j] = acc[g][j] * a + p * v2[j];
+                m[g] = mn;
+            }
+        }
+    }
+
+    // Merge the 16 groups' states, then write this split's (m, l, acc) per head.
+    for (uint g = 0u; g < GMAX; g++) {
+        if (sub == 0u) {
+            sm_m[grp * GMAX + g] = m[g];
+            sm_l[grp * GMAX + g] = l[g];
+        }
+        for (uint j = 0u; j < 4u; j++) {
+            uint d = sub * 8u + 2u * j;
+            sm_acc[(grp * GMAX + g) * HD + d] = acc[g][j].x;
+            sm_acc[(grp * GMAX + g) * HD + d + 1u] = acc[g][j].y;
+        }
+    }
+    barrier();
+    for (uint i = tid; i < group * HD; i += 256u) {
+        uint g = i / HD;
+        uint d = i % HD;
+        float M = -3.0e38;
+        for (uint q2 = 0u; q2 < 16u; q2++) M = max(M, sm_m[q2 * GMAX + g]);
+        float L = 0.0;
+        float A = 0.0;
+        for (uint q2 = 0u; q2 < 16u; q2++) {
+            float mg = sm_m[q2 * GMAX + g];
+            float w = (mg > -1.0e38) ? exp(mg - M) : 0.0;
+            L += sm_l[q2 * GMAX + g] * w;
+            A += sm_acc[(q2 * GMAX + g) * HD + d] * w;
+        }
+        uint h = kvh * group + g;
+        uint base = pc.part_off + (split * pc.n_head + h) * (HD + 2u);
+        part[base + 2u + d] = A;
+        if (d == 0u) {
+            part[base] = M;
+            part[base + 1u] = L;
+        }
+    }
+}

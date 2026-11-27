@@ -201,6 +201,8 @@ struct Pipelines {
     inkling_attn_batch: PipelineBundle,
     inkling_attn_prefill: PipelineBundle,
     mla_attn_prefill: PipelineBundle,
+    inkling_attn_split: PipelineBundle,
+    inkling_attn_merge: PipelineBundle,
     /// mla_attn_prefill.comp -DFDOT2 (when VK_VALVE_shader_mixed_float_dot_product is present).
     mla_attn_prefill_f2: Option<PipelineBundle>,
     attention_prefill_128: PipelineBundle,
@@ -357,7 +359,7 @@ impl Pipelines {
         .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
         .chain([
-            &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill,
+            &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill, &self.inkling_attn_split, &self.inkling_attn_merge,
             &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8, &self.quant_q8_256, &self.sum_splits,
         ])
         {
@@ -832,6 +834,8 @@ impl VkContext {
                 inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), "inkling_kv_store", 4, 44)?,
                 inkling_attn_batch: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_batch.spv")), "inkling_attn_batch", 10, 88)?,
                 mla_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill.spv")), "mla_attn_prefill", 4, 24)?,
+                inkling_attn_split: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_split.spv")), "inkling_attn_split", 9, 68)?,
+                inkling_attn_merge: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_merge.spv")), "inkling_attn_merge", 3, 16)?,
                 mla_attn_prefill_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill_f2.spv")), "mla_attn_prefill_f2", 4, 24)?) } else { None },
                 inkling_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill.spv")), "inkling_attn_prefill", 10, 92)?,
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
@@ -2323,6 +2327,43 @@ impl<'a> Recorder<'a> {
         n_head: u32, n_head_kv: u32, hd: u32, n_rel: u32, n_extent: u32, n_swa: u32, is_swa: bool,
         cap: u32, pos: u32, kv_slot_off: u32, qk_clip: f32, rel_clip: f32, tau: f32, eps: f32,
     ) {
+        // Split-K path: store K/V (inkling_kv_store), partial attention per (kv head, key range)
+        // for all query heads of the group, merge with sink + gate. The single-kernel version
+        // below runs one workgroup per head over the whole context (decode halved at 5.7k tokens).
+        let group = n_head / n_head_kv.max(1);
+        if hd == 128 && n_rel <= 16 && n_head.is_multiple_of(n_head_kv) && (1..=4).contains(&group) && std::env::var("OCAK_INKLING_ATTN_OLD").is_err() {
+            let t_start = if is_swa && pos + 1 > n_swa { pos + 1 - n_swa } else { 0 };
+            let t_len = pos + 1 - t_start;
+            let splits = t_len.div_ceil(256).clamp(1, 32);
+            let chunk = t_len.div_ceil(splits);
+            let splits = t_len.div_ceil(chunk);
+            let part_floats = (splits * n_head * (hd + 2)) as u64;
+            if part_floats * 4 <= ATTN_SCRATCH_BYTES {
+                let bytes = part_floats * 4;
+                if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+                    self.barrier();
+                    self.scratch_cursor = 0;
+                }
+                let part_off = off_u32(self.scratch_cursor / 4);
+                self.scratch_cursor += bytes;
+                let scratch = self.ctx.attn_scratch;
+                self.inkling_kv_store(k_cur, 0, v_cur, 0, k_cache, v_cache, n_head_kv * hd, n_head_kv, hd, is_swa, cap, pos, kv_slot_off, qk_clip, eps, 1);
+                self.barrier();
+                let pc = [
+                    q_off, r_off, s_off, n_head, n_head_kv, n_rel, n_extent, is_swa as u32, cap, pos, kv_slot_off,
+                    qk_clip.to_bits(), rel_clip.to_bits(), tau.to_bits(), t_start, chunk, part_off,
+                ];
+                self.dispatch_raw(
+                    &self.ctx.pipelines.inkling_attn_split,
+                    &[q.buf, r.buf, sinks.buf, q_clip.buf, r_clip.buf, r_bias.buf, k_cache.buf, v_cache.buf, scratch],
+                    bytemuck::cast_slice(&pc), n_head_kv, splits, 1,
+                );
+                self.barrier();
+                let pcm = [g_off, n_head, splits, part_off];
+                self.dispatch_raw(&self.ctx.pipelines.inkling_attn_merge, &[scratch, gate.buf, out.buf], bytemuck::cast_slice(&pcm), n_head, 1, 1);
+                return;
+            }
+        }
         let pc = [
             q_off, r_off, s_off, g_off, n_head, n_head_kv, hd, n_rel, n_extent, n_swa, is_swa as u32,
             cap, pos, kv_slot_off, qk_clip.to_bits(), rel_clip.to_bits(), tau.to_bits(), eps.to_bits(),
