@@ -49,6 +49,7 @@ layout(local_size_x = 32, local_size_y = RPW) in;
 layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(set = 0, binding = 0) readonly buffer W32 { uint w32[]; };
 layout(set = 0, binding = 1) readonly buffer XQ { uvec2 xq2[]; };
+layout(set = 0, binding = 1) readonly buffer XQ4 { uvec4 xq4[]; };
 layout(set = 0, binding = 2) readonly buffer XS { vec4 xsc[]; };
 layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
 layout(set = 0, binding = 4) readonly buffer T { uint tbl[]; };
@@ -72,6 +73,32 @@ void main() {
     if (row < pc.m) {
         uint rb = pc.w_off + row * pc.row_bytes;
         uint kblocks = pc.k >> 5;
+#ifdef HAS_DQI32
+        // Block-level decode: a lane handles one 32-weight block per step (one address / scale
+        // computation and two loads per block) - decode is instruction-bound.
+        for (uint blk = tid; blk < kblocks; blk += 32u) {
+            uint q[8];
+            vec4 dm;
+            dqi32(rb, blk, q, dm);
+            for (uint t = 0u; t < MAXB; t++) {
+                if (t < pc.batch) {
+                    uint xb = t * kblocks + blk;
+                    uvec4 xa = xq4[pc.q_off2 / 2u + xb * 2u];
+                    uvec4 xc = xq4[pc.q_off2 / 2u + xb * 2u + 1u];
+                    int i0 = dotPacked4x8EXT(int(q[0]), int(xa.x)) + dotPacked4x8EXT(int(q[1]), int(xa.y))
+                           + dotPacked4x8EXT(int(q[2]), int(xa.z)) + dotPacked4x8EXT(int(q[3]), int(xa.w));
+                    int i1 = dotPacked4x8EXT(int(q[4]), int(xc.x)) + dotPacked4x8EXT(int(q[5]), int(xc.y))
+                           + dotPacked4x8EXT(int(q[6]), int(xc.z)) + dotPacked4x8EXT(int(q[7]), int(xc.w));
+                    vec4 xs = xsc[pc.s_off + xb];   // (dx, dx * sum(qx[0..16]), dx * sum(qx[16..32]), -)
+#ifdef HAS_MIN
+                    acc[t] += xs.x * (dm.x * float(i0) + dm.y * float(i1)) - (dm.z * xs.y + dm.w * xs.z);
+#else
+                    acc[t] += xs.x * (dm.x * float(i0) + dm.y * float(i1));
+#endif
+                }
+            }
+        }
+#else
         for (uint k0 = tid * 8u; k0 < pc.k; k0 += 256u) {
             uint q0, q1;
             float d, mn;
@@ -93,6 +120,7 @@ void main() {
                 }
             }
         }
+#endif
     }
     for (uint t = 0u; t < MAXB; t++) {
         float r = subgroupClusteredAdd(acc[t], 32u);

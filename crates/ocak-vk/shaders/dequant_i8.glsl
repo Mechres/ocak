@@ -25,7 +25,7 @@ uint bytes4(uint o) {
 // bytes with the bit set become 256 - g (two's complement), with no carry between bytes.
 uint apply_signs4(uint g, uint bits) {
     uint m = ((bits & 0xFu) * 0x00204081u) & 0x01010101u;   // bit j -> bit 0 of byte j
-    return (g ^ (m * 0xFFu)) + m;
+    return (g ^ ((m << 8) - m)) + m;                         // (m << 8) - m == m * 0xFF
 }
 // Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
 uint sub_bytes(uint x, uint c) { return ((x | 0x80808080u) - c) ^ 0x80808080u; }
@@ -269,3 +269,220 @@ void dqi8(uint rb, uint k0, out uint q0, out uint q1, out float d, out float m) 
 #error "dequant_i8.glsl: unsupported weight format"
 #endif
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// dqi32(rb, blk, q, dm): whole 32-weight block `blk` of the row at rb for the decode matvec:
+// weights = d_h * q[i] - m_h with h = i / 4 (16-weight halves), dm = (d0, d1, m0, m1).
+// One address / scale computation and a few wide loads per block (decode is instruction-bound).
+#if defined(IQ2_XXS) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ3_XXS) || defined(IQ3_S) || defined(IQ1_S) || defined(IQ1_M) || defined(Q4_K) || defined(Q5_K) || defined(Q6_K) || defined(Q2_K) || defined(Q3_K) || defined(IQ4_XS)
+#define HAS_DQI32
+// 1 -> 4 bytes expansion helpers
+uint byte_of(uint w4, uint i) { return (w4 >> (8u * i)) & 0xFFu; }
+void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
+    uint ib = blk & 7u;            // 32-block within the 256-weight superblock
+#if defined(IQ2_XXS)
+    uint b = rb + (blk >> 3) * 66u;
+    uint o = b + 2u + ib * 8u;
+    uint a0 = bytes4(o), a1 = bytes4(o + 4u);
+    float d = f16at(b) * (0.5 + float(a1 >> 28)) * 0.25;
+    for (uint l = 0u; l < 4u; l++) {
+        uint gidx = byte_of(a0, l);
+        uint sg = TBL(1792u + ((a1 >> (7u * l)) & 127u));
+        q[2u * l] = apply_signs4(TBL(1936u + 2u * gidx), sg);
+        q[2u * l + 1u] = apply_signs4(TBL(1936u + 2u * gidx + 1u), sg >> 4);
+    }
+    dm = vec4(d, d, 0.0, 0.0);
+#elif defined(IQ2_XS)
+    uint b = rb + (blk >> 3) * 74u;
+    uint o = b + 2u + ib * 8u;
+    uint w0 = bytes4(o), w1 = bytes4(o + 4u);
+    uint sc = uint(w[b + 66u + ib]);
+    float d = f16at(b) * 0.25;
+    for (uint l = 0u; l < 4u; l++) {
+        uint qq = ((l < 2u) ? (w0 >> (16u * l)) : (w1 >> (16u * (l - 2u)))) & 0xFFFFu;
+        uint gidx = qq & 511u;
+        uint sg = TBL(1792u + (qq >> 9));
+        q[2u * l] = apply_signs4(TBL(2u * gidx), sg);
+        q[2u * l + 1u] = apply_signs4(TBL(2u * gidx + 1u), sg >> 4);
+    }
+    dm = vec4(d * (0.5 + float(sc & 0xFu)), d * (0.5 + float(sc >> 4)), 0.0, 0.0);
+#elif defined(IQ2_S)
+    uint b = rb + (blk >> 3) * 82u;
+    uint qs = bytes4(b + 2u + ib * 4u);
+    uint sgw = bytes4(b + 34u + ib * 4u);
+    uint qhb = uint(w[b + 66u + ib]);
+    uint sc = uint(w[b + 74u + ib]);
+    float d = f16at(b) * 0.25;
+    for (uint l = 0u; l < 4u; l++) {
+        uint gidx = byte_of(qs, l) | ((qhb << (8u - 2u * l)) & 0x300u);
+        uint sg = byte_of(sgw, l);
+        q[2u * l] = apply_signs4(TBL(2448u + 2u * gidx), sg);
+        q[2u * l + 1u] = apply_signs4(TBL(2448u + 2u * gidx + 1u), sg >> 4);
+    }
+    dm = vec4(d * (0.5 + float(sc & 0xFu)), d * (0.5 + float(sc >> 4)), 0.0, 0.0);
+#elif defined(IQ3_XXS)
+    uint b = rb + (blk >> 3) * 98u;
+    uint o = b + 2u + ib * 8u;
+    uint w0 = bytes4(o), w1 = bytes4(o + 4u);
+    uint aux32 = bytes4(b + 66u + ib * 4u);
+    float d = f16at(b) * (0.5 + float(aux32 >> 28)) * 0.5;
+    for (uint l = 0u; l < 4u; l++) {
+        uint ww = (l < 2u) ? w0 : w1;
+        uint sh = 16u * (l & 1u);
+        uint sg = TBL(1792u + ((aux32 >> (7u * l)) & 127u));
+        q[2u * l] = apply_signs4(TBL(1024u + ((ww >> sh) & 0xFFu)), sg);
+        q[2u * l + 1u] = apply_signs4(TBL(1024u + ((ww >> (sh + 8u)) & 0xFFu)), sg >> 4);
+    }
+    dm = vec4(d, d, 0.0, 0.0);
+#elif defined(IQ3_S)
+    uint b = rb + (blk >> 3) * 110u;
+    uint o = b + 2u + ib * 8u;
+    uint w0 = bytes4(o), w1 = bytes4(o + 4u);
+    uint sgw = bytes4(b + 74u + ib * 4u);
+    uint qh = uint(w[b + 66u + ib]);
+    uint sc = uint(w[b + 106u + (ib >> 1)]);
+    float d = f16at(b) * float(1u + 2u * (((ib & 1u) == 0u) ? (sc & 0xFu) : (sc >> 4)));
+    for (uint l = 0u; l < 4u; l++) {
+        uint ww = (l < 2u) ? w0 : w1;
+        uint sh = 16u * (l & 1u);
+        uint i1 = ((ww >> sh) & 0xFFu) | ((qh << (8u - 2u * l)) & 256u);
+        uint i2 = ((ww >> (sh + 8u)) & 0xFFu) | ((qh << (7u - 2u * l)) & 256u);
+        uint sg = byte_of(sgw, l);
+        q[2u * l] = apply_signs4(TBL(1280u + i1), sg);
+        q[2u * l + 1u] = apply_signs4(TBL(1280u + i2), sg >> 4);
+    }
+    dm = vec4(d, d, 0.0, 0.0);
+#elif defined(IQ1_S)
+    uint b = rb + (blk >> 3) * 50u;
+    uint qs = bytes4(b + 2u + ib * 4u);
+    uint qhb = uint(w[b + 34u + 2u * ib]) | (uint(w[b + 35u + 2u * ib]) << 8);
+    float d = f16at(b) * float(2u * ((qhb >> 12) & 7u) + 1u) * 0.125;
+    uint c = ((qhb & 0x8000u) != 0u) ? 0x09090909u : 0x07070707u;
+    for (uint l = 0u; l < 4u; l++) {
+        uint gidx = byte_of(qs, l) | (((qhb >> (3u * l)) & 7u) << 8);
+        uint glo = TBL(4496u + 2u * gidx), ghi = TBL(4496u + 2u * gidx + 1u);
+        uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
+        uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
+        q[2u * l] = sub_bytes(g1lo << 3, c);
+        q[2u * l + 1u] = sub_bytes(g1hi << 3, c);
+    }
+    dm = vec4(d, d, 0.0, 0.0);
+#elif defined(IQ1_M)
+    uint b = rb + (blk >> 3) * 56u;
+    uint qs = bytes4(b + ib * 4u);
+    uint sc0 = uint(w[b + 48u]) | (uint(w[b + 49u]) << 8);
+    uint sc1 = uint(w[b + 50u]) | (uint(w[b + 51u]) << 8);
+    uint sc2 = uint(w[b + 52u]) | (uint(w[b + 53u]) << 8);
+    uint sc3 = uint(w[b + 54u]) | (uint(w[b + 55u]) << 8);
+    float dsup = unpackHalf2x16((sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u)).x;
+    uint s16 = (ib < 2u) ? sc0 : ((ib < 4u) ? sc1 : ((ib < 6u) ? sc2 : sc3));
+    uint ssh = 6u * (ib & 1u);
+    uint qb0 = uint(w[b + 32u + ib * 2u]), qb1 = uint(w[b + 33u + ib * 2u]);
+    for (uint l = 0u; l < 4u; l++) {
+        uint qb = (l < 2u) ? qb0 : qb1;
+        uint hi = (l & 1u) == 0u ? ((qb << 8) & 0x700u) : ((qb << 4) & 0x700u);
+        uint gidx = byte_of(qs, l) | hi;
+        bool neg = (qb & ((l & 1u) == 0u ? 0x08u : 0x80u)) != 0u;
+        uint c = neg ? 0x09090909u : 0x07070707u;
+        uint glo = TBL(4496u + 2u * gidx), ghi = TBL(4496u + 2u * gidx + 1u);
+        uint g1lo = 0x01010101u + (glo & 0x01010101u) - (((glo >> 1) & 0x01010101u) << 1);
+        uint g1hi = 0x01010101u + (ghi & 0x01010101u) - (((ghi >> 1) & 0x01010101u) << 1);
+        q[2u * l] = sub_bytes(g1lo << 3, c);
+        q[2u * l + 1u] = sub_bytes(g1hi << 3, c);
+    }
+    dm = vec4(dsup * float(2u * ((s16 >> ssh) & 7u) + 1u), dsup * float(2u * ((s16 >> (ssh + 3u)) & 7u) + 1u), 0.0, 0.0) * 0.125;
+#elif defined(IQ4_XS)
+    uint b = rb + (blk >> 3) * 136u;
+    uint shb = uint(w[b + 2u]) | (uint(w[b + 3u]) << 8);
+    uint sl = uint(w[b + 4u + ib / 2u]);
+    int ls = int((sl >> (4u * (ib & 1u))) & 0xFu) | int(((shb >> (2u * ib)) & 3u) << 4);
+    float d = f16at(b) * float(ls - 32);
+    uint qo = (b + 8u + ib * 16u) >> 2;   // 136-byte superblocks: 4-byte aligned
+    for (uint wv = 0u; wv < 4u; wv++) {
+        uint ww = w32[qo + wv];
+        // bytes 4wv..4wv+3 hold weights 4wv.. (low nibble) and 16 + 4wv.. (high nibble)
+        q[wv] = pack4(int(TBL(1920u + (ww & 0xFu))), int(TBL(1920u + ((ww >> 8) & 0xFu))),
+                      int(TBL(1920u + ((ww >> 16) & 0xFu))), int(TBL(1920u + ((ww >> 24) & 0xFu))));
+        q[wv + 4u] = pack4(int(TBL(1920u + ((ww >> 4) & 0xFu))), int(TBL(1920u + ((ww >> 12) & 0xFu))),
+                           int(TBL(1920u + ((ww >> 20) & 0xFu))), int(TBL(1920u + (ww >> 28))));
+    }
+    dm = vec4(d, d, 0.0, 0.0);
+#elif defined(Q4_K) || defined(Q5_K)
+#if defined(Q4_K)
+    uint b = rb + (blk >> 3) * 144u;
+#else
+    uint b = rb + (blk >> 3) * 176u;
+#endif
+    uint j = ib;
+    uint sb = b + 4u;
+    uint sc, mn;
+    if (j < 4u) {
+        sc = uint(w[sb + j]) & 63u;
+        mn = uint(w[sb + j + 4u]) & 63u;
+    } else {
+        sc = (uint(w[sb + j + 4u]) & 0xFu) | ((uint(w[sb + j - 4u]) >> 6) << 4);
+        mn = (uint(w[sb + j + 4u]) >> 4) | ((uint(w[sb + j]) >> 6) << 4);
+    }
+    uint dd = w32[b >> 2];
+    float d = unpackHalf2x16(dd).x * float(sc);
+    float m = unpackHalf2x16(dd >> 16).x * float(mn);
+    uint sh = (j & 1u) * 4u;
+#if defined(Q4_K)
+    uint qo = (b + 16u + (j >> 1) * 32u) >> 2;
+    for (uint wv = 0u; wv < 8u; wv++) q[wv] = (w32[qo + wv] >> sh) & 0x0F0F0F0Fu;
+#else
+    uint qo = (b + 48u + (j >> 1) * 32u) >> 2;
+    uint ho = (b + 16u) >> 2;
+    for (uint wv = 0u; wv < 8u; wv++)
+        q[wv] = ((w32[qo + wv] >> sh) & 0x0F0F0F0Fu) | (((w32[ho + wv] >> j) & 0x01010101u) << 4);
+#endif
+    dm = vec4(d, d, m, m);
+#elif defined(Q6_K)
+    uint b = rb + (blk >> 3) * 210u;
+    uint half_ = ib >> 2;
+    uint g = ib & 3u;
+    uint qlo = b + half_ * 64u + (g & 1u) * 32u;
+    uint qho = b + 128u + half_ * 32u;
+    uint sl = (g >> 1) * 4u;
+    uint sh = g * 2u;
+    for (uint wv = 0u; wv < 8u; wv++) {
+        uint u = ((bytes4(qlo + 4u * wv) >> sl) & 0x0F0F0F0Fu) | (((bytes4(qho + 4u * wv) >> sh) & 0x03030303u) << 4);
+        q[wv] = sub_bytes(u, 0x20202020u);
+    }
+    float d = f16at(b + 208u);
+    uint so = b + 192u + half_ * 8u + 2u * g;
+    dm = vec4(d * float(int8_t(w[so])), d * float(int8_t(w[so + 1u])), 0.0, 0.0);
+#elif defined(Q2_K)
+    uint b = rb + (blk >> 3) * 84u;
+    uint half_ = ib >> 2;
+    uint g = ib & 3u;
+    uint s0 = uint(w[b + half_ * 8u + 2u * g]), s1 = uint(w[b + half_ * 8u + 2u * g + 1u]);
+    uint qo = (b + 16u + half_ * 32u) >> 2;
+    for (uint wv = 0u; wv < 8u; wv++) q[wv] = ((w32[qo + wv] >> (2u * g)) & 0x03030303u) * ((wv < 4u) ? (s0 & 0xFu) : (s1 & 0xFu));
+    uint dd = w32[(b + 80u) >> 2];
+    float d = unpackHalf2x16(dd).x, dmin = unpackHalf2x16(dd >> 16).x;
+    dm = vec4(d, d, dmin * float(s0 >> 4), dmin * float(s1 >> 4));
+#elif defined(Q3_K)
+    uint b = rb + (blk >> 3) * 110u;
+    uint half_ = ib >> 2;
+    uint g = ib & 3u;
+    uint qo = b + 32u + half_ * 32u;
+    uint hs = half_ * 4u + g;
+    for (uint wv = 0u; wv < 8u; wv++) {
+        uint lo = (bytes4(qo + 4u * wv) >> (2u * g)) & 0x03030303u;
+        uint hm = (bytes4(b + 4u * wv) >> hs) & 0x01010101u;
+        q[wv] = sub_bytes(lo | (hm << 2), 0x04040404u);
+    }
+    float d = f16at(b + 108u);
+    float dh[2];
+    for (uint h = 0u; h < 2u; h++) {
+        uint is = half_ * 8u + 2u * g + h;
+        uint lo4 = (is < 8u) ? (uint(w[b + 96u + is]) & 0xFu) : (uint(w[b + 96u + is - 8u]) >> 4);
+        uint hi2 = (uint(w[b + 104u + (is & 3u)]) >> (2u * (is >> 2))) & 3u;
+        dh[h] = d * float(int(lo4 | (hi2 << 4)) - 32);
+    }
+    dm = vec4(dh[0], dh[1], 0.0, 0.0);
+#endif
+}
+#endif
