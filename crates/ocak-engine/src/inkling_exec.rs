@@ -36,12 +36,17 @@ struct MoEExps {
 }
 
 /// Tokens per batched-prefill chunk.
-const INK_PB: usize = 256;
+/// Batched-prefill chunk sizes, largest first. Bigger chunks give each MoE expert more tokens
+/// per weight pass (128 experts, top-8: 16 tokens per expert at 256, 128 at 2048), but the
+/// activation buffers cost ~0.8 MB per token, so the size is picked from free VRAM at load.
+const INK_PB_CHOICES: [usize; 4] = [2048, 1024, 512, 256];
+/// VRAM kept free beyond the KV cache and prefill buffers (transient / desktop allocations).
+const INK_PB_VRAM_MARGIN: u64 = 512 << 20;
 /// Layer passes recorded per queue submit during batched prefill (TDR safety).
 const INK_LAYERS_PER_SUBMIT: usize = 4;
 
-/// Activation buffers for batched prefill, sized for INK_PB tokens. Multi-part buffers are
-/// laid out part-major ([part][INK_PB][dim]) so every part is a contiguous token batch.
+/// Activation buffers for batched prefill, sized for `pb` tokens. Multi-part buffers are
+/// laid out part-major ([part][pb][dim]) so every part is a contiguous token batch.
 struct InklingBatch {
     cur: Buffer,
     inp_sa: Buffer,
@@ -274,6 +279,8 @@ pub struct InklingExec {
     /// Batched-prefill buffers, allocated on first use (None if allocation failed).
     batch: Option<InklingBatch>,
     batch_tried: bool,
+    /// Batched-prefill chunk size (tokens), chosen at load from free VRAM.
+    pb: usize,
     hidden: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -485,6 +492,7 @@ impl InklingExec {
         let output_w = load_mat(&g, vk.as_ref(), "output.weight", vk.is_some())?;
 
         let gpu_moe_limit = if vk.is_some() { n_phys.saturating_sub(n_cpu_moe) } else { 0 };
+        let mut pb = INK_PB_CHOICES[INK_PB_CHOICES.len() - 1];
         let mut gpu_moe_count = 0usize;
         let mut cpu_moe_count = 0usize;
         let mut phys = Vec::with_capacity(n_phys);
@@ -693,14 +701,16 @@ impl InklingExec {
                     });
                 }
                 let kv_dim = phys[0].n_head_kv * head_dim;
+                pb = pick_prefill_chunk(&phys, n_slot, n_phys, core_start, core_end, n_embd, kv_dim, head_dim, n_expert, n_expert_used, n_ff_exp, max_ctx, n_swa, &g);
+                eprintln!("ocak: inkling batched prefill chunk: {pb} tokens");
                 let mut slot_kv_offsets = Vec::with_capacity(n_slot);
                 let mut slot_caps = Vec::with_capacity(n_slot);
                 let mut total_kv_u32 = 0usize;
                 for il in 0..n_slot {
                     let ip = if il < n_phys { il } else { core_start + (il - n_phys) % (core_end - core_start) };
-                    // A batched prefill chunk writes INK_PB keys before attending, so the SWA ring
+                    // A batched prefill chunk writes pb keys before attending, so the SWA ring
                     // must hold the window plus a full chunk.
-                    let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16 + INK_PB) } else { max_ctx };
+                    let cap = if phys[ip].is_swa { max_ctx.min(n_swa + 16 + pb) } else { max_ctx };
                     slot_kv_offsets.push(total_kv_u32 as u32);
                     slot_caps.push(cap as u32);
                     total_kv_u32 += cap * (kv_dim / 2);
@@ -781,6 +791,7 @@ impl InklingExec {
             gpu_x, gpu_y, gpu_gu, gpu_mid, gpu_sum, gpu_moe_count, cpu_moe_count, gpu_pipe,
             batch: None,
             batch_tried: false,
+            pb,
             hidden: vec![0f32; n_embd],
             logits: vec![0f32; n_vocab_unpadded],
         })
@@ -1333,10 +1344,73 @@ impl InklingExec {
     }
 }
 
+/// Floats per token across the `InklingBatch` buffers (ctrl rank bounded by 256).
+fn batch_floats_per_token(phys: &[PhysLayer], ne: usize, kv_dim: usize, head_dim: usize, n_expert: usize, nu: usize, n_ff: usize) -> usize {
+    let n_head_max = phys.iter().map(|p| p.n_head).max().unwrap_or(1);
+    let proj_max = phys.iter().map(proj_total).max().unwrap_or(1);
+    ne * 68 + 3 * 256 + proj_max + 2 * kv_dim + n_head_max * head_dim + 2 * n_expert + 2 * nu + nu * 3 * n_ff + nu * ne
+}
+
+/// VRAM staging for GTT-resident experts: the largest such layer's gate/up and down tensors.
+fn expert_stage_bytes(g: &GgufFile, phys: &[PhysLayer]) -> u64 {
+    let (mut gu_max, mut dn_max) = (0u64, 0u64);
+    for p in phys.iter().filter(|p| p.exps.gtt) {
+        if let (Some(tg), Some(td)) = (g.tensor(&p.exps.gu_name), g.tensor(&p.exps.dn_name)) {
+            gu_max = gu_max.max(tg.n_bytes);
+            dn_max = dn_max.max(td.n_bytes);
+        }
+    }
+    gu_max + dn_max
+}
+
+/// VRAM currently free, minus the safety margin (None without amdgpu telemetry).
+fn vram_free_after_margin() -> Option<u64> {
+    let tel = ocak_sysfs::amdgpu::discover_amd_gpu()?.telemetry();
+    if tel.vram_total_bytes == 0 {
+        return None;
+    }
+    Some(tel.vram_total_bytes.saturating_sub(tel.vram_used_bytes).saturating_sub(INK_PB_VRAM_MARGIN))
+}
+
+/// Largest batched-prefill chunk for which the KV cache (SWA rings grow with the chunk) and the
+/// activation buffers (see `InklingExec::ensure_batch`) fit in the VRAM still free after the
+/// weights, with a safety margin.
+/// `OCAK_PREFILL_CHUNK` overrides it (rounded to one of the supported sizes).
+#[allow(clippy::too_many_arguments)]
+fn pick_prefill_chunk(
+    phys: &[PhysLayer], n_slot: usize, n_phys: usize, core_start: usize, core_end: usize,
+    ne: usize, kv_dim: usize, head_dim: usize, n_expert: usize, nu: usize, n_ff: usize, max_ctx: usize, n_swa: usize,
+    gguf: &GgufFile,
+) -> usize {
+    let smallest = INK_PB_CHOICES[INK_PB_CHOICES.len() - 1];
+    if let Some(v) = std::env::var("OCAK_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return INK_PB_CHOICES.iter().copied().find(|&c| c <= v).unwrap_or(smallest);
+    }
+    let Some(free) = vram_free_after_margin() else { return smallest };
+    let per_tok = batch_floats_per_token(phys, ne, kv_dim, head_dim, n_expert, nu, n_ff);
+    let free = free.saturating_sub(expert_stage_bytes(gguf, phys));
+    let is_swa = |il: usize| {
+        let ip = if il < n_phys { il } else { core_start + (il - n_phys) % (core_end - core_start).max(1) };
+        phys[ip].is_swa
+    };
+    // FP16 K + V cache for chunk size c (same caps as InklingExec::new).
+    let kv_bytes = |c: usize| -> u64 {
+        (0..n_slot)
+            .map(|il| if is_swa(il) { max_ctx.min(n_swa + 16 + c) } else { max_ctx })
+            .map(|cap| (cap * kv_dim * 2 * 2) as u64)
+            .sum()
+    };
+    INK_PB_CHOICES
+        .iter()
+        .copied()
+        .find(|&c| c as u64 * per_tok as u64 * 4 + kv_bytes(c) <= free)
+        .unwrap_or(smallest)
+}
+
 /// Float offsets of the per-projection regions in `InklingBatch::proj` for one physical layer:
-/// (q, k, v, r, sinks, gate, k_dyn, v_dyn), each region INK_PB rows of that projection's width.
-fn proj_regions(p: &PhysLayer) -> [u64; 8] {
-    let pbm = |m: usize| (INK_PB * m) as u64;
+/// (q, k, v, r, sinks, gate, k_dyn, v_dyn), each region `pb` rows of that projection's width.
+fn proj_regions(p: &PhysLayer, pb: usize) -> [u64; 8] {
+    let pbm = |m: usize| (pb * m) as u64;
     let o_q = 0u64;
     let o_k = o_q + pbm(p.wq.m);
     let o_v = o_k + pbm(p.wk.m);
@@ -1367,7 +1441,21 @@ impl InklingExec {
         }
         self.batch_tried = true;
         let (Some(c), Some(gp)) = (&self.vk, &self.gpu_pipe) else { return false };
-        let pb = INK_PB;
+        // Re-check against the VRAM actually free now (KV cache and all weights allocated); the
+        // load-time choice is an upper bound (it sized the SWA rings).
+        if std::env::var("OCAK_PREFILL_CHUNK").is_err() {
+            if let Some(free) = vram_free_after_margin() {
+                let free = free.saturating_sub(expert_stage_bytes(&self.gguf, &self.phys));
+                let per_tok = batch_floats_per_token(&self.phys, self.n_embd, gp.kv_dim, self.head_dim, self.n_expert, self.n_expert_used, self.n_ff_exp) as u64 * 4;
+                let smallest = INK_PB_CHOICES[INK_PB_CHOICES.len() - 1];
+                let fit = INK_PB_CHOICES.iter().copied().find(|&c| c <= self.pb && c as u64 * per_tok <= free).unwrap_or(smallest);
+                if fit < self.pb {
+                    eprintln!("ocak: inkling batched prefill chunk reduced to {fit} tokens (free VRAM)");
+                    self.pb = fit;
+                }
+            }
+        }
+        let pb = self.pb;
         let ne = self.n_embd;
         let nu = self.n_expert_used;
         let rank = gp.ctrl_rank as usize;
@@ -1449,7 +1537,7 @@ impl InklingExec {
         let hd = self.head_dim as u32;
         let kv_dim = gp.kv_dim as u32;
         let nh_hist = (self.n_conv - 1) as u32;
-        let pb = INK_PB as u32;
+        let pb = self.pb as u32;
         let b = nb as u32;
         let part = (pb * ne) as u64; // floats between parts of a multi-part buffer
         let n = b * ne; // floats in the active token batch
@@ -1515,7 +1603,7 @@ impl InklingExec {
         rec.barrier();
 
         // 4. Projections (each into its own [PB][m] region)
-        let [o_q, o_k, o_v, o_r, o_s, o_g, o_kd, o_vd] = proj_regions(p);
+        let [o_q, o_k, o_v, o_r, o_s, o_g, o_kd, o_vd] = proj_regions(p, self.pb);
         let (bq, wtq) = p.wq.gpu.as_ref().unwrap();
         let (bk, wtk) = p.wk.gpu.as_ref().unwrap();
         let (bv, wtv) = p.wv.gpu.as_ref().unwrap();
@@ -1654,7 +1742,7 @@ impl InklingExec {
         rec.barrier();
     }
 
-    /// Batched GPU prefill of up to INK_PB tokens at positions pos0..
+    /// Batched GPU prefill of up to `pb` tokens at positions pos0..
     fn forward_batch_gpu(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
         let nb = chunk.len();
         let ne = self.n_embd;
@@ -1672,7 +1760,7 @@ impl InklingExec {
         };
         let ne32 = ne as u32;
         let b = nb as u32;
-        let part = (INK_PB * ne) as u64;
+        let part = (self.pb * ne) as u64;
         let n = b * ne32;
         c.upload(&bb.cur, 0, bytemuck::cast_slice(&emb)).map_err(be)?;
         let mut rec = c.begin();
@@ -1770,7 +1858,7 @@ impl Executor for InklingExec {
             }
             let mut off = 0usize;
             while off < tokens.len() {
-                let chunk = &tokens[off..(off + INK_PB).min(tokens.len())];
+                let chunk = &tokens[off..(off + self.pb).min(tokens.len())];
                 let is_last = off + chunk.len() == tokens.len();
                 self.forward_batch_gpu(chunk, pos0 + off, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
                 off += chunk.len();

@@ -11,7 +11,7 @@ use ocak_vk::{Buffer, VkContext, WType};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-const XING_PREFILL_BATCH: usize = 512;
+const XING_PREFILL_BATCH: usize = 1024;
 /// Layers per queue submit in batched prefill (keeps each submit far below the amdgpu TDR).
 #[cfg(feature = "vulkan")]
 const XING_LAYERS_PER_SUBMIT: usize = 8;
