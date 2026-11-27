@@ -40,7 +40,9 @@ layout(push_constant) uniform PC {
     uint x_stride; uint x_div; uint slice_bytes; uint n_groups; uint count; uint use_list; uint cap;
 } pc;
 #else
-layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+// Split-K (small m, large k): workgroup z covers columns [z * kchunk, (z + 1) * kchunk) and
+// writes its partial result at y_off + z * split_stride (summed by sum_splits.comp).
+layout(push_constant) uniform PC { uint w_off; uint x_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; uint kchunk; uint split_stride; } pc;
 #endif
 
 shared float16_t ws[BK * BM];
@@ -61,6 +63,13 @@ void main() {
     uint tok0 = gl_WorkGroupID.y * BN;
     uint ncols = pc.batch;
     uint wbase = pc.w_off;
+#endif
+#ifdef GROUPED
+    uint kbeg = 0u, kend = pc.k, ybase = pc.y_off;
+#else
+    uint kbeg = gl_WorkGroupID.z * pc.kchunk;
+    uint kend = min(pc.k, kbeg + pc.kchunk);
+    uint ybase = pc.y_off + gl_WorkGroupID.z * pc.split_stride;
 #endif
 
     // Weight loader: 64 rows x 4 segments of 8 along K per pass; BM/64 passes.
@@ -89,7 +98,7 @@ void main() {
     for (uint j = 0u; j < TN; j++)
         for (uint i = 0u; i < TM; i++) acc[j][i] = 0.0;
 
-    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+    for (uint k0 = kbeg; k0 < kend; k0 += BK) {
         for (uint p = 0u; p < BM / 64u; p++) {
             float v[8];
             dq8(rbs[p], k0 + ld_seg, v);
@@ -118,7 +127,7 @@ void main() {
 #endif
         for (uint i = 0u; i < TM; i++) {
             uint row = row0 + tx * TM + i;
-            if (row < pc.m) y[pc.y_off + yentry * pc.m + row] = acc[j][i];
+            if (row < pc.m) y[ybase + yentry * pc.m + row] = acc[j][i];
         }
     }
 }

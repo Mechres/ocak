@@ -204,6 +204,7 @@ struct Pipelines {
     attention_prefill_128: PipelineBundle,
     attention_prefill_256: PipelineBundle,
     argmax: PipelineBundle,
+    sum_splits: PipelineBundle,
     quant_q8: PipelineBundle,
     /// Integer-dot tiled matmuls, indexed by qmmq_index.
     qmmq: Vec<PipelineBundle>,
@@ -325,7 +326,7 @@ impl Pipelines {
         .chain(self.qmmqg.iter())
         .chain([
             &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill,
-            &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8,
+            &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8, &self.sum_splits,
         ])
         {
             dev.destroy_pipeline(p.pipeline, None);
@@ -657,26 +658,26 @@ impl VkContext {
                 qmm2_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), "qmm2_q5_k", 3, 28)?,
                 qmm2_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), "qmm2_iq3_s", 4, 28)?,
                 qmmt: vec![
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_k.spv")), "qmmt_q4_k", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q5_k.spv")), "qmmt_q5_k", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q6_k.spv")), "qmmt_q6_k", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q2_k.spv")), "qmmt_q2_k", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q3_k.spv")), "qmmt_q3_k", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q8_0.spv")), "qmmt_q8_0", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_0.spv")), "qmmt_q4_0", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f16.spv")), "qmmt_f16", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f32.spv")), "qmmt_f32", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_s.spv")), "qmmt_iq3_s", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_xxs.spv")), "qmmt_iq3_xxs", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xs.spv")), "qmmt_iq2_xs", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_s.spv")), "qmmt_iq2_s", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xxs.spv")), "qmmt_iq2_xxs", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_s.spv")), "qmmt_iq1_s", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_m.spv")), "qmmt_iq1_m", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_xs.spv")), "qmmt_iq4_xs", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_nl.spv")), "qmmt_iq4_nl", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_bf16.spv")), "qmmt_bf16", 4, 28)?,
-                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_nvfp4.spv")), "qmmt_nvfp4", 4, 28)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_k.spv")), "qmmt_q4_k", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q5_k.spv")), "qmmt_q5_k", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q6_k.spv")), "qmmt_q6_k", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q2_k.spv")), "qmmt_q2_k", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q3_k.spv")), "qmmt_q3_k", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q8_0.spv")), "qmmt_q8_0", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_0.spv")), "qmmt_q4_0", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f16.spv")), "qmmt_f16", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_f32.spv")), "qmmt_f32", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_s.spv")), "qmmt_iq3_s", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq3_xxs.spv")), "qmmt_iq3_xxs", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xs.spv")), "qmmt_iq2_xs", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_s.spv")), "qmmt_iq2_s", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq2_xxs.spv")), "qmmt_iq2_xxs", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_s.spv")), "qmmt_iq1_s", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq1_m.spv")), "qmmt_iq1_m", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_xs.spv")), "qmmt_iq4_xs", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_iq4_nl.spv")), "qmmt_iq4_nl", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_bf16.spv")), "qmmt_bf16", 4, 36)?,
+                    bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_nvfp4.spv")), "qmmt_nvfp4", 4, 36)?,
                 ],
                 qmmg: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmg_q4_k.spv")), "qmmg_q4_k", 5, 52)?,
@@ -752,6 +753,7 @@ impl VkContext {
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
                 attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), "attention_prefill_256", 4, 40)?,
                 argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 2, 8)?,
+                sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
                 qmmq: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmq_q4_k.spv")), "qmmq_q4_k", 5, 32)?,
@@ -1484,11 +1486,34 @@ impl<'a> Recorder<'a> {
             if self.qmm_int8(ty, w, w_off, x, x_off, y, y_off, k, m, batch) {
                 return;
             }
-            {
-                let p = &self.ctx.pipelines.qmmt[qmmt_index(ty)];
-                self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN), 1);
+            let p = &self.ctx.pipelines.qmmt[qmmt_index(ty)];
+            let (gx, gy) = (m.div_ceil(QMMT_BM), batch.div_ceil(QMMT_BN));
+            // Small m with large k (e.g. 24-row hyper-connection / router weights) gives only a
+            // few workgroups: split K across workgroup z and sum the partials.
+            let splits = if gx * gy < 40 { (160 / (gx * gy)).min(k / 512).min(32) } else { 1 };
+            let part = batch as u64 * m as u64 * 4;
+            if splits >= 2 && self.scratch_cursor.is_multiple_of(4) && part * splits as u64 <= ATTN_SCRATCH_BYTES {
+                let bytes = part * splits as u64;
+                if self.scratch_cursor + bytes > ATTN_SCRATCH_BYTES {
+                    self.barrier();
+                    self.scratch_cursor = 0;
+                }
+                let s_off = self.scratch_cursor;
+                self.scratch_cursor += bytes;
+                let kchunk = k.div_ceil(splits).next_multiple_of(32);
+                let splits = k.div_ceil(kchunk);
+                let scratch = self.ctx.attn_scratch;
+                let pcs = [off_u32(w_off), off_u32(x_off), off_u32(s_off / 4), k, m, ty.row_bytes(k), batch, kchunk, batch * m];
+                self.dispatch_raw(p, &[w.buf, x.buf, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
+                self.barrier();
+                let n = batch * m;
+                let pcr = [off_u32(s_off / 4), off_u32(y_off), n, splits];
+                self.dispatch_raw(&self.ctx.pipelines.sum_splits, &[scratch, y.buf], bytemuck::cast_slice(&pcr), n.div_ceil(256), 1, 1);
                 return;
             }
+            let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), batch, k, 0];
+            self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1);
+            return;
         }
         let gy = batch.div_ceil(8);
         let gx8 = m.div_ceil(8);
@@ -3012,55 +3037,57 @@ mod tests {
     #[test]
     fn vk_qmm_tiled_matches_qmv() {
         let c = VkContext::new().expect("vulkan init");
-        // m and batch deliberately not multiples of the 64x64 tile.
-        let (k, m, batch) = (512usize, 70usize, 75usize);
-        let mut s = 0x1234_5678u64;
-        let mut next_u8 = || -> u8 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (s >> 32) as u8
-        };
-        let x: Vec<f32> = (0..batch * k).map(|i| ((i % 31) as f32 - 15.0) * 0.05).collect();
-        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
-        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
-        let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
-        for wt in [
-            WType::Q4K, WType::Q5K, WType::Q6K, WType::Q2K, WType::Q3K, WType::Q8_0, WType::Q4_0, WType::F16, WType::F32,
-            WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS,
-            WType::IQ4NL, WType::BF16, WType::NVFP4,
-        ] {
-            let rb = wt.row_bytes(k as u32) as usize;
-            let raw: Vec<u8> = if wt == WType::F32 {
-                let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
-                bytemuck::cast_slice(&f).to_vec()
-            } else {
-                (0..m * rb).map(|_| next_u8() & 0x3F).collect()
+        // m and batch deliberately not multiples of the 64x128 tile; the second shape (small m,
+        // large k) takes the split-K path.
+        for (k, m, batch) in [(512usize, 70usize, 75usize), (4608, 24, 200)] {
+            let mut s = 0x1234_5678u64;
+            let mut next_u8 = || -> u8 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 32) as u8
             };
-            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
-            c.upload(&bw, 0, &raw).unwrap();
-            let mut rec = c.begin();
-            rec.set_mmq(false);
-            rec.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, batch as u32);
-            for b in 0..batch {
-                rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
-            }
-            rec.finish_and_wait().unwrap();
-            let mut y_qmm = vec![0f32; batch * m];
-            let mut y_qmv = vec![0f32; batch * m];
-            c.download(&by_qmm, 0, bytemuck::cast_slice_mut(&mut y_qmm)).unwrap();
-            c.download(&by_qmv, 0, bytemuck::cast_slice_mut(&mut y_qmv)).unwrap();
-            // The tiled kernel stages weights and activations as fp16 in shared memory (like
-            // llama.cpp's mul_mm), so allow fp16-level error relative to the output scale. Indexing
-            // bugs produce errors on the order of the scale itself.
-            let scale = y_qmv.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
-            for i in 0..batch * m {
-                let tol = 3e-3 * scale;  // observed max ~5e-4
-                assert!(
-                    (y_qmm[i] - y_qmv[i]).abs() <= tol,
-                    "tiled qmm vs qmv mismatch for {wt:?} idx={i}: qmm={} qmv={}",
-                    y_qmm[i],
-                    y_qmv[i]
-                );
+            let x: Vec<f32> = (0..batch * k).map(|i| ((i % 31) as f32 - 15.0) * 0.05).collect();
+            let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+            c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+            let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+            let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
+            for wt in [
+                WType::Q4K, WType::Q5K, WType::Q6K, WType::Q2K, WType::Q3K, WType::Q8_0, WType::Q4_0, WType::F16, WType::F32,
+                WType::IQ3S, WType::IQ3XXS, WType::IQ2XS, WType::IQ2S, WType::IQ2XXS, WType::IQ1S, WType::IQ1M, WType::IQ4XS,
+                WType::IQ4NL, WType::BF16, WType::NVFP4,
+            ] {
+                let rb = wt.row_bytes(k as u32) as usize;
+                let raw: Vec<u8> = if wt == WType::F32 {
+                    let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
+                    bytemuck::cast_slice(&f).to_vec()
+                } else {
+                    (0..m * rb).map(|_| next_u8() & 0x3F).collect()
+                };
+                let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+                c.upload(&bw, 0, &raw).unwrap();
+                let mut rec = c.begin();
+                rec.set_mmq(false);
+                rec.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, batch as u32);
+                for b in 0..batch {
+                    rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_qmv, (b * m) as u64, k as u32, m as u32);
+                }
+                rec.finish_and_wait().unwrap();
+                let mut y_qmm = vec![0f32; batch * m];
+                let mut y_qmv = vec![0f32; batch * m];
+                c.download(&by_qmm, 0, bytemuck::cast_slice_mut(&mut y_qmm)).unwrap();
+                c.download(&by_qmv, 0, bytemuck::cast_slice_mut(&mut y_qmv)).unwrap();
+                // The tiled kernel stages weights and activations as fp16 in shared memory (like
+                // llama.cpp's mul_mm), so allow fp16-level error relative to the output scale. Indexing
+                // bugs produce errors on the order of the scale itself.
+                let scale = y_qmv.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+                for i in 0..batch * m {
+                    let tol = 3e-3 * scale;  // observed max ~5e-4
+                    assert!(
+                        (y_qmm[i] - y_qmv[i]).abs() <= tol,
+                        "tiled qmm vs qmv mismatch for {wt:?} k={k} m={m} idx={i}: qmm={} qmv={}",
+                        y_qmm[i],
+                        y_qmv[i]
+                    );
+                }
             }
         }
     }

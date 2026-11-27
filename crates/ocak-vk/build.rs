@@ -84,6 +84,7 @@ fn main() {
         "qmm2_q5_k",
         "qmm2_iq3_s",
         "argmax",
+        "sum_splits",
         "moe_group",
         "inkling_kv_store",
         "inkling_attn_batch",
