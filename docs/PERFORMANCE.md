@@ -25,6 +25,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
   matvec at Qwen3.8's FFN shape, rotating 6 weight copies). A single small weight matrix stays in
   the 96 MB Infinity Cache across repeats and reports impossible bandwidth — rotate buffers that
   together exceed ~100 MB.
+- **Comparing sampled runs:** `SamplerParams::seed = 0` means a random seed per run, so two
+  sampled runs differ even when the logits are identical — hash the logits per position instead.
 - **MTP must stay lossless:** with greedy sampling, `OCAK_DISABLE_MTP=1` and the default must
   produce identical text. The verify step (`forward_verify2`, batched layer code) and single-token
   decode use different call paths, so every kernel pair must give bit-identical results: same
@@ -86,6 +88,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
 | MTP verify with device-side argmax for plain greedy sampling (no 2 x vocab logits download / CPU sampling) | verify host overhead 6.7 -> ~1.4 ms; Qwen3.8 IQ2_S (borrowed head) 40.4 -> 46.8 tok/s, Q2_K 32 -> 38 |
 | MTP verify: DeltaNet / conv kernels write the post-token-0 rollback state from registers (was: per-token dispatches + copies with transfer barriers in all 48 layers) | verify 33.6 -> 32.7 ms; IQ2_S 47.8 tok/s |
+| Host-cached staging buffer (was write-combined: CPU reads ~200 MB/s) | 1 MB logits download 4.5 -> 0.2 ms; sampled decode Qwen3.8 IQ2_S 26.5 -> 33.7 tok/s |
+| MTP for sampled decoding by default (sample from the target logits, accept the draft iff it equals the sample: exact, same draw count per token) | Qwen3.8 Q2_K at T=0.7: 24.5 -> 37.9 tok/s |
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,

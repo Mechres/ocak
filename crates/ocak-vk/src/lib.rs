@@ -895,13 +895,12 @@ impl VkContext {
             )?;
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
 
-            let (staging_buf, staging_mem) = alloc_raw_buffer(
-                &device,
-                &mem_props,
-                STAGING_SIZE,
-                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
+            // Host-cached staging when available: downloads (e.g. 1 MB of logits per sampled token)
+            // read it back on the CPU, and uncached (write-combined) memory reads at ~200 MB/s.
+            let staging_usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+            let host_cc = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let (staging_buf, staging_mem) = alloc_raw_buffer(&device, &mem_props, STAGING_SIZE, staging_usage, host_cc | vk::MemoryPropertyFlags::HOST_CACHED)
+                .or_else(|_| alloc_raw_buffer(&device, &mem_props, STAGING_SIZE, staging_usage, host_cc))?;
             let staging_ptr = device.map_memory(staging_mem, 0, STAGING_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
             let iq_data = ocak_gguf::iq_tables::packed_gpu_table();
             let iq_bytes = bytemuck::cast_slice::<u32, u8>(&iq_data);
@@ -2774,6 +2773,21 @@ mod tests {
                 assert!(a[i].to_bits() == b[i].to_bits(), "{wt:?} batch {nb} idx {i}: batch {} vs single {}", a[i], b[i]);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vk_download_bench() {
+        let c = ctx();
+        let n = 248_320usize;
+        let b = c.create_device_buffer((n * 4) as u64).unwrap();
+        let mut out = vec![0f32; n];
+        c.download(&b, 0, bytemuck::cast_slice_mut(&mut out)).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            c.download(&b, 0, bytemuck::cast_slice_mut(&mut out)).unwrap();
+        }
+        eprintln!("download {} KiB: {:.3} ms", n * 4 / 1024, t.elapsed().as_secs_f64() * 1e3 / 20.0);
     }
 
     #[test]

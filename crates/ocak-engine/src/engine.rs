@@ -275,7 +275,8 @@ impl NativeEngine {
         let use_mtp = self.mtp.is_some()
             && !req.json_mode
             && req.thinking.is_none()
-            && (req.sampler.temperature <= 0.0 || std::env::var("OCAK_MTP_VERIFY").is_ok())
+            // Sampled decoding is lossless too: the next token is sampled from the target model's
+            // own logits and the draft is accepted only if it equals that sample.
             && std::env::var("OCAK_DISABLE_MTP").is_err();
         if let Some(m) = &mut self.mtp {
             m.reset();
