@@ -53,6 +53,7 @@ fn main() {
         "hc_mix",
         "rope_yarn_mla",
         "mla_attn",
+        "mla_attn_prefill",
         "moe_topk",
         "qmv_iq3_xxs_id",
         "qmv_iq3_s_id",

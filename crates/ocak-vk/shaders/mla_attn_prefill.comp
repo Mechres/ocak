@@ -1,0 +1,100 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Flash-style MLA (absorbed) attention for prefill batches over the contiguous FP16 latent KV
+// cache (latent = 512, n_rot = 64: rows of 288 packed f16 pairs, value = latent part).
+// Workgroup (head block, token b) owns 32 query rows = heads 32 * wg.x .. +31 of token b, which
+// all attend the same keys 0 .. pos + b. Each step stages a BK-key tile of the cache in shared
+// memory once for all 32 rows (vs. mla_attn.comp's lane group per head re-reading every row).
+// Thread layout: row r = tid / 8; the 8 lanes of a row split the 576 score dims (36 packed pairs
+// each, Q kept in registers) and reduce the BK partial scores with clustered adds, so every lane
+// holds the row's scores; for P V the lanes split the 512 value dims (interleaved for banks).
+#define BK 16u
+#define HHD 288u     // packed pairs per cache row (512 latent + 64 rope dims)
+#define HLAT 256u    // packed latent pairs
+#define QW 36u       // score pairs per lane (HHD / 8)
+#define VW 32u       // value pairs per lane (HLAT / 8)
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer QLat { float ql[]; };
+layout(set = 0, binding = 1) readonly buffer QFull { float qf[]; };
+layout(set = 0, binding = 2) readonly buffer KvCache { uint kvc[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint key_dim;
+    uint nope;
+    uint pos;
+    uint kv_layer_off;
+    float kq_scale;
+} pc;
+
+shared uint ks[BK * HHD];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint r = tid >> 3;
+    uint sub = tid & 7u;
+    uint nh = gl_NumWorkGroups.x * 32u;
+    uint h = gl_WorkGroupID.x * 32u + r;
+    uint b = gl_WorkGroupID.y;
+    uint qh = b * nh + h;
+    uint n_t = pc.pos + b + 1u;
+
+    // This lane's 36 score pairs: concatenated [q_lat (256 pairs), q_rope (32 pairs)], pre-scaled.
+    vec2 q[QW];
+    for (uint e = 0u; e < QW; e++) {
+        uint p = sub * QW + e;
+        vec2 v;
+        if (p < HLAT) {
+            uint o2 = qh * 512u + 2u * p;
+            v = vec2(ql[o2], ql[o2 + 1u]);
+        } else {
+            uint o2 = qh * pc.key_dim + pc.nope + 2u * (p - HLAT);
+            v = vec2(qf[o2], qf[o2 + 1u]);
+        }
+        q[e] = v * pc.kq_scale;
+    }
+
+    float m = -3.0e38;
+    float l = 0.0;
+    vec2 acc[VW];
+    for (uint j = 0u; j < VW; j++) acc[j] = vec2(0.0);
+
+    for (uint t0 = 0u; t0 < n_t; t0 += BK) {
+        for (uint idx = tid; idx < BK * HHD; idx += 256u) {
+            uint t = t0 + idx / HHD;
+            ks[idx] = (t < n_t) ? kvc[pc.kv_layer_off + t0 * HHD + idx] : 0u;
+        }
+        barrier();
+
+        float s[BK];
+        for (uint k = 0u; k < BK; k++) s[k] = 0.0;
+        for (uint e = 0u; e < QW; e++) {
+            uint base = sub * QW + e;
+            for (uint k = 0u; k < BK; k++) s[k] += dot(q[e], unpackHalf2x16(ks[k * HHD + base]));
+        }
+        float tmax = -3.0e38;
+        for (uint k = 0u; k < BK; k++) {
+            s[k] = subgroupClusteredAdd(s[k], 8u);
+            s[k] = (t0 + k < n_t) ? s[k] : -3.0e38;
+            tmax = max(tmax, s[k]);
+        }
+        float m_new = max(m, tmax);
+        float alpha = exp(m - m_new);
+        l *= alpha;
+        for (uint j = 0u; j < VW; j++) acc[j] *= alpha;
+        for (uint k = 0u; k < BK; k++) {
+            float p = (s[k] > -1.0e38) ? exp(s[k] - m_new) : 0.0;
+            l += p;
+            for (uint j = 0u; j < VW; j++) acc[j] += p * unpackHalf2x16(ks[k * HHD + j * 8u + sub]);
+        }
+        m = m_new;
+        barrier();
+    }
+
+    float inv = 1.0 / l;
+    uint ob = qh * 512u;
+    for (uint j = 0u; j < VW; j++) {
+        uint p = j * 8u + sub;
+        o[ob + 2u * p] = acc[j].x * inv;
+        o[ob + 2u * p + 1u] = acc[j].y * inv;
+    }
+}

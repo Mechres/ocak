@@ -199,6 +199,7 @@ struct Pipelines {
     inkling_kv_store: PipelineBundle,
     inkling_attn_batch: PipelineBundle,
     inkling_attn_prefill: PipelineBundle,
+    mla_attn_prefill: PipelineBundle,
     attention_prefill_128: PipelineBundle,
     attention_prefill_256: PipelineBundle,
     argmax: PipelineBundle,
@@ -329,7 +330,7 @@ impl Pipelines {
         .chain(self.qmmq.iter())
         .chain(self.qmmqg.iter())
         .chain([
-            &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill,
+            &self.moe_group, &self.inkling_kv_store, &self.inkling_attn_batch, &self.inkling_attn_prefill, &self.mla_attn_prefill,
             &self.attention_prefill_128, &self.attention_prefill_256, &self.quant_q8,
         ])
         {
@@ -751,6 +752,7 @@ impl VkContext {
                 moe_group: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_group.spv")), "moe_group", 2, 12)?,
                 inkling_kv_store: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_kv_store.spv")), "inkling_kv_store", 4, 44)?,
                 inkling_attn_batch: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_batch.spv")), "inkling_attn_batch", 10, 88)?,
+                mla_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill.spv")), "mla_attn_prefill", 4, 20)?,
                 inkling_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill.spv")), "inkling_attn_prefill", 10, 92)?,
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
                 attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), "attention_prefill_256", 4, 40)?,
@@ -1089,7 +1091,7 @@ impl VkContext {
             unsafe { self.device.cmd_reset_query_pool(exec.cmd_buf, exec.qpool, 0, PROF_QUERIES) };
             exec.q_names.clear();
         }
-        Recorder { ctx: self, exec, defer_barriers: false, scratch_cursor: 0, attn_split: true, q8_cursor: 0, q8_cache: None, mmq: mmq_enabled(), ink_flash: true }
+        Recorder { ctx: self, exec, defer_barriers: false, scratch_cursor: 0, attn_split: true, q8_cursor: 0, q8_cache: None, mmq: mmq_enabled(), flash_attn: true }
     }
 }
 
@@ -1220,7 +1222,7 @@ pub struct Recorder<'a> {
     /// such a matmul (or any copy / fill) clears it, since it might rewrite x.
     q8_cache: Option<(vk::Buffer, u64, u32, u32, u64)>,
     mmq: bool,
-    ink_flash: bool,
+    flash_attn: bool,
 }
 
 #[inline]
@@ -1736,6 +1738,12 @@ impl<'a> Recorder<'a> {
     ) {
         assert!(latent <= 512 && n_rot <= 128, "mla_attn supports latent <= 512, n_rot <= 128");
         assert!(nh.is_multiple_of(8), "mla_attn processes heads in groups of 8 (n_heads = {nh})");
+        if self.flash_attn && batch >= 16 && latent == 512 && n_rot == 64 && nh.is_multiple_of(32) {
+            // Prefill: flash-style tiles (32 heads of one token share each staged key tile).
+            let pc = [key_dim, nope, pos, kv_layer_off, kq_scale.to_bits()];
+            self.dispatch_raw(&self.ctx.pipelines.mla_attn_prefill, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf], bytemuck::cast_slice(&pc), nh / 32, batch, 1);
+            return;
+        }
         let max_nt = pos + batch; // longest context in the batch (token b attends pos + b + 1)
         // Smaller chunks for short contexts keep enough workgroups in flight (each covers 8 heads).
         let mla_chunk: u32 = if max_nt <= 1024 { 16 } else { 64 };
@@ -1947,7 +1955,7 @@ impl<'a> Recorder<'a> {
         // Flash-style kernel: head_dim 128, n_rel <= 16, and 64 / group query tokens per tile
         // small enough that the staged relative-bias rows cover the tile (group >= 2).
         let group = n_head / n_head_kv.max(1);
-        if self.ink_flash && hd == 128 && n_rel <= 16 && n_head.is_multiple_of(n_head_kv) && (2..=64).contains(&group) {
+        if self.flash_attn && hd == 128 && n_rel <= 16 && n_head.is_multiple_of(n_head_kv) && (2..=64).contains(&group) {
             let pc = [
                 qs.0, qs.1, rs.0, rs.1, ss.0, ss.1, gs.0, gs.1,
                 n_head, n_head_kv, hd, n_rel, n_extent, n_swa, is_swa as u32, cap, pos, kv_slot_off,
@@ -2458,7 +2466,7 @@ mod tests {
             let bo_b = c.create_device_buffer((n_out * 4) as u64).unwrap();
             for (flash, bo) in [(true, &bo_a), (false, &bo_b)] {
                 let mut rec = c.begin();
-                rec.ink_flash = flash;
+                rec.flash_attn = flash;
                 rec.inkling_attn_batch(
                     &bq, &br, &bs, &bg, &bqc, &brc, &brb, &bk, &bv, bo,
                     (0, (nh * hd) as u32), (0, (nh * nrel) as u32), (0, nh as u32), (0, (nh * hd) as u32),
@@ -2474,6 +2482,48 @@ mod tests {
             let scale = ob.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
             for i in 0..n_out {
                 assert!((oa[i] - ob[i]).abs() <= 5e-3 * scale, "inkling flash swa={is_swa} idx={i}: {} vs {}", oa[i], ob[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn vk_mla_attn_prefill_matches_split() {
+        let c = ctx();
+        let mut rng = Lcg(31337);
+        let (nh, latent, n_rot, nope) = (32usize, 512usize, 64usize, 128usize);
+        let key_dim = nope + n_rot;
+        let half_hd = (latent + n_rot) / 2;
+        for (pos, batch) in [(0usize, 40usize), (300, 24)] {
+            let n_keys = pos + batch;
+            let ql: Vec<f32> = (0..batch * nh * latent).map(|_| rng.f() * 2.0).collect();
+            let qf: Vec<f32> = (0..batch * nh * key_dim).map(|_| rng.f() * 2.0).collect();
+            let kv: Vec<u32> = (0..n_keys * half_hd)
+                .map(|_| (f16::from_f32(rng.f()).to_bits() as u32) | ((f16::from_f32(rng.f()).to_bits() as u32) << 16))
+                .collect();
+            let up = |v: &[f32]| {
+                let b = c.create_device_buffer((v.len() * 4) as u64).unwrap();
+                c.upload(&b, 0, bytemuck::cast_slice(v)).unwrap();
+                b
+            };
+            let (bql, bqf) = (up(&ql), up(&qf));
+            let bkv = c.create_device_buffer((kv.len() * 4) as u64).unwrap();
+            c.upload(&bkv, 0, bytemuck::cast_slice(&kv)).unwrap();
+            let n_out = batch * nh * latent;
+            let bo_a = c.create_device_buffer((n_out * 4) as u64).unwrap();
+            let bo_b = c.create_device_buffer((n_out * 4) as u64).unwrap();
+            for (flash, bo) in [(true, &bo_a), (false, &bo_b)] {
+                let mut rec = c.begin();
+                rec.flash_attn = flash;
+                rec.mla_attn_batch(&bql, &bqf, &bkv, bo, nh as u32, key_dim as u32, nope as u32, n_rot as u32, latent as u32, pos as u32, 0, 0.07, batch as u32);
+                rec.finish_and_wait().unwrap();
+            }
+            let mut oa = vec![0f32; n_out];
+            let mut ob = vec![0f32; n_out];
+            c.download(&bo_a, 0, bytemuck::cast_slice_mut(&mut oa)).unwrap();
+            c.download(&bo_b, 0, bytemuck::cast_slice_mut(&mut ob)).unwrap();
+            let scale = ob.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+            for i in 0..n_out {
+                assert!((oa[i] - ob[i]).abs() <= 1e-3 * scale, "mla flash pos={pos} idx={i}: {} vs {}", oa[i], ob[i]);
             }
         }
     }
