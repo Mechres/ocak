@@ -117,9 +117,15 @@ fn main() {
         let _ = fs::metadata(&dst).expect("spv missing");
     }
     // Sources compiled several times with different defines: (output name, source, defines).
-    let variants: [(&str, &str, &[&str]); 2] = [
+    println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
+    let variants: [(&str, &str, &[&str]); 7] = [
         ("attention_prefill_128", "shaders/attention_prefill.comp", &["-DHDMAX=128"]),
         ("attention_prefill_256", "shaders/attention_prefill.comp", &["-DHDMAX=256"]),
+        ("quant_q8", "shaders/quant_q8.comp", &[]),
+        ("qmmq_q4_k", "shaders/qmm_q8.comp", &["-DQ4_K"]),
+        ("qmmq_q5_k", "shaders/qmm_q8.comp", &["-DQ5_K"]),
+        ("qmmq_q6_k", "shaders/qmm_q8.comp", &["-DQ6_K"]),
+        ("qmmq_q8_0", "shaders/qmm_q8.comp", &["-DQ8_0"]),
     ];
     for (name, src, defs) in variants {
         println!("cargo:rerun-if-changed={src}");

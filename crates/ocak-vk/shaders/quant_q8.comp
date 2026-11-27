@@ -1,0 +1,31 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Quantize activations to int8 blocks of 32 for the integer-dot matmul (qmm_q8.comp).
+// Block b covers x[x_off + 32 b .. +32] (rows of k floats, k % 32 == 0, laid out back to back).
+// Output: 8 packed int8x4 words per block at q[q_off + 8 b], and
+// sc[s_off + b] = (dx, dx * sum(q[0..16]), dx * sum(q[16..32]), 0) with x ~= dx * q.
+// 8 lanes per block (4 values each), 32 blocks per workgroup.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer X { vec4 x4[]; };
+layout(set = 0, binding = 1) writeonly buffer Q { uint q[]; };
+layout(set = 0, binding = 2) writeonly buffer S { vec4 sc[]; };
+layout(push_constant) uniform PC { uint x_off4; uint q_off; uint s_off; uint n_blocks; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint blk = gid >> 3;
+    uint lane = gid & 7u;
+    // Whole 8-lane clusters share blk, so they exit together and the reductions stay uniform.
+    if (blk >= pc.n_blocks) return;
+    vec4 v = x4[pc.x_off4 + gid];
+    float amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = subgroupClusteredMax(amax, 8u);
+    float dx = amax / 127.0;
+    float inv = (amax > 0.0) ? 127.0 / amax : 0.0;
+    ivec4 qi = clamp(ivec4(round(v * inv)), ivec4(-127), ivec4(127));
+    q[pc.q_off + gid] = uint(qi.x & 0xFF) | (uint(qi.y & 0xFF) << 8) | (uint(qi.z & 0xFF) << 16) | (uint(qi.w & 0xFF) << 24);
+    int s = qi.x + qi.y + qi.z + qi.w;
+    int s0 = subgroupClusteredAdd(lane < 4u ? s : 0, 8u);
+    int s1 = subgroupClusteredAdd(lane < 4u ? 0 : s, 8u);
+    if (lane == 0u) sc[pc.s_off + blk] = vec4(dx, dx * float(s0), dx * float(s1), 0.0);
+}

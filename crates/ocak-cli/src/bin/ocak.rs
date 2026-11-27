@@ -203,6 +203,9 @@ async fn main() -> Result<()> {
                     res.timings.predicted_n, res.timings.predicted_per_second
                 );
             }
+            if let Some(report) = ocak_vk::take_gpu_profile_report() {
+                eprintln!("{report}");
+            }
         }
         Cmd::ParityTest { model, prompt, steps } => {
             let mut eng_vk = NativeEngine::load(&model, EngineOptions { backend: BackendKind::Vulkan, max_ctx: 512, kv_pages: 64 })?;
@@ -434,6 +437,9 @@ async fn main() -> Result<()> {
                 );
                 let _ = std::io::stdout().flush();
                 drop(eng);
+                if let Some(report) = ocak_vk::take_gpu_profile_report() {
+                    eprintln!("{report}");
+                }
             }
         }
         Cmd::Top { addr } => {

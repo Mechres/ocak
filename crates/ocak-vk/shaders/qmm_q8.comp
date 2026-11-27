@@ -1,0 +1,153 @@
+#version 460
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_GOOGLE_include_directive : require
+// Integer-dot tiled matmul for prefill: Y[batch, m] = X[batch, k] * W[m, k]^T with X
+// pre-quantized by quant_q8.comp (int8 blocks of 32 + per-16 sums). Same tile shape as
+// qmm_tiled.comp (64 rows x 128 tokens, BK = 32), but the weight tile stays int8 and the inner
+// product is dotPacked4x8EXT (4 MACs per instruction) with one float scale fix-up per
+// 16-column group:  sum_i (d q_i - m) * dx qx_i = d dx (q . qx) - m (dx sum qx).
+// Compiled once per weight format with -D<TYPE> (see build.rs).
+#if defined(Q6_K)
+#define SCALE16
+#endif
+#define TM 4u
+#define TN 8u
+#define BM 64u
+#define BN 128u
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(set = 0, binding = 0) readonly buffer W32 { uint w32[]; };
+layout(set = 0, binding = 1) readonly buffer XQ { uvec4 xq4[]; };
+layout(set = 0, binding = 2) readonly buffer XS { vec4 xsc[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { float y[]; };
+// q_off4 / s_off: uvec4 / vec4 offsets of the quantized activations and their scales.
+layout(push_constant) uniform PC { uint w_off; uint q_off4; uint s_off; uint y_off; uint k; uint m; uint row_bytes; uint batch; } pc;
+
+shared uvec4 ws[8u * (BM / 4u)];   // [k word][row / 4] (4 consecutive rows per uvec4)
+shared uvec4 xs[8u * (BN / 4u)];   // [k word][col / 4]
+shared vec4 wsc[BM];               // (d0, m0, d1, m1) per row for the two 16-col halves
+shared vec4 xss[BN];               // (dx, dx*sum0, dx*sum1, -)
+
+#include "dequant_i8.glsl"
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint tok0 = gl_WorkGroupID.y * BN;
+
+    // Weight loader: row lid/4, 8 columns (2 words) per thread.
+    uint ld_row = lid >> 2;
+    uint ld_part = lid & 3u;
+    uint rb = pc.w_off + min(row0 + ld_row, pc.m - 1u) * pc.row_bytes;
+    // Activation loader: column lid/2, 4 words (16 values) per thread.
+    uint x_col = lid >> 1;
+    uint x_half = lid & 1u;
+    uint col = min(tok0 + x_col, pc.batch - 1u);
+    uint kblocks = pc.k >> 5;
+    uint xblk0 = col * kblocks;
+
+    uint tx = lid & 15u;   // rows tx*4 .. +3
+    uint ty = lid >> 4;    // cols ty*8 .. +7
+    float acc[TN][TM];
+    for (uint j = 0u; j < TN; j++)
+        for (uint i = 0u; i < TM; i++) acc[j][i] = 0.0;
+
+    // Register prefetch: the next K block's weights / activations are loaded from global memory
+    // while the current one is computed from shared memory.
+    uint pq0, pq1;
+    float pd, pm;
+    uvec4 pxv;
+    vec4 pxs;
+    dqi8(rb, ld_part * 8u, pq0, pq1, pd, pm);
+    pxv = xq4[pc.q_off4 + xblk0 * 2u + x_half];
+    pxs = xsc[pc.s_off + xblk0];
+
+    for (uint kb = 0u; kb < kblocks; kb++) {
+        {
+            uint kw = ld_part * 2u;
+            ws[kw * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq0;
+            ws[(kw + 1u) * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq1;
+            if (ld_part == 0u) { wsc[ld_row].x = pd; wsc[ld_row].y = pm; }
+            if (ld_part == 2u) { wsc[ld_row].z = pd; wsc[ld_row].w = pm; }
+            uint xw = x_half * 4u;
+            for (uint c = 0u; c < 4u; c++)
+                xs[(xw + c) * (BN / 4u) + (x_col >> 2)][x_col & 3u] = pxv[c];
+            if (x_half == 0u) xss[x_col] = pxs;
+        }
+        barrier();
+        if (kb + 1u < kblocks) {
+            dqi8(rb, ((kb + 1u) << 5) + ld_part * 8u, pq0, pq1, pd, pm);
+            pxv = xq4[pc.q_off4 + (xblk0 + kb + 1u) * 2u + x_half];
+            pxs = xsc[pc.s_off + xblk0 + kb + 1u];
+        }
+#ifdef SCALE16
+        // d (and m) change every 16 columns: one fix-up per half.
+        for (uint h = 0u; h < 2u; h++) {
+            int ia[TN][TM];
+            for (uint j = 0u; j < TN; j++)
+                for (uint i = 0u; i < TM; i++) ia[j][i] = 0;
+            for (uint c = 0u; c < 4u; c++) {
+                uint kw = h * 4u + c;
+                uvec4 wv = ws[kw * (BM / 4u) + tx];
+                uvec4 xa = xs[kw * (BN / 4u) + ty * 2u];
+                uvec4 xb = xs[kw * (BN / 4u) + ty * 2u + 1u];
+                for (uint i = 0u; i < TM; i++) {
+                    for (uint j = 0u; j < 4u; j++) {
+                        ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xa[j]));
+                        ia[j + 4u][i] += dotPacked4x8EXT(int(wv[i]), int(xb[j]));
+                    }
+                }
+            }
+            vec2 wdm[TM];
+            for (uint i = 0u; i < TM; i++) {
+                vec4 s = wsc[tx * TM + i];
+                wdm[i] = (h == 0u) ? s.xy : s.zw;
+            }
+            for (uint j = 0u; j < TN; j++) {
+                vec4 xv = xss[ty * TN + j];
+                float xs_h = (h == 0u) ? xv.y : xv.z;
+                for (uint i = 0u; i < TM; i++)
+                    acc[j][i] += float(ia[j][i]) * (wdm[i].x * xv.x) - wdm[i].y * xs_h;
+            }
+        }
+#else
+        // d and m are constant over the 32-column block: one fix-up per block.
+        {
+            int ia[TN][TM];
+            for (uint j = 0u; j < TN; j++)
+                for (uint i = 0u; i < TM; i++) ia[j][i] = 0;
+            for (uint kw = 0u; kw < 8u; kw++) {
+                uvec4 wv = ws[kw * (BM / 4u) + tx];
+                uvec4 xa = xs[kw * (BN / 4u) + ty * 2u];
+                uvec4 xb = xs[kw * (BN / 4u) + ty * 2u + 1u];
+                for (uint i = 0u; i < TM; i++) {
+                    for (uint j = 0u; j < 4u; j++) {
+                        ia[j][i] += dotPacked4x8EXT(int(wv[i]), int(xa[j]));
+                        ia[j + 4u][i] += dotPacked4x8EXT(int(wv[i]), int(xb[j]));
+                    }
+                }
+            }
+            vec2 wdm[TM];
+            for (uint i = 0u; i < TM; i++) wdm[i] = wsc[tx * TM + i].xy;
+            for (uint j = 0u; j < TN; j++) {
+                vec4 xv = xss[ty * TN + j];
+                float xsum = xv.y + xv.z;
+                for (uint i = 0u; i < TM; i++)
+                    acc[j][i] += float(ia[j][i]) * (wdm[i].x * xv.x) - wdm[i].y * xsum;
+            }
+        }
+#endif
+        barrier();
+    }
+
+    for (uint j = 0u; j < TN; j++) {
+        uint c = tok0 + ty * TN + j;
+        if (c >= pc.batch) break;
+        for (uint i = 0u; i < TM; i++) {
+            uint row = row0 + tx * TM + i;
+            if (row < pc.m) y[pc.y_off + c * pc.m + row] = acc[j][i];
+        }
+    }
+}

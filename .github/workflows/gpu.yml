@@ -22,7 +22,7 @@ jobs:
     runs-on: [self-hosted, ocak-gpu]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build (release)
         run: cargo build --release --workspace
@@ -46,7 +46,7 @@ jobs:
           cat report.md >> "$GITHUB_STEP_SUMMARY"
           python3 ci/bench_check.py ci/bench-baseline.md bench.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: bench
