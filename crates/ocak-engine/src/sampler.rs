@@ -84,11 +84,56 @@ impl Sampler {
             return 0;
         }
         let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap();
-        if p.top_k > 0 && p.top_k < cand.len() {
+        if p.top_k == 0 || p.top_k >= cand.len() {
+            // No top-k truncation: avoid sorting the whole vocabulary (8 ms for 248k tokens).
+            let mx = cand.iter().fold(f32::NEG_INFINITY, |a, c| a.max(c.1));
+            let inv_t = 1.0 / p.temperature;
+            let sum_all: f32 = cand.iter().map(|c| ((c.1 - mx) * inv_t).exp()).sum();
+            if p.top_p >= 1.0 && p.min_p <= 0.0 {
+                // Plain temperature sampling: one O(n) pass, no ordering needed.
+                let mut r = self.next_f32() * sum_all;
+                for c in &cand {
+                    r -= ((c.1 - mx) * inv_t).exp();
+                    if r <= 0.0 {
+                        return c.0;
+                    }
+                }
+                return cand[cand.len() - 1].0;
+            }
+            // Nucleus / min-p: sort only a top-M prefix, growing M until it covers the cut.
+            let mut m = 256usize.min(cand.len());
+            loop {
+                if m < cand.len() {
+                    cand.select_nth_unstable_by(m - 1, cmp);
+                }
+                cand[..m].sort_by(cmp);
+                let w0 = 1.0f32; // exp(0): the top candidate
+                let thr = w0 * p.min_p;
+                let mut cum = 0.0f32;
+                let mut covered = m == cand.len();
+                for c in &cand[..m] {
+                    let w = ((c.1 - mx) * inv_t).exp();
+                    if p.min_p > 0.0 && w < thr {
+                        covered = true;
+                        break;
+                    }
+                    cum += w / sum_all;
+                    if p.top_p < 1.0 && cum >= p.top_p {
+                        covered = true;
+                        break;
+                    }
+                }
+                if covered {
+                    break;
+                }
+                m = (m * 4).min(cand.len());
+            }
+            cand.truncate(m);
+        } else {
             cand.select_nth_unstable_by(p.top_k - 1, cmp);
             cand.truncate(p.top_k);
+            cand.sort_by(cmp);
         }
-        cand.sort_by(cmp);
         let mx = cand[0].1;
         let mut probs: Vec<f32> = cand.iter().map(|c| ((c.1 - mx) / p.temperature).exp()).collect();
         let sum: f32 = probs.iter().sum();
@@ -124,6 +169,40 @@ impl Sampler {
 mod tests {
     use super::*;
     #[test]
+    fn untruncated_sampling_matches_softmax() {
+        // top_k = 0 paths (no full sort): frequencies follow the temperature softmax, and top_p
+        // keeps exactly the smallest prefix reaching top_p.
+        let logits = [2.0f32, 1.0, 0.5, 0.0, -1.0, -3.0];
+        let t = 0.8f32;
+        let w: Vec<f64> = logits.iter().map(|&l| ((l - 2.0) / t).exp() as f64).collect();
+        let z: f64 = w.iter().sum();
+        for top_p in [1.0f32, 0.8] {
+            let mut sm = Sampler::new(SamplerParams { temperature: t, top_k: 0, top_p, seed: 42, ..Default::default() });
+            let mut cnt = [0usize; 6];
+            let n = 200_000;
+            for _ in 0..n {
+                let mut l = logits;
+                cnt[sm.sample(&mut l) as usize] += 1;
+            }
+            // expected distribution after the nucleus cut
+            let mut keep = 6;
+            if top_p < 1.0 {
+                let mut cum = 0.0;
+                for (i, wi) in w.iter().enumerate() {
+                    cum += wi / z;
+                    if cum >= top_p as f64 { keep = i + 1; break; }
+                }
+            }
+            let zk: f64 = w[..keep].iter().sum();
+            for i in 0..6 {
+                let exp = if i < keep { w[i] / zk } else { 0.0 };
+                let got = cnt[i] as f64 / n as f64;
+                assert!((got - exp).abs() < 0.01, "top_p={top_p} token {i}: got {got:.4} expected {exp:.4}");
+            }
+        }
+    }
+
+    #[test]
     fn greedy_picks_max() {
         let mut s = Sampler::new(SamplerParams::greedy());
         assert_eq!(s.sample(&mut [0.1, 3.0, -1.0, f32::NEG_INFINITY]), 1);
@@ -148,3 +227,20 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod speed {
+    use super::*;
+    #[test]
+    #[ignore = "benchmark"]
+    fn sampler_speed() {
+        let n = 248_320usize;
+        let mut s = 12345u64;
+        let base: Vec<f32> = (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 40) as f32 / 16777216.0) * 20.0 - 10.0 }).collect();
+        for (k, p) in [(40usize, 0.95f32), (0, 0.95), (0, 1.0)] {
+            let mut sm = Sampler::new(SamplerParams { temperature: 0.7, top_k: k, top_p: p, ..Default::default() });
+            let t = std::time::Instant::now();
+            for _ in 0..20 { let mut l = base.clone(); std::hint::black_box(sm.sample(&mut l)); }
+            eprintln!("top_k={k} top_p={p}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 20.0);
+        }
+    }
+}

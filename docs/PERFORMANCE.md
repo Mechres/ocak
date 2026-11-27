@@ -90,6 +90,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | MTP verify: DeltaNet / conv kernels write the post-token-0 rollback state from registers (was: per-token dispatches + copies with transfer barriers in all 48 layers) | verify 33.6 -> 32.7 ms; IQ2_S 47.8 tok/s |
 | Host-cached staging buffer (was write-combined: CPU reads ~200 MB/s) | 1 MB logits download 4.5 -> 0.2 ms; sampled decode Qwen3.8 IQ2_S 26.5 -> 33.7 tok/s |
 | MTP for sampled decoding by default (sample from the target logits, accept the draft iff it equals the sample: exact, same draw count per token) | Qwen3.8 Q2_K at T=0.7: 24.5 -> 37.9 tok/s |
+| Sampler without a full-vocabulary sort when top_k = 0 (O(n) for plain temperature; growing top-M prefix for top_p / min_p) | top_k = 0 sampling 8.0 -> 1.8 ms per token (248k vocab) |
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
