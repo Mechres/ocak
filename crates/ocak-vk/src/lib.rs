@@ -259,13 +259,6 @@ fn qmmq_index(ty: WType) -> Option<usize> {
     }
 }
 
-/// Formats whose scale changes every 16 columns (two fix-ups per 32-column block). In the
-/// grouped (MoE) kernel's narrow 32-column tiles that overhead outweighs the int8 gain, so they
-/// keep the fp16-tile grouped path.
-fn qmmq_scale16(ty: WType) -> bool {
-    matches!(ty, WType::Q6K | WType::Q2K | WType::Q3K | WType::IQ2XS | WType::IQ2S | WType::IQ1M | WType::NVFP4)
-}
-
 /// Integer-dot prefill matmuls are on unless OCAK_MMQ=0.
 fn mmq_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1848,7 +1841,7 @@ impl<'a> Recorder<'a> {
         }
         let use_list = list.is_some() as u32;
         let lbuf = list.map(|b| b.buf).unwrap_or(self.ctx.iq_buf);
-        if let Some(qi) = qmmq_index(ty).filter(|_| !qmmq_scale16(ty)) {
+        if let Some(qi) = qmmq_index(ty) {
             if x_stride == k && w_off.is_multiple_of(4) && slice_bytes.is_multiple_of(4) {
                 if let Some(q_off) = self.quantize_q8(x, x_off, k, x_rows) {
                     let n = x_rows as u64 * k as u64;
@@ -2808,7 +2801,7 @@ mod tests {
             c.download(&by_r, 0, bytemuck::cast_slice_mut(&mut yr)).unwrap();
             let scale = yr.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
             // fp16 tiles: ~5e-4 of scale; int8 activations: ~2e-4 mean, up to ~1e-2 per element.
-            let tol = if mmq && qmmq_index(wt).is_some() && !qmmq_scale16(wt) { 2e-2 } else { 3e-3 };
+            let tol = if mmq && qmmq_index(wt).is_some() { 2e-2 } else { 3e-3 };
             for i in 0..n_ent * m {
                 assert!((yg[i] - yr[i]).abs() <= tol * scale, "grouped(list) {wt:?} mmq={mmq} idx={i}: {} vs {}", yg[i], yr[i]);
             }

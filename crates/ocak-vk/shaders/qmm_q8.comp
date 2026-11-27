@@ -12,6 +12,10 @@
 #if defined(Q6_K) || defined(Q2_K) || defined(Q3_K) || defined(IQ2_XS) || defined(IQ2_S) || defined(IQ1_M) || defined(NVFP4)
 #define SCALE16
 #endif
+// Formats with a per-block min (weights d * q - m); the others skip the min fix-up.
+#if defined(Q4_K) || defined(Q5_K) || defined(Q2_K)
+#define HAS_MIN
+#endif
 #define TM 4u
 #define BM 64u
 #ifdef GROUPED
@@ -46,8 +50,12 @@ layout(push_constant) uniform PC { uint w_off; uint q_off4; uint s_off; uint y_o
 
 shared uvec4 ws[8u * (BM / 4u)];   // [k word][row / 4] (4 consecutive rows per uvec4)
 shared uvec4 xs[8u * (BN / 4u)];   // [k word][col / 4]
-shared vec4 wsc[BM];               // (d0, m0, d1, m1) per row for the two 16-col halves
-shared vec4 xss[BN];               // (dx, dx*sum0, dx*sum1, -)
+shared float wsd[2u * BM];         // weight scale d per row, for the two 16-col halves
+shared float xsd[BN];              // activation scale dx per column
+#ifdef HAS_MIN
+shared float wsm[2u * BM];         // weight min m per row and half
+shared float xsm[2u * BN];         // dx * sum(qx) per column and half
+#endif
 
 #include "dequant_i8.glsl"
 
@@ -105,11 +113,21 @@ void main() {
             uint kw = ld_part * 2u;
             ws[kw * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq0;
             ws[(kw + 1u) * (BM / 4u) + (ld_row >> 2)][ld_row & 3u] = pq1;
-            if (ld_part == 0u) { wsc[ld_row].x = pd; wsc[ld_row].y = pm; }
-            if (ld_part == 2u) { wsc[ld_row].z = pd; wsc[ld_row].w = pm; }
+            if ((ld_part & 1u) == 0u) {
+                wsd[(ld_part >> 1) * BM + ld_row] = pd;
+#ifdef HAS_MIN
+                wsm[(ld_part >> 1) * BM + ld_row] = pm;
+#endif
+            }
             for (uint c = 0u; c < WPT; c++)
                 xs[(x_part * WPT + c) * (BN / 4u) + (x_col >> 2)][x_col & 3u] = pxv[c];
-            if (x_part == 0u) xss[x_col] = pxs;
+            if (x_part == 0u) {
+                xsd[x_col] = pxs.x;
+#ifdef HAS_MIN
+                xsm[x_col] = pxs.y;
+                xsm[BN + x_col] = pxs.z;
+#endif
+            }
         }
         barrier();
         if (kb + 1u < kblocks) {
@@ -143,16 +161,23 @@ void main() {
                 }
 #endif
             }
-            vec2 wdm[TM];
-            for (uint i = 0u; i < TM; i++) {
-                vec4 s = wsc[tx * TM + i];
-                wdm[i] = (h == 0u) ? s.xy : s.zw;
-            }
+            float wd[TM];
+            for (uint i = 0u; i < TM; i++) wd[i] = wsd[h * BM + tx * TM + i];
+#ifdef HAS_MIN
+            float wm[TM];
+            for (uint i = 0u; i < TM; i++) wm[i] = wsm[h * BM + tx * TM + i];
+#endif
             for (uint j = 0u; j < TN; j++) {
-                vec4 xv = xss[ty * TN + j];
-                float xs_h = (h == 0u) ? xv.y : xv.z;
+                float xd = xsd[ty * TN + j];
+#ifdef HAS_MIN
+                float xm = xsm[h * BN + ty * TN + j];
+#endif
                 for (uint i = 0u; i < TM; i++)
-                    acc[j][i] += float(ia[j][i]) * (wdm[i].x * xv.x) - wdm[i].y * xs_h;
+#ifdef HAS_MIN
+                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - wm[i] * xm;
+#else
+                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd);
+#endif
             }
         }
 #else
@@ -180,13 +205,23 @@ void main() {
                 }
 #endif
             }
-            vec2 wdm[TM];
-            for (uint i = 0u; i < TM; i++) wdm[i] = wsc[tx * TM + i].xy;
+            float wd[TM];
+            for (uint i = 0u; i < TM; i++) wd[i] = wsd[tx * TM + i];
+#ifdef HAS_MIN
+            float wm[TM];
+            for (uint i = 0u; i < TM; i++) wm[i] = wsm[tx * TM + i];
+#endif
             for (uint j = 0u; j < TN; j++) {
-                vec4 xv = xss[ty * TN + j];
-                float xsum = xv.y + xv.z;
+                float xd = xsd[ty * TN + j];
+#ifdef HAS_MIN
+                float xm = xsm[ty * TN + j] + xsm[BN + ty * TN + j];
+#endif
                 for (uint i = 0u; i < TM; i++)
-                    acc[j][i] += float(ia[j][i]) * (wdm[i].x * xv.x) - wdm[i].y * xsum;
+#ifdef HAS_MIN
+                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd) - wm[i] * xm;
+#else
+                    acc[j][i] += float(ia[j][i]) * (wd[i] * xd);
+#endif
             }
         }
 #endif
