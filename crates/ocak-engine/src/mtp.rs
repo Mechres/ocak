@@ -338,7 +338,7 @@ impl MtpDrafter {
     pub fn warmup_kv_batch(&mut self, hs: &[Vec<f32>], tokens: &[u32], pos0: usize) -> Result<usize, EngineError> {
         let n_all = hs.len().min(tokens.len()).min(self.max_ctx.saturating_sub(pos0));
         #[cfg(feature = "vulkan")]
-        if self.gpu.is_some() {
+        if self.has_gpu() {
             let c = self.cfg.clone();
             let (ne, nkv, hd) = (c.n_embd, c.n_head_kv, c.head_dim);
             let kv_dim = nkv * hd;
@@ -353,7 +353,7 @@ impl MtpDrafter {
                     dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[t * rb..(t + 1) * rb], &mut tok_e[r * ne..(r + 1) * ne], ne);
                     hcat[r * ne..(r + 1) * ne].copy_from_slice(&hs[done + r]);
                 }
-                let gp = self.gpu.as_mut().unwrap();
+                let Some(gp) = self.gpu.as_mut() else { break };
                 if gp.warm.is_none() {
                     let mk = |elems: usize| gp.ctx.create_device_buffer((elems * 4) as u64).map_err(|e| EngineError::Backend(e.to_string()));
                     gp.warm = Some(WarmBufs {
@@ -366,8 +366,8 @@ impl MtpDrafter {
                         v: mk(WARM_ROWS * kv_dim)?,
                     });
                 }
-                let gp = self.gpu.as_ref().unwrap();
-                let wb = gp.warm.as_ref().unwrap();
+                let Some(gp) = self.gpu.as_ref() else { break };
+                let Some(wb) = gp.warm.as_ref() else { break };
                 gp.ctx.upload(&wb.tok_e, 0, bytemuck::cast_slice(&tok_e)).map_err(|e| EngineError::Backend(e.to_string()))?;
                 gp.ctx.upload(&wb.h, 0, bytemuck::cast_slice(&hcat)).map_err(|e| EngineError::Backend(e.to_string()))?;
                 let (ne32, nb) = (ne as u32, n as u32);
