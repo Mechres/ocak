@@ -1508,8 +1508,20 @@ impl<'a> Recorder<'a> {
     /// Integer-dot matvec for 1..8 tokens (decode / MTP verify): activations quantized to int8
     /// blocks (shared with other matvecs on the same input), weights unpacked to int8.
     fn qmv_int8(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, batch: u32) -> bool {
+        // Tiny matvecs (e.g. Xing's per-head absorbed projections, ~1500 per token) would pay an
+        // activation-quantize dispatch and barrier each, serializing work that otherwise overlaps.
+        // Q8_0 weights gain little from int8 activations (the float kernel is already cheap per
+        // weight), so they skip the extra quantize dispatch.
+        if !qmv_int8_enabled() || (k as u64) * (m as u64) < (1 << 20) || ty == WType::Q8_0 {
+            return false;
+        }
+        self.qmv_int8_dispatch(ty, w, w_off, x, x_off, y, y_off, k, m, batch)
+    }
+
+    /// qmv_int8 without the size / format heuristics (also used directly by tests).
+    fn qmv_int8_dispatch(&mut self, ty: WType, w: &Buffer, w_off: u64, x: &Buffer, x_off: u64, y: &Buffer, y_off: u64, k: u32, m: u32, batch: u32) -> bool {
         let Some(qi) = qmmq_index(ty) else { return false };
-        if !qmv_int8_enabled() || batch == 0 || batch > 8 || !w_off.is_multiple_of(4) {
+        if batch == 0 || batch > 8 || !w_off.is_multiple_of(4) {
             return false;
         }
         let Some(q_off) = self.quantize_q8(x, x_off, k, batch) else { return false };
@@ -1934,6 +1946,7 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn moe_topk_batch(&mut self, logits: &Buffer, bias: &Buffer, ids: &Buffer, weights: &Buffer, n_exp: u32, n_used: u32, has_bias: bool, norm_w: bool, scale: f32, batch: u32) {
+        assert!(n_exp <= 256 && n_used <= n_exp, "moe_topk supports up to 256 experts");
         let pc = [n_exp, n_used, has_bias as u32, norm_w as u32, scale.to_bits()];
         self.dispatch_raw(&self.ctx.pipelines.moe_topk, &[logits.buf, bias.buf, ids.buf, weights.buf], bytemuck::cast_slice(&pc), 1, batch, 1);
     }
@@ -3138,7 +3151,7 @@ mod tests {
         c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
         let by_a = c.create_device_buffer((count * m * 4) as u64).unwrap();
         let by_b = c.create_device_buffer((count * m * 4) as u64).unwrap();
-        for wt in [WType::IQ3S, WType::Q8_0, WType::Q4K, WType::Q6K, WType::IQ2XS, WType::NVFP4, WType::Q2K] {
+        for wt in [WType::IQ3S, WType::Q8_0, WType::Q4K, WType::Q6K, WType::IQ2XS, WType::NVFP4, WType::Q2K, WType::IQ1S] {
             let slice = m * wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = (0..n_exp * slice).map(|_| next_u8() & 0x3F).collect();
             let bw = c.create_device_buffer(raw.len() as u64).unwrap();
@@ -3301,7 +3314,7 @@ mod tests {
             c.upload(&bw, 0, &raw).unwrap();
             for batch in [1usize, 3, 8] {
                 let mut rec = c.begin();
-                assert!(rec.qmv_int8(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch as u32));
+                assert!(rec.qmv_int8_dispatch(wt, &bw, 0, &bx, 0, &by_a, 0, k as u32, m as u32, batch as u32));
                 for b in 0..batch {
                     rec.qmv_classic(wt, &bw, 0, &bx, (b * k) as u64, &by_b, (b * m) as u64, k as u32, m as u32);
                 }

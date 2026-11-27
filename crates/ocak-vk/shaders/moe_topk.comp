@@ -1,5 +1,10 @@
 #version 460
-layout(local_size_x = 1) in;
+// MoE router: sigmoid probabilities, top-n_used experts by (probability + optional bias), output
+// in descending order with weights = probability * scale (optionally normalized to sum 1 first).
+// One workgroup per token, one thread per expert (n_exp <= 256): an expert's output slot is its
+// rank, the number of experts with a larger biased score (ties: lower index first), which gives
+// the same order as repeated argmax.
+layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Logits { float logits[]; };
 layout(set = 0, binding = 1) readonly buffer Bias { float bias[]; };
 layout(set = 0, binding = 2) writeonly buffer Ids { uint ids[]; };
@@ -11,36 +16,37 @@ layout(push_constant) uniform PC {
     uint norm_w;
     float scale;
 } pc;
+shared float sb[256];
+shared float sel_p[256];
 void main() {
     uint b = gl_WorkGroupID.y;
+    uint e = gl_LocalInvocationID.x;
     uint lg_off = b * pc.n_exp;
     uint out_off = b * pc.n_used;
-    float probs[128];
-    float biased[128];
-    uint used_mask[128];
-    for (uint e = 0u; e < pc.n_exp; e++) {
-        float p = 1.0 / (1.0 + exp(-logits[lg_off + e]));
-        probs[e] = p;
-        biased[e] = p + ((pc.has_bias != 0u) ? bias[e] : 0.0);
-        used_mask[e] = 0u;
+    float p = 0.0;
+    if (e < pc.n_exp) {
+        p = 1.0 / (1.0 + exp(-logits[lg_off + e]));
+        sb[e] = p + ((pc.has_bias != 0u) ? bias[e] : 0.0);
     }
-    float wsum = 0.0;
-    for (uint k = 0u; k < pc.n_used; k++) {
-        uint best = 0u;
-        float best_v = -1e30;
-        for (uint e = 0u; e < pc.n_exp; e++) {
-            if (used_mask[e] == 0u && biased[e] > best_v) {
-                best_v = biased[e];
-                best = e;
-            }
+    barrier();
+    uint rank = 0xFFFFFFFFu;
+    if (e < pc.n_exp) {
+        float v = sb[e];
+        rank = 0u;
+        for (uint o = 0u; o < pc.n_exp; o++) {
+            float u = sb[o];
+            rank += (u > v || (u == v && o < e)) ? 1u : 0u;
         }
-        used_mask[best] = 1u;
-        ids[out_off + k] = best;
-        weights[out_off + k] = probs[best];
-        wsum += probs[best];
+        if (rank < pc.n_used) {
+            ids[out_off + rank] = e;
+            sel_p[rank] = p;
+        }
     }
-    float mult = (pc.norm_w != 0u) ? (pc.scale / (wsum + 1e-20)) : pc.scale;
-    for (uint k = 0u; k < pc.n_used; k++) {
-        weights[out_off + k] *= mult;
+    barrier();
+    if (rank < pc.n_used) {
+        float wsum = 0.0;
+        for (uint k = 0u; k < pc.n_used; k++) wsum += sel_p[k];   // same order as before
+        float mult = (pc.norm_w != 0u) ? (pc.scale / (wsum + 1e-20)) : pc.scale;
+        weights[out_off + rank] = p * mult;
     }
 }
