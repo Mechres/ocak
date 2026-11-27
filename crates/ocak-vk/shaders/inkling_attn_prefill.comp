@@ -1,0 +1,203 @@
+#version 460
+#extension GL_KHR_shader_subgroup_clustered : require
+// Flash-style Inkling prefill attention (replaces inkling_attn_batch.comp for batches): same
+// math (Q/R clipping, log-scale temperature tau, relative-position bias, zero-logit sink,
+// sigmoid output gate, SWA ring cache), but a workgroup (kv head, tile) owns R = group * (64 /
+// group) query rows (the `group` heads sharing KV head kvh, for 64 / group tokens) and stages
+// each BK-key tile of K, V and the relative-bias rows it needs in shared memory once for all
+// rows. Thread layout as attention_prefill.comp: row r = tid / 4, the 4 lanes of a row split
+// the keys (scores) and the output dims. Requires head_dim == 128 and n_rel <= 16.
+#define HD 128u
+#define HHD 64u            // packed f16x2 per row
+#define BK 32u
+#define KPT (BK / 4u)      // keys per lane
+#define DPT (HHD / 4u)     // packed output dims per lane
+#define NREL 16u
+#define RB_ROWS 64u        // relative-bias rows staged per tile (>= BK + 64 / group - 1)
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer Rr { float rr[]; };
+layout(set = 0, binding = 2) readonly buffer Sinks { float sinks[]; };
+layout(set = 0, binding = 3) readonly buffer Gate { float gate[]; };
+layout(set = 0, binding = 4) readonly buffer QClip { float qclip[]; };
+layout(set = 0, binding = 5) readonly buffer RClip { float rclip[]; };
+layout(set = 0, binding = 6) readonly buffer RelBias { float rbias[]; };
+layout(set = 0, binding = 7) readonly buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 8) readonly buffer VCache { uint vcache[]; };
+layout(set = 0, binding = 9) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint q_off; uint q_stride;
+    uint r_off; uint r_stride;
+    uint s_off; uint s_stride;
+    uint g_off; uint g_stride;
+    uint n_head;
+    uint n_head_kv;
+    uint hd;
+    uint n_rel;
+    uint n_extent;
+    uint n_swa;
+    uint is_swa;
+    uint cap;
+    uint pos;
+    uint kv_slot_off;
+    float qk_clip;
+    float rel_clip;
+    float log_alpha;
+    float log_floor;
+    uint n_tok;
+} pc;
+
+shared uint qs[64u * HHD];
+shared uint ks[BK * HHD];
+shared uint vs[BK * HHD];
+shared float ps[64u * BK];
+shared float rbs[RB_ROWS * NREL];
+
+void main() {
+    uint kvh = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint group = pc.n_head / pc.n_head_kv;
+    uint bq = 64u / group;
+    uint rows = bq * group;
+    uint q0 = gl_WorkGroupID.y * bq;
+    uint half_kv_dim = pc.n_head_kv * HHD;
+    float scale = inversesqrt(float(HD));
+
+    uint r = tid >> 2;
+    uint sub = tid & 3u;
+    uint tok_r = q0 + r / group;
+    uint h = kvh * group + r % group;
+    bool row_valid = r < rows && tok_r < pc.n_tok;
+    uint tok_c = min(tok_r, pc.n_tok - 1u);   // clamped for loads
+    uint tpos = pc.pos + tok_c;
+    float tau = (pc.is_swa == 0u) ? (1.0 + pc.log_alpha * log(max((float(tpos) + 1.0) / pc.log_floor, 1.0))) : 1.0;
+
+    // Q: clip by qclip, row norm clip to qk_clip, times tau and 1/sqrt(hd); the 4 lanes of a
+    // row each own 32 dims. Stored as packed f16.
+    {
+        uint qb = pc.q_off + tok_c * pc.q_stride + h * HD + sub * 32u;
+        float qv[32];
+        float ss = 0.0;
+        for (uint e = 0u; e < 32u; e++) {
+            qv[e] = q[qb + e] * qclip[h * HD + sub * 32u + e];
+            ss += qv[e] * qv[e];
+        }
+        ss = subgroupClusteredAdd(ss, 4u);
+        float qn = sqrt(ss);
+        float qf = ((qn > pc.qk_clip) ? (pc.qk_clip / qn) : 1.0) * tau * scale;
+        for (uint e = 0u; e < 16u; e++)
+            qs[r * HHD + sub * 16u + e] = packHalf2x16(vec2(qv[2u * e], qv[2u * e + 1u]) * (row_valid ? qf : 0.0));
+    }
+    // R (relative query, n_rel <= 16): clip, norm clip to rel_clip, times tau. Kept in registers
+    // (all 4 lanes of the row hold the full vector).
+    float srow[NREL];
+    {
+        float rs = 0.0;
+        for (uint j = 0u; j < NREL; j++) {
+            float v = (j < pc.n_rel) ? rr[pc.r_off + tok_c * pc.r_stride + h * pc.n_rel + j] * rclip[h * pc.n_rel + j] : 0.0;
+            srow[j] = v;
+            rs += v * v;
+        }
+        float rn = sqrt(rs);
+        float rf = ((rn > pc.rel_clip) ? (pc.rel_clip / rn) : 1.0) * tau;
+        for (uint j = 0u; j < NREL; j++) srow[j] *= rf;
+    }
+    float sink_t = sinks[pc.s_off + tok_c * pc.s_stride + h];
+
+    uint ntq = min(bq, pc.n_tok - q0);
+    uint min_qpos = pc.pos + q0;
+    uint max_qpos = pc.pos + q0 + ntq - 1u;
+    uint t_lo = (pc.is_swa != 0u && min_qpos + 1u > pc.n_swa) ? (min_qpos + 1u - pc.n_swa) : 0u;
+    t_lo = (t_lo / BK) * BK;
+
+    // Online softmax; the zero-logit sink is the initial state (m = 0, l = 1).
+    float m = 0.0;
+    float l = 1.0;
+    vec2 acc[DPT];
+    for (uint j = 0u; j < DPT; j++) acc[j] = vec2(0.0);
+    barrier();
+
+    for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
+        // Stage K/V tile (cache slot = t, or t % cap in the SWA ring).
+        for (uint idx = tid; idx < BK * HHD; idx += 256u) {
+            uint kk = idx / HHD;
+            uint e = idx % HHD;
+            uint t = t0 + kk;
+            uint kval = 0u, vval = 0u;
+            if (t <= max_qpos) {
+                uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
+                uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + e;
+                kval = kcache[kb];
+                vval = vcache[kb];
+            }
+            ks[kk * HHD + e] = kval;
+            vs[kk * HHD + e] = vval;
+        }
+        // Stage relative-bias rows for distances dist_base .. dist_base + RB_ROWS - 1.
+        uint dist_base = (min_qpos + 1u > t0 + BK) ? (min_qpos + 1u - t0 - BK) : 0u;
+        for (uint idx = tid; idx < RB_ROWS * NREL; idx += 256u) {
+            uint dd = dist_base + idx / NREL;
+            uint j = idx % NREL;
+            rbs[idx] = (dd < pc.n_extent && j < pc.n_rel) ? rbias[dd * pc.n_rel + j] : 0.0;
+        }
+        barrier();
+
+        float s[KPT];
+        for (uint j = 0u; j < KPT; j++) s[j] = 0.0;
+        for (uint e = 0u; e < HHD; e++) {
+            vec2 qv = unpackHalf2x16(qs[r * HHD + e]);
+            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HHD + e]));
+        }
+        float tmax = -3.0e38;
+        for (uint j = 0u; j < KPT; j++) {
+            uint t = t0 + sub * KPT + j;
+            uint qpos = pc.pos + tok_c;
+            bool ok = row_valid && t <= qpos && (pc.is_swa == 0u || qpos - t < pc.n_swa);
+            if (ok) {
+                uint dist = qpos - t;
+                float rb = 0.0;
+                if (dist < pc.n_extent) {
+                    uint ro = (dist - dist_base) * NREL;
+                    for (uint jj = 0u; jj < NREL; jj++) rb += rbs[ro + jj] * srow[jj];
+                }
+                s[j] = s[j] + rb - sink_t;
+            } else {
+                s[j] = -3.0e38;
+            }
+            tmax = max(tmax, s[j]);
+        }
+        tmax = subgroupClusteredMax(tmax, 4u);
+        float m_new = max(m, tmax);
+        float alpha = exp(m - m_new);
+        float psum = 0.0;
+        for (uint j = 0u; j < KPT; j++) {
+            float p = (s[j] > -1.0e38) ? exp(s[j] - m_new) : 0.0;
+            ps[r * BK + sub * KPT + j] = p;
+            psum += p;
+        }
+        psum = subgroupClusteredAdd(psum, 4u);
+        l = l * alpha + psum;
+        m = m_new;
+        for (uint j = 0u; j < DPT; j++) acc[j] *= alpha;
+        barrier();
+
+        for (uint kk = 0u; kk < BK; kk++) {
+            float p = ps[r * BK + kk];
+            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HHD + sub * DPT + j]);
+        }
+        barrier();
+    }
+
+    if (row_valid) {
+        float inv = 1.0 / l;
+        uint gb = pc.g_off + tok_r * pc.g_stride + h * HD;
+        uint ob = (tok_r * pc.n_head + h) * HD;
+        for (uint j = 0u; j < DPT; j++) {
+            uint d = 2u * (sub * DPT + j);
+            float g0 = 1.0 / (1.0 + exp(-gate[gb + d]));
+            float g1 = 1.0 / (1.0 + exp(-gate[gb + d + 1u]));
+            o[ob + d] = acc[j].x * inv * g0;
+            o[ob + d + 1u] = acc[j].y * inv * g1;
+        }
+    }
+}

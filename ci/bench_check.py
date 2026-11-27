@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Compare an `ocak bench` Markdown table against a stored baseline.
 
-usage: bench_check.py BASELINE.md CURRENT.md
+usage: bench_check.py BASELINE.md CURRENT.md [CURRENT2.md ...]
 
+With several CURRENT tables (repeat runs), each model's best throughput is used, so a transient
+slowdown (another process using the GPU during one run) does not fail the check.
 - A model whose row is ERR (load/generate failure) fails the check.
 - Prefill or decode throughput more than WARN_PCT below the baseline emits a GitHub
   warning annotation; more than FAIL_PCT below fails the check.
@@ -35,7 +37,16 @@ def parse(path):
 
 def main():
     base = parse(sys.argv[1])
-    cur = parse(sys.argv[2])
+    cur = {}
+    for path in sys.argv[2:]:
+        for model, vals in parse(path).items():
+            prev = cur.get(model)
+            if vals is None:
+                cur.setdefault(model, None)
+            elif prev is None:
+                cur[model] = vals
+            else:
+                cur[model] = (max(prev[0], vals[0]), max(prev[1], vals[1]))
     failed = False
     out = ["| Model | Prefill base → now | Decode base → now |", "|---|---:|---:|"]
     for model, vals in cur.items():

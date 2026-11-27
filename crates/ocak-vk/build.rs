@@ -85,6 +85,7 @@ fn main() {
         "moe_group",
         "inkling_kv_store",
         "inkling_attn_batch",
+        "inkling_attn_prefill",
     ];
     let has_glslc = Command::new("glslc").arg("--version").output().is_ok();
     let has_usr_glslc = !has_glslc && Command::new("/usr/bin/glslc").arg("--version").output().is_ok();
