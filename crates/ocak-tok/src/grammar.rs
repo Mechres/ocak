@@ -314,25 +314,68 @@ impl JsonGrammar {
     }
 
     /// Allowed-token bitset for the current state over a vocabulary of `n` ids.
-    fn build_mask(&self, tok: &Tokenizer, n: usize) -> Vec<u64> {
+    pub(crate) fn build_mask(&self, tok: &Tokenizer, n: usize) -> Vec<u64> {
         let mut bits = vec![0u64; n.div_ceil(64)];
         let complete = self.is_complete();
         let mut g = JsonGrammar { stack: Vec::with_capacity(self.stack.len() + 8), state: self.state, mask_cache: Default::default() };
-        for i in 0..n {
-            let id = i as u32;
-            let ok = if tok.is_eog(id) {
-                complete
-            } else {
-                let bytes = tok.token_bytes_ref(id);
-                // One reset of a scratch copy per token (no allocation); `step` mutates it in place
-                // (a rejected token's state is dropped, so no per-byte rollback is needed).
-                g.stack.clear();
-                g.stack.extend_from_slice(&self.stack);
-                g.state = self.state;
-                !bytes.is_empty() && bytes.iter().all(|&b| g.step(b))
+        let reset = |g: &mut JsonGrammar| {
+            g.stack.clear();
+            g.stack.extend_from_slice(&self.stack);
+            g.state = self.state;
+        };
+        // First bytes the current state accepts: most tokens fail on their first byte outside
+        // strings, which is then one table lookup instead of a state reset + step.
+        let mut first_ok = [false; 256];
+        for (b, ok) in first_ok.iter_mut().enumerate() {
+            reset(&mut g);
+            *ok = g.step(b as u8);
+        }
+        // Inside a string (no pending escape) a byte >= 0x20 other than '"' and '\\' is accepted and
+        // leaves the state unchanged, so tokens made only of such bytes need no stepping.
+        let plain_string = matches!(self.state, State::InString { escape: false, hex_rem: 0, .. });
+        // JSON whitespace that leaves the state unchanged here (between values): skip a token's
+        // leading whitespace and test its first other byte (~40% of BPE tokens start with ' ').
+        let mut ws_noop = [false; 256];
+        for b in *b" \t\n\r" {
+            reset(&mut g);
+            ws_noop[b as usize] = g.step(b) && g.state == self.state && g.stack == self.stack;
+        }
+        let (data, offs) = tok.token_bytes_table();
+        let n_tab = n.min(offs.len().saturating_sub(1));
+        for i in 0..n_tab {
+            let ok = {
+                let full = &data[offs[i] as usize..offs[i + 1] as usize];
+                let lead = full.iter().take_while(|&&b| ws_noop[b as usize]).count();
+                let bytes = &full[lead..];
+                if full.is_empty() {
+                    false
+                } else if bytes.is_empty() {
+                    true // whitespace only, all no-ops here
+                } else if !first_ok[bytes[0] as usize] {
+                    false
+                } else if plain_string && bytes.iter().all(|&b| b >= 0x20 && b != b'"' && b != b'\\') {
+                    true
+                } else {
+                    // One reset of a scratch copy per token (no allocation); `step` mutates it in
+                    // place (a rejected token's state is dropped, so no per-byte rollback).
+                    reset(&mut g);
+                    bytes.iter().all(|&b| g.step(b))
+                }
             };
             if ok {
                 bits[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        // End-of-generation tokens: allowed exactly when the document is complete (set once here
+        // instead of a hash lookup per vocabulary entry).
+        for id in tok.eog_ids() {
+            let i = id as usize;
+            if i < n {
+                if complete {
+                    bits[i >> 6] |= 1u64 << (i & 63);
+                } else {
+                    bits[i >> 6] &= !(1u64 << (i & 63));
+                }
             }
         }
         bits

@@ -86,19 +86,19 @@ mod tests {
         let gf = ocak_gguf::GgufFile::open(&p).unwrap();
         let tok = Tokenizer::from_gguf(&gf).unwrap();
         let n = tok.n_vocab();
-        let mut g = JsonGrammar::new();
-        assert!(br#"{"name": "a"#.iter().all(|&b| g.feed_byte(b)));
-        let mut logits = vec![0f32; n];
-        g.mask_logits(&tok, &mut logits);
-        let t = std::time::Instant::now();
-        let iters = 3;
-        let mut allowed = 0;
-        for _ in 0..iters {
-            logits.iter_mut().for_each(|l| *l = 0.0);
-            g.mask_logits(&tok, &mut logits);
-            allowed = logits.iter().filter(|l| l.is_finite()).count();
+        let _ = tok.token_bytes_ref(0); // build the byte table outside the timing
+        for prefix in [&br#"{"name": "a"#[..], br#"{"a": 1, "#, br#"{"a": "#, br#"{"a": [1, 2"#, b""] {
+            let mut g = JsonGrammar::new();
+            assert!(prefix.iter().all(|&b| g.feed_byte(b)));
+            let t = std::time::Instant::now();
+            let iters = 3;
+            let mut allowed = 0;
+            for _ in 0..iters {
+                let bits = g.build_mask(&tok, n);
+                allowed = bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+            }
+            eprintln!("json mask miss after {:?}: {:.2} ms ({allowed} allowed)", String::from_utf8_lossy(prefix), t.elapsed().as_secs_f64() * 1e3 / iters as f64);
         }
-        eprintln!("json mask over {n} tokens: {:.2} ms ({allowed} allowed)", t.elapsed().as_secs_f64() * 1e3 / iters as f64);
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub struct Tokenizer {
     chat_template: Option<String>,
     /// Decoded bytes of every token, built on first use (JSON-mode masking reads all of them per
     /// generated token).
-    bytes_table: std::sync::OnceLock<Vec<Box<[u8]>>>,
+    bytes_table: std::sync::OnceLock<(Vec<u8>, Vec<u32>)>,
 }
 
 fn gpt2_byte_to_char() -> [char; 256] {
@@ -178,6 +178,10 @@ impl Tokenizer {
     }
     pub fn is_eog(&self, id: u32) -> bool {
         self.eog.contains(&id)
+    }
+    /// All end-of-generation token ids.
+    pub fn eog_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.eog.iter().copied()
     }
     pub fn add_bos(&self) -> bool {
         self.add_bos
@@ -457,10 +461,31 @@ impl Tokenizer {
         self.token_bytes_ref(id).to_vec()
     }
 
+    /// Decoded bytes of all tokens: (data, offsets); token i is data[offs[i]..offs[i + 1]].
+    pub fn token_bytes_table(&self) -> (&[u8], &[u32]) {
+        let _ = self.token_bytes_ref(0);
+        let (d, o) = self.bytes_table.get().expect("built above");
+        (d, o)
+    }
+
     /// Borrowed decoded bytes of a token (from a table built once per tokenizer).
     pub fn token_bytes_ref(&self, id: u32) -> &[u8] {
-        let t = self.bytes_table.get_or_init(|| (0..self.tokens.len() as u32).map(|i| self.decode_token_bytes(i).into_boxed_slice()).collect());
-        t.get(id as usize).map(|b| &b[..]).unwrap_or(&[])
+        // One contiguous byte array + offsets (a scan over the vocabulary stays sequential).
+        let (data, offs) = self.bytes_table.get_or_init(|| {
+            let mut data = Vec::new();
+            let mut offs = Vec::with_capacity(self.tokens.len() + 1);
+            offs.push(0u32);
+            for i in 0..self.tokens.len() as u32 {
+                data.extend_from_slice(&self.decode_token_bytes(i));
+                offs.push(data.len() as u32);
+            }
+            (data, offs)
+        });
+        let i = id as usize;
+        if i + 1 >= offs.len() {
+            return &[];
+        }
+        &data[offs[i] as usize..offs[i + 1] as usize]
     }
 
     fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
