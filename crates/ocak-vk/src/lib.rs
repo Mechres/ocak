@@ -1955,7 +1955,7 @@ impl<'a> Recorder<'a> {
     pub fn inkling_conv_batch(&mut self, inp: &Buffer, inp_off: u64, inp_stride: u32, wt: &Buffer, dy: &Buffer, dy_off: u64, dy_stride: u32, hist: &Buffer, hist_off: u64, out: &Buffer, out_off: u64, out_stride: u32, n_ch: u32, n_conv: u32, has_dyn: bool, head_ch: u32, n_tok: u32) {
         assert!(n_conv <= 9, "inkling_conv supports n_conv <= 9");
         let pc = [off_u32(inp_off), off_u32(dy_off), off_u32(hist_off), off_u32(out_off), n_ch, n_conv, has_dyn as u32, head_ch, n_tok, inp_stride, dy_stride, out_stride];
-        self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), n_ch.div_ceil(256), 1, 1);
+        self.dispatch_raw(&self.ctx.pipelines.inkling_conv, &[inp.buf, wt.buf, dy.buf, hist.buf, out.buf], bytemuck::cast_slice(&pc), n_ch.div_ceil(32), 1, 1);
     }
 
     /// Batched Inkling prefill pass 1: clip/normalize and store K/V for tokens pos..pos+n_tok.

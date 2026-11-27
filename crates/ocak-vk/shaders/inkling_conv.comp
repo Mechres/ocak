@@ -1,8 +1,10 @@
 #version 460
 // Causal short convolution (+ optional per-head dynamic taps) over n_tok consecutive tokens.
-// One thread per channel walks the tokens in order, keeping the (n_conv - 1)-entry history in
-// registers, and writes the history back at the end. Token t reads inp row t * inp_stride, dyn
-// row t * dy_stride and writes out row t * out_stride.
+// The convolution is over the inputs (no recurrence through the outputs), so tokens are
+// independent: a workgroup handles 32 channels x 8 token lanes (lane l: tokens l, l + 8, ...).
+// Inputs before the chunk come from the (n_conv - 1)-entry history, which is rewritten with the
+// chunk's last inputs after a barrier (all of a channel's tokens live in one workgroup).
+// Token t reads inp row t * inp_stride, dyn row t * dy_stride and writes out row t * out_stride.
 #define MAXH 8u
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Inp { float inp[]; };
@@ -24,29 +26,42 @@ layout(push_constant) uniform PC {
     uint dy_stride;
     uint out_stride;
 } pc;
+float xin(uint c, uint ho, uint nh, int pos) {
+    return (pos >= 0) ? inp[pc.inp_off + uint(pos) * pc.inp_stride + c] : hist[ho + uint(int(nh) + pos)];
+}
+
 void main() {
-    uint c = gl_GlobalInvocationID.x;
-    if (c >= pc.n_ch) return;
+    uint cl = gl_LocalInvocationID.x & 31u;
+    uint tl = gl_LocalInvocationID.x >> 5;
+    uint c = gl_WorkGroupID.x * 32u + cl;
+    bool ch_ok = c < pc.n_ch;
     uint nh = pc.n_conv - 1u;
     uint ho = pc.hist_off + c * nh;
     uint wo = c * pc.n_conv;
-    float h[MAXH];
-    for (uint k = 0u; k < MAXH; k++) h[k] = (k < nh) ? hist[ho + k] : 0.0;
-    float denom = sqrt(float(((pc.has_dyn != 0u) ? 2u : 1u) * pc.n_conv + 1u));
-    uint hh = c / pc.head_ch;
-    for (uint t = 0u; t < pc.n_tok; t++) {
-        float cur_v = inp[pc.inp_off + t * pc.inp_stride + c];
-        float acc = 0.0;
-        for (uint k = 0u; k < nh; k++) acc += h[k] * wt[wo + k];
-        acc += cur_v * wt[wo + nh];
-        if (pc.has_dyn != 0u) {
-            uint d_off = pc.dy_off + t * pc.dy_stride + hh * pc.n_conv;
-            acc += cur_v * dy[d_off];
-            for (uint lag = 1u; lag < pc.n_conv; lag++) acc += h[nh - lag] * dy[d_off + lag];
+    float last[MAXH];
+    if (ch_ok) {
+        float w[MAXH + 1u];
+        for (uint k = 0u; k <= MAXH; k++) w[k] = (k <= nh) ? wt[wo + k] : 0.0;
+        float denom = sqrt(float(((pc.has_dyn != 0u) ? 2u : 1u) * pc.n_conv + 1u));
+        uint hh = c / pc.head_ch;
+        for (uint t = tl; t < pc.n_tok; t += 8u) {
+            float cur_v = inp[pc.inp_off + t * pc.inp_stride + c];
+            float h[MAXH];
+            for (uint k = 0u; k < MAXH; k++) h[k] = (k < nh) ? xin(c, ho, nh, int(t) - int(nh) + int(k)) : 0.0;
+            float acc = cur_v * w[nh];
+            for (uint k = 0u; k < MAXH; k++) if (k < nh) acc += h[k] * w[k];
+            if (pc.has_dyn != 0u) {
+                uint d_off = pc.dy_off + t * pc.dy_stride + hh * pc.n_conv;
+                acc += cur_v * dy[d_off];
+                for (uint lag = 1u; lag < pc.n_conv; lag++) acc += h[nh - lag] * dy[d_off + lag];
+            }
+            o[pc.out_off + t * pc.out_stride + c] = (cur_v + acc) / denom;
         }
-        for (uint k = 0u; k + 1u < nh; k++) h[k] = h[k + 1u];
-        h[nh - 1u] = cur_v;
-        o[pc.out_off + t * pc.out_stride + c] = (cur_v + acc) / denom;
+        // New history = the last nh inputs (may still include old history for short chunks).
+        if (tl == 0u)
+            for (uint k = 0u; k < MAXH; k++) if (k < nh) last[k] = xin(c, ho, nh, int(pc.n_tok) - int(nh) + int(k));
     }
-    for (uint k = 0u; k < nh; k++) hist[ho + k] = h[k];
+    barrier();
+    if (ch_ok && tl == 0u)
+        for (uint k = 0u; k < MAXH; k++) if (k < nh) hist[ho + k] = last[k];
 }
