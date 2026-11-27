@@ -86,6 +86,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | IQ1 grid pre-transformed to 8 (g + 1) per byte (new 4096-word table at [8592, 12688)), so the unpack is one `sub_bytes` per word instead of the borrow-free g + 1 formula; that table in shared memory (the block decoder had been reading the global copy) | IQ1_S matvec 75.6 -> 56.5 us (225 -> 308 GB/s); batch 2 68 us |
 | Sign byte-mask table for IQ2_XS / IQ2_S block decoders (shared memory, per KSIGNS index / raw sign byte; negate as (g ^ M) + ((M >> 7) & 0x01010101) instead of deriving the mask from 4 sign bits) | IQ2_XS 77.8 -> 75.5 us, IQ2_S 84.4 -> 82.8 us; Qwen3.8 IQ2_S decode 36.2 -> 36.3 tok/s |
 | Opt-in `OCAK_PREFILL_Q256=1`: prefill activations with one int8 scale per 256 values (quant_q8 -DGROUP256, same layout); qmm_q8 -DACT256 keeps acc in units of the current activation scale and rescales once per 256, so the fix-up drops the d_w * d_x multiply (lossy: 1.6-1.9x the int8 rounding error in vk_qmm_int8_matches_qmv; Qwen3.8 greedy text identical for ~70 tokens of a summary, then a different wording; count-test passes) | matmul +1-7% (IQ2_XS 2.97 -> 2.78 ms, IQ2_S 2.96 -> 2.80); Qwen3.8 IQ2_S prefill 300.5 -> 313.6 tok/s |
+| Q3_K block decoder: the 12 scale bytes as three word loads instead of four byte loads per block (timing experiments: byte loads ~28% of the kernel, unaligned-word funnels ~11%), and decode from aligned words then realign each result once (110-byte superblocks sit at offset 0 or 2 mod 4) | Q3_K matvec 155 -> 110 us (247 -> 347 GB/s); Qwen3.8 Q2_K decode 27.0 -> 29.9 tok/s, with MTP 41.9 -> 45.8; output identical |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -100,8 +101,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
-IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 308, Q2_K 351, Q3_K 246, Q4_K 336, Q6_K 368,
-Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; Q3_K lags.
+IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 308, Q2_K 351, Q3_K 347, Q4_K 336, Q6_K 368,
+Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit.
 
 ## Tried and rejected (do not repeat without a new idea)
 
@@ -136,6 +137,8 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | int8 path for DeltaNet's 5120x48 Q8_0 `ssm_alpha` / `ssm_beta` when the q8 cache already holds the input | no change (10.6 vs 11.1 us serialized, 36.2 tok/s) | latency-bound: 12 workgroups each walk a serial load chain; skipping both matvecs entirely only gives +1.2% (36.1 -> 36.5), so the ceiling is small |
 | Drafting the second MTP token without the CPU round trip (GPU embedding lookup) | not built: estimated < 0.5% | profile: draft passes are 12% of MTP decode (~3.2 ms each, dominated by the 248k-vocab head matvec); a submit + wait + 4-byte read is ~0.1-0.2 ms per chained draft |
 | Prefill int8 matmul with double-buffered shared tiles (one barrier per K block instead of two) | no change (Q8_0 2.42 vs 2.45 ms, IQ2_S 2.95 vs 3.01 ms at 5120x17408x256) | barriers are not the limit; the loop is instruction-issue bound (see below) |
+| Fuse decode activation quantization into `add_rms_norm` / `rms_norm` (norm kernel also writes the int8 copy; bit-identical, MTP stays exact) | no change (Qwen3.8 IQ2_S 36.2-36.3 tok/s; standalone quant_q8 dispatches halved) | the separate quant dispatch + barrier was not on the critical path |
+| Q3_K: fold the -4 offset into the min term (unsigned 0..7 weights, dot(q - 4, x) = dot(q, x) - 4 sum(x)) | no change (154 vs 155 us; 110 us either way after the scale fix) | the kernel was load-bound (byte loads), not ALU-bound; dropped to keep the old bits |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
@@ -151,9 +154,8 @@ big lever is fewer fix-ups (coarser activation scales: lossy). Reference: llama.
 
 ## Open ideas (not tried yet)
 
-- Decode: the Q3_K block decoder reaches only ~246 GB/s (others 300-370).
-- Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
-  input).
+- Decode: other block decoders with several single-byte scale loads per block (IQ1_M, the dqi8
+  prefill unpackers) may gain from the same word-load treatment as Q3_K.
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).
 - Prefill: the per-256 opt-in still converts every block's int32 dot to float; accumulating
   ia * integer weight sub-scale in int32 needs a 24-bit multiply ACO only emits when it can prove

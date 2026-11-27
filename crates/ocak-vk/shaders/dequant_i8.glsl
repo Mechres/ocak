@@ -485,17 +485,25 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     uint g = ib & 3u;
     uint qo = b + 32u + half_ * 32u;
     uint hs = half_ * 4u + g;
+    // Decode from aligned words (all ops are per byte), then realign each result once instead of
+    // realigning both inputs (qo and b share their offset mod 4).
+    uint sh = (b & 3u) << 3;
+    uint qa = qo >> 2, ha = b >> 2;
+    uint prev = ((w32[qa] >> (2u * g)) & 0x03030303u) | (((w32[ha] >> hs) & 0x01010101u) << 2);
     for (uint wv = 0u; wv < 8u; wv++) {
-        uint lo = (bytes4(qo + 4u * wv) >> (2u * g)) & 0x03030303u;
-        uint hm = (bytes4(b + 4u * wv) >> hs) & 0x01010101u;
-        q[wv] = sub_bytes(lo | (hm << 2), 0x04040404u);
+        uint next = ((w32[qa + wv + 1u] >> (2u * g)) & 0x03030303u) | (((w32[ha + wv + 1u] >> hs) & 0x01010101u) << 2);
+        q[wv] = sub_bytes((prev >> sh) | ((next << 1) << (31u - sh)), 0x04040404u);
+        prev = next;
     }
     float d = f16at(b + 108u);
+    // The 12 scale bytes as three words (byte loads cost ~28% of the kernel time).
+    uint s01 = bytes4(b + 96u + 4u * (g >> 1));   // bytes 96 + is (is & 7 = 2g + h < 8)
+    uint s2w = bytes4(b + 104u);
     float dh[2];
     for (uint h = 0u; h < 2u; h++) {
         uint is = half_ * 8u + 2u * g + h;
-        uint lo4 = (is < 8u) ? (uint(w[b + 96u + is]) & 0xFu) : (uint(w[b + 96u + is - 8u]) >> 4);
-        uint hi2 = (uint(w[b + 104u + (is & 3u)]) >> (2u * (is >> 2))) & 3u;
+        uint lo4 = (s01 >> (8u * (is & 3u) + 4u * half_)) & 0xFu;
+        uint hi2 = (s2w >> (8u * (is & 3u) + 2u * (is >> 2))) & 3u;
         dh[h] = d * float(int(lo4 | (hi2 << 4)) - 32);
     }
     dm = vec4(dh[0], dh[1], 0.0, 0.0);
