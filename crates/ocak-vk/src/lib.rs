@@ -1428,7 +1428,10 @@ impl<'a> Recorder<'a> {
         if self.qmv_int8(ty, w, w_off, x, x_off, y, y_off, k, m, 1) {
             return;
         }
-        if qmvm_beats_qmv(ty) && k.is_multiple_of(32) {
+        // Same kernel as the 2..8-token path (qmm) so MTP verification reproduces single-token
+        // decode bit for bit (speculative decoding stays lossless). Large matrices already take
+        // the int8 path above; this only affects small / Q8_0 ones.
+        if k.is_multiple_of(32) {
             let pc = [off_u32(w_off), off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), 1];
             let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
             self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(4), 1, 1);
@@ -2699,6 +2702,40 @@ mod tests {
     }
 
     #[test]
+    fn vk_matvec_batch_matches_single_bitwise() {
+        // Speculative decoding (MTP) verifies drafts with a multi-token matvec; it must reproduce
+        // single-token decode exactly or greedy output changes when MTP is on.
+        let c = ctx();
+        let (k, m) = (2048usize, 600usize);
+        let mut rng = Lcg(77);
+        let x: Vec<f32> = (0..3 * k).map(|_| rng.f()).collect();
+        let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
+        c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
+        let ya = c.create_device_buffer((3 * m * 4) as u64).unwrap();
+        let yb = c.create_device_buffer((3 * m * 4) as u64).unwrap();
+        for wt in [WType::Q4K, WType::Q6K, WType::Q8_0, WType::IQ2S, WType::Q2K] {
+            let raw: Vec<u8> = (0..m * wt.row_bytes(k as u32) as usize).map(|_| (rng.next() & 0x3F) as u8).collect();
+            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
+            c.upload(&bw, 0, &raw).unwrap();
+            let mut rec = c.begin();
+            rec.qmm(wt, &bw, 0, &bx, 0, &ya, 0, k as u32, m as u32, 3);
+            rec.finish_and_wait().unwrap();
+            for t in 0..3 {
+                let mut rec = c.begin();
+                rec.qmv(wt, &bw, 0, &bx, (t * k) as u64, &yb, (t * m) as u64, k as u32, m as u32);
+                rec.finish_and_wait().unwrap();
+            }
+            let mut a = vec![0f32; 3 * m];
+            let mut b = vec![0f32; 3 * m];
+            c.download(&ya, 0, bytemuck::cast_slice_mut(&mut a)).unwrap();
+            c.download(&yb, 0, bytemuck::cast_slice_mut(&mut b)).unwrap();
+            for i in 0..3 * m {
+                assert!(a[i].to_bits() == b[i].to_bits(), "{wt:?} idx {i}: batch {} vs single {}", a[i], b[i]);
+            }
+        }
+    }
+
+    #[test]
     fn vk_context_create_drop_twice() {
         for _ in 0..2 {
             let tmp = VkContext::new().unwrap();
@@ -3010,33 +3047,38 @@ mod tests {
     #[test]
     #[ignore = "benchmark"]
     fn vk_small_batch_bench() {
+        // Decode-shaped matvecs (Qwen3.8 FFN: k=5120, m=17408). Six weight copies are rotated so
+        // the weights come from VRAM rather than the 96 MB Infinity Cache.
         let c = VkContext::new().expect("vulkan init");
-        let (k, m) = (4096usize, 12288usize);
+        let (k, m) = (5120usize, 17408usize);
         let x: Vec<f32> = (0..8 * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
         let bx = c.create_device_buffer((x.len() * 4) as u64).unwrap();
         c.upload(&bx, 0, bytemuck::cast_slice(&x)).unwrap();
         let by = c.create_device_buffer((8 * m * 4) as u64).unwrap();
-        for wt in [WType::Q6K, WType::Q4K, WType::Q8_0, WType::IQ3S, WType::Q2K] {
+        for wt in [WType::IQ2XXS, WType::IQ2S, WType::IQ2XS, WType::IQ3XXS, WType::IQ3S, WType::IQ1S, WType::Q2K, WType::Q3K, WType::Q4K, WType::Q6K, WType::Q8_0] {
             let rb = wt.row_bytes(k as u32) as usize;
             let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
-            let bw = c.create_device_buffer(raw.len() as u64).unwrap();
-            c.upload(&bw, 0, &raw).unwrap();
-            for batch in [1u32, 2, 4, 8] {
+            let bws: Vec<_> = (0..6).map(|_| {
+                let b = c.create_device_buffer(raw.len() as u64).unwrap();
+                c.upload(&b, 0, &raw).unwrap();
+                b
+            }).collect();
+            for batch in [1u32, 2] {
                 let run = |n: usize| {
                     let mut rec = c.begin();
-                    for _ in 0..n {
-                        rec.qmm(wt, &bw, 0, &bx, 0, &by, 0, k as u32, m as u32, batch);
+                    for i in 0..n {
+                        rec.qmm(wt, &bws[i % 6], 0, &bx, 0, &by, 0, k as u32, m as u32, batch);
                     }
                     rec.finish_and_wait().unwrap();
                 };
-                run(100);
+                run(30);
                 let mut dt = f64::MAX;
                 for _ in 0..5 {
                     let t = std::time::Instant::now();
-                    run(100);
-                    dt = dt.min(t.elapsed().as_secs_f64() / 100.0);
+                    run(60);
+                    dt = dt.min(t.elapsed().as_secs_f64() / 60.0);
                 }
-                eprintln!("{wt:?} batch={batch}: {:.3} ms  ({:.0} GB/s weights)", dt * 1e3, raw.len() as f64 / dt / 1e9);
+                eprintln!("{wt:?} batch={batch}: {:.1} us  ({:.0} GB/s weights)", dt * 1e6, raw.len() as f64 / dt / 1e9);
             }
         }
     }

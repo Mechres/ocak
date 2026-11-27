@@ -161,6 +161,8 @@ cargo test --release --workspace
 
 Performance work log (methodology, what helped, and what was tried and rejected): [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+Experimental: `OCAK_MTP_FROM=/path/to/other.gguf` borrows the NextN MTP draft head from another GGUF of the same model when the loaded file has none (e.g. a Qwen3.8 IQ2_S quant without `blk.64`), enabling lossless speculative decoding.
+
 ---
 
 ## License

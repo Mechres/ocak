@@ -130,6 +130,19 @@ impl NativeEngine {
         } };
         let backend_name = exec.name();
         let mut mtp = crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten();
+        // Experimental: borrow the NextN MTP head from another GGUF of the same base model when
+        // this file has none (e.g. a quant whose converter dropped blk.{n_layer}).
+        if mtp.is_none() && opts.backend == BackendKind::Vulkan {
+            if let Ok(path) = std::env::var("OCAK_MTP_FROM") {
+                match load_foreign_mtp(&path, &cfg, max_ctx) {
+                    Ok(m) => {
+                        eprintln!("ocak: MTP head borrowed from {path}");
+                        mtp = Some(m);
+                    }
+                    Err(e) => eprintln!("ocak: OCAK_MTP_FROM={path} not usable: {e}"),
+                }
+            }
+        }
         #[cfg(feature = "vulkan")]
         if let (Some(m), Some((ctx, hb, hty, hk, hm))) = (mtp.as_mut(), exec.mtp_gpu_shared()) {
             let _ = m.attach_gpu(ctx, hb, hty, hk, hm);
@@ -799,6 +812,21 @@ pub struct ActiveSlot {
 /// Free VRAM (bytes) left for the KV cache after loading `weight_bytes` of weights, from the
 /// amdgpu sysfs counters. Keeps a margin for activations, staging, scratch and other apps.
 /// Returns None when no AMD GPU telemetry is available (no clamping is applied then).
+/// MTP drafter from another GGUF (`OCAK_MTP_FROM`): same architecture, width, layer count and
+/// vocabulary as the loaded model, with a NextN layer.
+fn load_foreign_mtp(path: &str, cfg: &ModelConfig, max_ctx: usize) -> Result<crate::mtp::MtpDrafter, EngineError> {
+    let g = Arc::new(GgufFile::open(path).map_err(|e| EngineError::Gguf(e.to_string()))?);
+    let other = ModelConfig::from_gguf(&g)?;
+    if other.arch != cfg.arch || other.n_embd != cfg.n_embd || other.n_layer != cfg.n_layer || other.n_vocab != cfg.n_vocab {
+        return Err(EngineError::Unsupported(format!(
+            "model mismatch (arch {} / {}, n_embd {} / {}, n_layer {} / {}, n_vocab {} / {})",
+            other.arch, cfg.arch, other.n_embd, cfg.n_embd, other.n_layer, cfg.n_layer, other.n_vocab, cfg.n_vocab
+        )));
+    }
+    crate::mtp::MtpDrafter::try_load(g, cfg.clone(), max_ctx)?
+        .ok_or_else(|| EngineError::Unsupported("no NextN MTP layer in that file".into()))
+}
+
 fn vram_kv_budget(weight_bytes: u64) -> Option<u64> {
     const MARGIN: u64 = 768 * 1024 * 1024;
     let tel = ocak_sysfs::amdgpu::discover_amd_gpu()?.telemetry();

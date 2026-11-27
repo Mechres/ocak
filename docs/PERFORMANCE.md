@@ -21,7 +21,16 @@ experiments are not repeated. Keep it up to date when you try something new: add
   instructions in a hot loop explained more than any amount of guessing (see "decode is
   instruction-bound" below).
 - **Micro-benchmarks:** `cargo test --release -p ocak-vk vk_qmm_tiled_bench -- --ignored --nocapture`
-  (2560x9216x256 matmul per format), `vk_qmm_grouped_bench`, `vk_small_batch_bench`.
+  (2560x9216x256 matmul per format), `vk_qmm_grouped_bench`, `vk_small_batch_bench` (decode
+  matvec at Qwen3.8's FFN shape, rotating 6 weight copies). A single small weight matrix stays in
+  the 96 MB Infinity Cache across repeats and reports impossible bandwidth — rotate buffers that
+  together exceed ~100 MB.
+- **MTP must stay lossless:** with greedy sampling, `OCAK_DISABLE_MTP=1` and the default must
+  produce identical text. The verify step (`forward_verify2`, batched layer code) and single-token
+  decode use different call paths, so every kernel pair must give bit-identical results: same
+  matvec kernel for 1 and 2..8 tokens, same reduction order in `add_rms_norm` and `rms_norm`.
+  `vk_matvec_batch_matches_single_bitwise` checks the matvecs; check the end-to-end equality
+  after touching norms, matvec routing or anything in the decode path.
 - **Correctness bar for kernel changes:** `cargo test --release --workspace` (GPU kernels vs
   reference kernels / CPU), `ocak count-test` (long-context counting, 8 models), greedy output
   vs the previous build on a fixed prompt, and for numerics changes `ocak parity-test` (logit
@@ -74,6 +83,11 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | IQ1 grid in shared memory | IQ1_S matvec 258 -> 121 us |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
+| Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
+
+Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
+IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 225, Q2_K 351, Q3_K 246, Q4_K 336, Q6_K 368,
+Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; IQ1_S and Q3_K lag.
 
 ## Tried and rejected (do not repeat without a new idea)
 
@@ -98,12 +112,14 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | int8 decode for Q8_0 | no gain on Inkling | float Q8_0 matvec is already cheap per weight |
 | int8 MoE **expert** matvec (decode) | ~30% less kernel time, no end-to-end change | Inkling decode is bound by PCIe reads of host-resident experts; removed |
 | More Inkling experts in VRAM at the cost of prefill buffers | est. +5% decode, -40% long-prompt prefill | not done; 12 GB card |
+| Decode matvec: two rows per 32-lane group (share activation loads) | no change per kernel | activation loads are not the limit (cached, overlapped) |
+| Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 
 ## Open ideas (not tried yet)
 
-- Decode: two rows per lane group so each activation load serves two rows (activation loads
-  outnumber weight loads per block for 2-bit formats).
+- Decode: IQ1_S and Q3_K block decoders reach only ~225-246 GB/s (others 320-370).
+- MTP: draft more than one token per step (acceptance is ~74% on Qwen3.8).
 - Decode: fuse activation quantization into the preceding norm (saves a dispatch + barrier per
   input).
 - Decode: block-level `dqi32` for Q8_0 / NVFP4 / IQ4_NL (Inkling's formats).

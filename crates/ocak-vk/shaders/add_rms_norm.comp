@@ -1,7 +1,9 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
-// One 1024-thread workgroup (5 elements per thread for n = 5120: latency-bound otherwise).
-layout(local_size_x = 1024) in;
+// x += r; o = x * rsqrt(mean(x^2) + eps) * w. The reduction (512 threads, 32-lane clusters, 16
+// partials summed in order) is identical to rms_norm.comp, so the fused decode path and the
+// batched path (add + rms_norm_batch, used by MTP verification) produce the same bits.
+layout(local_size_x = 512) in;
 layout(set = 0, binding = 0) buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer R { float r[]; };
 layout(set = 0, binding = 2) readonly buffer W { float w[]; };
@@ -14,22 +16,22 @@ layout(push_constant) uniform PC {
     uint n;
     float eps;
 } pc;
-shared float sm[32];
+shared float sm[16];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     float acc = 0.0;
-    for (uint i = tid; i < pc.n; i += 1024u) {
+    for (uint i = tid; i < pc.n; i += 512u) {
         float v = x[pc.x_off + i] + r[pc.r_off + i];
         x[pc.x_off + i] = v;
         acc += v * v;
     }
-    float s_sub = subgroupClusteredAdd(acc, 32u);
-    if ((tid & 31u) == 0u) sm[tid >> 5] = s_sub;
+    float s32 = subgroupClusteredAdd(acc, 32u);
+    if ((tid & 31u) == 0u) sm[tid >> 5] = s32;
     barrier();
     float tot = 0.0;
-    for (uint j = 0u; j < 32u; j++) tot += sm[j];
-    float sc = inversesqrt(tot / float(pc.n) + pc.eps);
-    for (uint i = tid; i < pc.n; i += 1024u) {
-        o[pc.out_off + i] = x[pc.x_off + i] * sc * w[pc.w_off + i];
+    for (uint j = 0u; j < 16u; j++) tot += sm[j];
+    float scale = inversesqrt(tot / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 512u) {
+        o[pc.out_off + i] = x[pc.x_off + i] * scale * w[pc.w_off + i];
     }
 }
