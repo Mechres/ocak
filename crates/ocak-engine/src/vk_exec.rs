@@ -424,6 +424,43 @@ impl Executor for VkExec {
         Ok(Some(([l0, l1], [h0, h1])))
     }
 
+    fn forward_verify2_argmax(
+        &mut self,
+        tokens: [u32; 2],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<([u32; 2], [Vec<f32>; 2])>, EngineError> {
+        if page_table.len() > self.max_pages {
+            return Err(EngineError::Context("page table exceeds GPU capacity".into()));
+        }
+        self.ensure_rec_snaps()?;
+        self.ctx.upload(&self.pt_buf, 0, bytemuck::cast_slice(page_table)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let c = &self.cfg;
+        let ne = c.n_embd as u32;
+        let mut rec = self.ctx.begin();
+        rec.set_defer_barriers(true);
+        self.record_batch_layers(&mut rec, &tokens, pos0, true, 0..self.layers.len());
+        rec.rms_norm(&self.x, 0, &self.out_norm, 0, &self.hidden_buf2, 0, ne, c.eps);
+        rec.rms_norm(&self.x, ne as u64, &self.out_norm, 0, &self.hidden_buf2, ne as u64, ne, c.eps);
+        rec.barrier();
+        let w = self.output.as_ref().unwrap_or(&self.embd);
+        rec.qmm(w.ty, &w.buf, 0, &self.hidden_buf2, 0, &self.logits_buf2, 0, w.k, w.m, 2);
+        rec.barrier();
+        // Greedy: argmax of both rows on the device (argmax_buf words 0 and 1); only two indices
+        // and the hidden states cross PCIe instead of 2 x n_vocab logits.
+        rec.argmax(&self.logits_buf2, 0, &self.argmax_buf, c.n_vocab as u32);
+        rec.argmax_at(&self.logits_buf2, c.n_vocab as u64, &self.argmax_buf, 1, c.n_vocab as u32);
+        rec.barrier();
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mut idx = [0u32; 2];
+        self.ctx.download(&self.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mut h_both = vec![0f32; 2 * c.n_embd];
+        self.ctx.download(&self.hidden_buf2, 0, bytemuck::cast_slice_mut(&mut h_both)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let h1 = h_both.split_off(c.n_embd);
+        self.hidden.copy_from_slice(&h1);
+        Ok(Some((idx, [h_both, h1])))
+    }
+
     fn snapshot_recurrent(&mut self) -> Result<(), EngineError> {
         self.ensure_rec_snaps()?;
         let snaps = self.rec_snaps.as_ref().unwrap();
@@ -998,35 +1035,15 @@ impl VkExec {
                     rec.qmm(wbeta.ty, &wbeta.buf, 0, &self.xn, 0, &self.beta_buf, 0, wbeta.k, wbeta.m, batch);
                     rec.barrier();
                     if snap_after_t0 && batch == 2 {
+                        // Both tokens in one dispatch per kernel; the kernels also write the exact
+                        // post-token-0 state (rollback point for a rejected draft) to the
+                        // snapshot buffers from registers - no copies / transfer barriers.
                         let snaps = self.rec_snaps.as_ref().unwrap();
-                        let v_dim = *n_v_heads * *state_dim;
-                        // Token 0 -> snapshot exact post-t0 recurrent state!
-                        rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 1);
+                        rec.ssm_conv_silu_batch_snap(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 2, Some((&snaps[rec_snap_idx].0, 0)));
                         rec.barrier();
-                        rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 1);
+                        rec.deltanet_step_batch_snap(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 2, Some((snaps[rec_snap_idx].1.as_ref().unwrap(), 0)));
                         rec.barrier();
-                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 1);
-                        rec.barrier();
-                        rec.copy_buf_bytes(conv_state, &snaps[rec_snap_idx].0, conv_state.size());
-                        rec.copy_buf_bytes(ssm_state, snaps[rec_snap_idx].1.as_ref().unwrap(), ssm_state.size());
-                        // Save token 0 dn_norm into dn_out[v_dim..] and shift token 1 inputs to offset 0
-                        rec.copy(&self.dn_norm, 0, &self.dn_out, v_dim as u64, v_dim);
-                        rec.copy(&self.qkv_raw, *conv_ch as u64, &self.qkv_raw, 0, *conv_ch);
-                        rec.copy(&self.alpha_buf, *n_v_heads as u64, &self.alpha_buf, 0, *n_v_heads);
-                        rec.copy(&self.beta_buf, *n_v_heads as u64, &self.beta_buf, 0, *n_v_heads);
-                        rec.copy(&self.z_buf, v_dim as u64, &self.z_buf, 0, v_dim);
-                        rec.barrier();
-                        // Token 1
-                        rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 1);
-                        rec.barrier();
-                        rec.deltanet_step_batch(&self.qkv_conv, &self.alpha_buf, &self.beta_buf, dt_bias, ssm_a, ssm_state, &self.dn_out, *n_k_heads, *n_v_heads, *state_dim, c.eps, 1);
-                        rec.barrier();
-                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 1);
-                        rec.barrier();
-                        // Place token 1 at dn_norm[v_dim..] and restore token 0 at dn_norm[0..]
-                        rec.copy(&self.dn_norm, 0, &self.dn_norm, v_dim as u64, v_dim);
-                        rec.barrier();
-                        rec.copy(&self.dn_out, v_dim as u64, &self.dn_norm, 0, v_dim);
+                        rec.gated_rms_norm_batch(&self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, c.eps, 2);
                         rec.barrier();
                     } else {
                         rec.ssm_conv_silu_batch(&self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, batch);

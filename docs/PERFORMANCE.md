@@ -84,6 +84,8 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
+| MTP verify with device-side argmax for plain greedy sampling (no 2 x vocab logits download / CPU sampling) | verify host overhead 6.7 -> ~1.4 ms; Qwen3.8 IQ2_S (borrowed head) 40.4 -> 46.8 tok/s, Q2_K 32 -> 38 |
+| MTP verify: DeltaNet / conv kernels write the post-token-0 rollback state from registers (was: per-token dispatches + copies with transfer barriers in all 48 layers) | verify 33.6 -> 32.7 ms; IQ2_S 47.8 tok/s |
 | Borrowed MTP head (`OCAK_MTP_FROM=<gguf>`): Qwen3.8 IQ2_S has no NextN layer, the Q2_K file of the same model does | IQ2_S decode 34.7 -> 40.4 tok/s, 74% acceptance, output identical |
 
 Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM): IQ2_XXS 321,
@@ -114,6 +116,7 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit; 
 | int8 MoE **expert** matvec (decode) | ~30% less kernel time, no end-to-end change | Inkling decode is bound by PCIe reads of host-resident experts; removed |
 | More Inkling experts in VRAM at the cost of prefill buffers | est. +5% decode, -40% long-prompt prefill | not done; 12 GB card |
 | Decode matvec: two rows per 32-lane group (share activation loads) | no change per kernel | activation loads are not the limit (cached, overlapped) |
+| MTP draft head over only the first N vocab rows (BPE: low ids are common) | N=65536: ~+2-5% (within noise), acceptance 72 -> 69% | marginal, and acceptance would drop for text with high token ids (non-English, code) |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 

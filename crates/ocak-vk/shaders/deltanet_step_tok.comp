@@ -16,12 +16,15 @@ layout(set = 0, binding = 3) readonly buffer DT { float dt_bias[]; };
 layout(set = 0, binding = 4) readonly buffer SA { float ssm_a[]; };
 layout(set = 0, binding = 5) buffer ST { float st[]; };
 layout(set = 0, binding = 6) writeonly buffer O { float o[]; };
+// MTP verification: the state after token snap_t is also written to snap (rollback point).
+layout(set = 0, binding = 7) writeonly buffer SNAP { float snap[]; };
 layout(push_constant) uniform PC {
     uint n_k_heads;
     uint n_v_heads;
     uint head_dim;
     float eps;
     uint batch;
+    uint snap_t;   // 0xFFFFFFFF: no snapshot
 } pc;
 
 void main() {
@@ -85,6 +88,12 @@ void main() {
         }
         sq = subgroupClusteredAdd(sq, 32u) * qs;
         if (lane == 0u) o[t * v_total + h * hd + j] = sq;
+        if (t == pc.snap_t) {
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + 32u * r;
+                if (i < hd) snap[s_base + i] = s[r];
+            }
+        }
     }
     for (uint r = 0u; r < MAXR; r++) {
         uint i = lane + 32u * r;

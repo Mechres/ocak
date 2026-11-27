@@ -7,7 +7,9 @@ layout(set = 0, binding = 0) readonly buffer X { float x[]; };
 layout(set = 0, binding = 1) readonly buffer W { float cw[]; };
 layout(set = 0, binding = 2) buffer ST { float st[]; };
 layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
-layout(push_constant) uniform PC { uint channels; uint k_conv; uint batch; } pc;
+// MTP verification: the history after token snap_t is also written to snap (rollback point).
+layout(set = 0, binding = 4) writeonly buffer SNAP { float snap[]; };
+layout(push_constant) uniform PC { uint channels; uint k_conv; uint batch; uint snap_t; } pc;
 void main() {
     uint ch = gl_GlobalInvocationID.x;
     if (ch >= pc.channels) return;
@@ -25,6 +27,8 @@ void main() {
         for (uint t = 0u; t + 1u < MAXD; t++) if (t + 1u < d_conv) h[t] = h[t + 1u];
         for (uint t = 0u; t < MAXD; t++) if (t == d_conv - 1u) h[t] = xv;
         o[ti * pc.channels + ch] = acc / (1.0 + exp(-acc));
+        if (ti == pc.snap_t)
+            for (uint t = 0u; t < MAXD; t++) if (t < d_conv) snap[sb + t] = h[t];
     }
     for (uint t = 0u; t < MAXD; t++) if (t < d_conv) st[sb + t] = h[t];
 }

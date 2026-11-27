@@ -666,9 +666,9 @@ impl VkContext {
                 qmv_q3_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q3_k.spv")), "qmv_q3_k", 3, 24)?,
                 rms_norm_heads: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_heads.spv")), "rms_norm_heads", 2, 16)?,
                 shortconv_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_step.spv")), "shortconv_step", 4, 12)?,
-                ssm_conv_silu: bp(include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), "ssm_conv_silu", 4, 12)?,
+                ssm_conv_silu: bp(include_bytes!(concat!(env!("OUT_DIR"), "/ssm_conv_silu.spv")), "ssm_conv_silu", 5, 16)?,
                 deltanet_step: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step.spv")), "deltanet_step", 7, 20)?,
-                deltanet_step_tok: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step_tok.spv")), "deltanet_step_tok", 7, 20)?,
+                deltanet_step_tok: bp(include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_step_tok.spv")), "deltanet_step_tok", 8, 24)?,
                 gated_rms_norm: bp(include_bytes!(concat!(env!("OUT_DIR"), "/gated_rms_norm.spv")), "gated_rms_norm", 4, 12)?,
                 split_qg: bp(include_bytes!(concat!(env!("OUT_DIR"), "/split_qg.spv")), "split_qg", 3, 8)?,
                 mul_sigmoid: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv")), "mul_sigmoid", 2, 4)?,
@@ -813,7 +813,7 @@ impl VkContext {
                 attention_prefill_128_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128_f2.spv")), "attention_prefill_128_f2", 4, 40)?) } else { None },
                 attention_prefill_256_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256_f2.spv")), "attention_prefill_256_f2", 4, 40)?) } else { None },
                 attention_prefill_256: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256.spv")), "attention_prefill_256", 4, 40)?,
-                argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 3, 20)?,
+                argmax: bp(include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv")), "argmax", 3, 24)?,
                 sum_splits: bp(include_bytes!(concat!(env!("OUT_DIR"), "/sum_splits.spv")), "sum_splits", 2, 16)?,
                 quant_q8: bp(include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv")), "quant_q8", 3, 16)?,
                 qmmq: vec![
@@ -1712,6 +1712,11 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn argmax(&mut self, x: &Buffer, x_off: u64, out: &Buffer, n: u32) {
+        self.argmax_at(x, x_off, out, 0, n);
+    }
+
+    /// Argmax of x[x_off .. x_off + n] written to out word `out_idx`.
+    pub fn argmax_at(&mut self, x: &Buffer, x_off: u64, out: &Buffer, out_idx: u32, n: u32) {
         // Two passes: partial maxima over up to 128 slices (in the attention scratch), then one
         // workgroup reduces them (a single workgroup scanning a 200k+ vocabulary took ~250 us).
         let parts = n.div_ceil(2048).clamp(1, 128);
@@ -1723,10 +1728,10 @@ impl<'a> Recorder<'a> {
         let p_off = off_u32(self.scratch_cursor / 4);
         self.scratch_cursor += bytes.next_multiple_of(256);
         let scratch = self.ctx.attn_scratch;
-        let pc0 = [off_u32(x_off), n, 0, p_off, parts];
+        let pc0 = [off_u32(x_off), n, 0, p_off, parts, out_idx];
         self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc0), parts, 1, 1);
         self.barrier();
-        let pc1 = [off_u32(x_off), n, 1, p_off, parts];
+        let pc1 = [off_u32(x_off), n, 1, p_off, parts, out_idx];
         self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc1), 1, 1, 1);
     }
 
@@ -2287,9 +2292,17 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn ssm_conv_silu_batch(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32, batch: u32) {
+        self.ssm_conv_silu_batch_snap(x, cw, state, out, channels, k_conv, batch, None);
+    }
+
+    /// `snap = Some((buf, t))`: also write the conv history after token t to `buf` (MTP rollback
+    /// point), without a separate copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ssm_conv_silu_batch_snap(&mut self, x: &Buffer, cw: &Buffer, state: &Buffer, out: &Buffer, channels: u32, k_conv: u32, batch: u32, snap: Option<(&Buffer, u32)>) {
         assert!((2..=9).contains(&k_conv), "conv kernels keep at most 8 history taps (k_conv = {k_conv})");
-        let pc = [channels, k_conv, batch];
-        self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf], bytemuck::cast_slice(&pc), channels.div_ceil(256), 1, 1);
+        let (sb, st) = snap.map_or((out.buf, u32::MAX), |(b, t)| (b.buf, t));
+        let pc = [channels, k_conv, batch, st];
+        self.dispatch_raw(&self.ctx.pipelines.ssm_conv_silu, &[x.buf, cw.buf, state.buf, out.buf, sb], bytemuck::cast_slice(&pc), channels.div_ceil(256), 1, 1);
     }
 
     pub fn deltanet_step(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32) {
@@ -2298,14 +2311,25 @@ impl<'a> Recorder<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_step_batch(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32, batch: u32) {
+        self.deltanet_step_batch_snap(qkv, alpha, beta, dt_bias, ssm_a, state, out, n_k_heads, n_v_heads, head_dim, eps, batch, None);
+    }
+
+    /// `snap = Some((buf, t))` (batches < 16 only): also write the recurrent state after token t
+    /// to `buf` (MTP rollback point), without a separate copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_step_batch_snap(&mut self, qkv: &Buffer, alpha: &Buffer, beta: &Buffer, dt_bias: &Buffer, ssm_a: &Buffer, state: &Buffer, out: &Buffer, n_k_heads: u32, n_v_heads: u32, head_dim: u32, eps: f32, batch: u32, snap: Option<(&Buffer, u32)>) {
         assert!(head_dim <= 128, "deltanet_step supports head_dim <= 128 (got {head_dim})");
-        let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits(), batch];
-        let bufs = [qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf];
         if batch < 16 || !head_dim.is_multiple_of(32) {
             // Decode / MTP verify: 8 rows (32-lane clusters) per workgroup, no token staging.
+            let (sb, st) = snap.map_or((out.buf, u32::MAX), |(b, t)| (b.buf, t));
+            let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits(), batch, st];
+            let bufs = [qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf, sb];
             self.dispatch_raw(&self.ctx.pipelines.deltanet_step_tok, &bufs, bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(8), 1, 1);
             return;
         }
+        assert!(snap.is_none(), "deltanet snapshots are only supported for batches < 16");
+        let pc = [n_k_heads, n_v_heads, head_dim, eps.to_bits(), batch];
+        let bufs = [qkv.buf, alpha.buf, beta.buf, dt_bias.buf, ssm_a.buf, state.buf, out.buf];
         // 32 state rows (8-lane clusters) per 256-thread workgroup.
         self.dispatch_raw(&self.ctx.pipelines.deltanet_step, &bufs, bytemuck::cast_slice(&pc), (n_v_heads * head_dim).div_ceil(32), 1, 1);
     }

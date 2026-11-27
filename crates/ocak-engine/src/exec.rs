@@ -74,6 +74,16 @@ pub trait Executor: Send {
     ) -> Result<Option<([Vec<f32>; 2], [Vec<f32>; 2])>, EngineError> {
         Ok(None)
     }
+    /// Greedy variant of `forward_verify2`: returns the argmax token of each position (computed
+    /// on the device) instead of full logits, plus the hidden states. None if unsupported.
+    fn forward_verify2_argmax(
+        &mut self,
+        _tokens: [u32; 2],
+        _pos0: usize,
+        _page_table: &[u32],
+    ) -> Result<Option<([u32; 2], [Vec<f32>; 2])>, EngineError> {
+        Ok(None)
+    }
     /// Runs a continuous multi-slot decode batch across independent sequences (each with its own `pos` and `page_table`),
     /// returning one logits vector per slot when supported.
     fn forward_multi_slot(&mut self, _slots: &[SlotStep<'_>]) -> Result<Option<Vec<Vec<f32>>>, EngineError> {

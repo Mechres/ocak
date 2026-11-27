@@ -6,7 +6,7 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer Out { uint out_idx[]; };
 layout(set = 0, binding = 2) buffer Part { uint part[]; };
-layout(push_constant) uniform PC { uint x_off; uint n; uint mode; uint part_off; uint n_parts; } pc;
+layout(push_constant) uniform PC { uint x_off; uint n; uint mode; uint part_off; uint n_parts; uint out_idx; } pc;
 shared float sm_val[32];
 shared uint sm_idx[32];
 void main() {
@@ -47,7 +47,7 @@ void main() {
             part[pc.part_off + 2u * gl_WorkGroupID.x] = floatBitsToUint(bv);
             part[pc.part_off + 2u * gl_WorkGroupID.x + 1u] = bi;
         } else {
-            out_idx[0] = bi;
+            out_idx[pc.out_idx] = bi;
         }
     }
 }

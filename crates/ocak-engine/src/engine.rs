@@ -359,6 +359,11 @@ impl NativeEngine {
             && think_gov.is_none()
             && !use_mtp;
         let prof_mtp = std::env::var("OCAK_MTP_PROFILE").is_ok();
+        // MTP verification may use device-side argmax when sampling is plain greedy.
+        let verify_greedy = req.sampler.temperature <= 0.0
+            && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
+            && json_g.is_none()
+            && think_gov.is_none();
         let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
 
         while gen_tokens.len() < req.max_tokens && tokens.len() < self.max_ctx {
@@ -421,6 +426,54 @@ impl NativeEngine {
                         return Err(e);
                     }
                     let t2 = Instant::now();
+                    // Plain greedy: argmax on the device, no logits download / CPU sampling.
+                    if verify_greedy {
+                        match self.exec.forward_verify2_argmax([next_tok, dt], pos, &pages) {
+                            Ok(Some(([v1, v2], [h0, h1]))) => {
+                                ms_v2 += t2.elapsed().as_secs_f64() * 1000.0;
+                                if v1 == dt {
+                                    mtp_accepted += 1;
+                                    eval_len = pos + 2;
+                                    if self.tokenizer.is_eog(dt) {
+                                        finish = FinishReason::Stop;
+                                        break;
+                                    }
+                                    sampler.accept(dt);
+                                    let b2 = self.tokenizer.token_bytes(dt);
+                                    let p2 = detok.push(&b2);
+                                    gen_tokens.push(dt);
+                                    tokens.push(dt);
+                                    full_text.push_str(&p2);
+                                    if req.stop.iter().any(|s| !s.is_empty() && full_text.ends_with(s)) {
+                                        finish = FinishReason::Stop;
+                                        break;
+                                    }
+                                    if !on_chunk(dt, &p2) {
+                                        finish = FinishReason::Cancelled;
+                                        break;
+                                    }
+                                    forced_tok = Some(v2);
+                                    hidden_buf = h1;
+                                } else {
+                                    eval_len = pos + 1;
+                                    let t3 = Instant::now();
+                                    if let Err(e) = self.exec.restore_recurrent() {
+                                        self.pager.release(&pages);
+                                        return Err(e);
+                                    }
+                                    ms_rej += t3.elapsed().as_secs_f64() * 1000.0;
+                                    forced_tok = Some(v1);
+                                    hidden_buf = h0;
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                self.pager.release(&pages);
+                                return Err(e);
+                            }
+                        }
+                    }
                     match self.exec.forward_verify2([next_tok, dt], pos, &pages) {
                         Ok(Some(([mut l0, l1], [h0, h1]))) => {
                             ms_v2 += t2.elapsed().as_secs_f64() * 1000.0;
