@@ -39,6 +39,16 @@
 #define TBL_LO 1920u
 #define TBL_HI 1936u
 #endif
+// Sign byte masks (ocak_gguf::iq_tables): per KSIGNS index or per raw sign byte, (lo, hi) words.
+// Only where it measured faster: IQ2_XS 77.8 -> 75.5 us, IQ2_S 84.4 -> 82.8 us at 5120 x 17408;
+// IQ2_XXS got slower (one KSIGNS read per 8 weights became two mask reads), IQ3 unchanged.
+#if defined(IQ2_XS)
+#define SMASK_LO 12688u
+#define SMASK_N 256u
+#elif defined(IQ2_S)
+#define SMASK_LO 12944u
+#define SMASK_N 512u
+#endif
 #if defined(TBL_LO)
 #define RPW 16u
 #define TBL(i) stab[(i) - TBL_LO]
@@ -59,6 +69,9 @@ layout(push_constant) uniform PC { uint w_off; uint q_off2; uint s_off; uint y_o
 #ifdef TBL_LO
 shared uint stab[TBL_HI - TBL_LO];
 #endif
+#ifdef SMASK_LO
+shared uint smask[SMASK_N];
+#endif
 #include "dequant_i8.glsl"
 
 void main() {
@@ -66,6 +79,9 @@ void main() {
     uint row = gl_WorkGroupID.x * RPW + gl_LocalInvocationID.y;
 #ifdef TBL_LO
     for (uint i = gl_LocalInvocationIndex; i < TBL_HI - TBL_LO; i += 32u * RPW) stab[i] = tbl[TBL_LO + i];
+#ifdef SMASK_LO
+    for (uint i = gl_LocalInvocationIndex; i < SMASK_N; i += 32u * RPW) smask[i] = tbl[SMASK_LO + i];
+#endif
     barrier();
 #endif
     float acc[MAXB];

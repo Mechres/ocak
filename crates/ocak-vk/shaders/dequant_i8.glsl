@@ -27,6 +27,11 @@ uint apply_signs4(uint g, uint bits) {
     uint m = ((bits & 0xFu) * 0x00204081u) & 0x01010101u;   // bit j -> bit 0 of byte j
     return (g ^ ((m << 8) - m)) + m;                         // (m << 8) - m == m * 0xFF
 }
+#ifdef SMASK_LO
+// Negate the bytes of g where M has 0xFF (M from the shared sign-mask table smask).
+uint neg_bytes(uint g, uint m) { return (g ^ m) + ((m >> 7) & 0x01010101u); }
+#define SIGNED2(lo, hi, si, qa, qb) qa = neg_bytes(lo, smask[2u * (si)]); qb = neg_bytes(hi, smask[2u * (si) + 1u]);
+#endif
 // Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
 uint sub_bytes(uint x, uint c) { return ((x | 0x80808080u) - c) ^ 0x80808080u; }
 
@@ -283,9 +288,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     float d = f16at(b) * (0.5 + float(a1 >> 28)) * 0.25;
     for (uint l = 0u; l < 4u; l++) {
         uint gidx = byte_of(a0, l);
+#ifdef SMASK_LO
+        SIGNED2(TBL(1936u + 2u * gidx), TBL(1936u + 2u * gidx + 1u), (a1 >> (7u * l)) & 127u, q[2u * l], q[2u * l + 1u])
+#else
         uint sg = TBL(1792u + ((a1 >> (7u * l)) & 127u));
         q[2u * l] = apply_signs4(TBL(1936u + 2u * gidx), sg);
         q[2u * l + 1u] = apply_signs4(TBL(1936u + 2u * gidx + 1u), sg >> 4);
+#endif
     }
     dm = vec4(d, d, 0.0, 0.0);
 #elif defined(IQ2_XS)
@@ -297,9 +306,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     for (uint l = 0u; l < 4u; l++) {
         uint qq = ((l < 2u) ? (w0 >> (16u * l)) : (w1 >> (16u * (l - 2u)))) & 0xFFFFu;
         uint gidx = qq & 511u;
+#ifdef SMASK_LO
+        SIGNED2(TBL(2u * gidx), TBL(2u * gidx + 1u), qq >> 9, q[2u * l], q[2u * l + 1u])
+#else
         uint sg = TBL(1792u + (qq >> 9));
         q[2u * l] = apply_signs4(TBL(2u * gidx), sg);
         q[2u * l + 1u] = apply_signs4(TBL(2u * gidx + 1u), sg >> 4);
+#endif
     }
     dm = vec4(d * (0.5 + float(sc & 0xFu)), d * (0.5 + float(sc >> 4)), 0.0, 0.0);
 #elif defined(IQ2_S)
@@ -311,9 +324,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     float d = f16at(b) * 0.25;
     for (uint l = 0u; l < 4u; l++) {
         uint gidx = byte_of(qs, l) | ((qhb << (8u - 2u * l)) & 0x300u);
+#ifdef SMASK_LO
+        SIGNED2(TBL(2448u + 2u * gidx), TBL(2448u + 2u * gidx + 1u), byte_of(sgw, l), q[2u * l], q[2u * l + 1u])
+#else
         uint sg = byte_of(sgw, l);
         q[2u * l] = apply_signs4(TBL(2448u + 2u * gidx), sg);
         q[2u * l + 1u] = apply_signs4(TBL(2448u + 2u * gidx + 1u), sg >> 4);
+#endif
     }
     dm = vec4(d * (0.5 + float(sc & 0xFu)), d * (0.5 + float(sc >> 4)), 0.0, 0.0);
 #elif defined(IQ3_XXS)
@@ -325,9 +342,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
     for (uint l = 0u; l < 4u; l++) {
         uint ww = (l < 2u) ? w0 : w1;
         uint sh = 16u * (l & 1u);
+#ifdef SMASK_LO
+        SIGNED2(TBL(1024u + ((ww >> sh) & 0xFFu)), TBL(1024u + ((ww >> (sh + 8u)) & 0xFFu)), (aux32 >> (7u * l)) & 127u, q[2u * l], q[2u * l + 1u])
+#else
         uint sg = TBL(1792u + ((aux32 >> (7u * l)) & 127u));
         q[2u * l] = apply_signs4(TBL(1024u + ((ww >> sh) & 0xFFu)), sg);
         q[2u * l + 1u] = apply_signs4(TBL(1024u + ((ww >> (sh + 8u)) & 0xFFu)), sg >> 4);
+#endif
     }
     dm = vec4(d, d, 0.0, 0.0);
 #elif defined(IQ3_S)
@@ -343,9 +364,13 @@ void dqi32(uint rb, uint blk, out uint q[8], out vec4 dm) {
         uint sh = 16u * (l & 1u);
         uint i1 = ((ww >> sh) & 0xFFu) | ((qh << (8u - 2u * l)) & 256u);
         uint i2 = ((ww >> (sh + 8u)) & 0xFFu) | ((qh << (7u - 2u * l)) & 256u);
+#ifdef SMASK_LO
+        SIGNED2(TBL(1280u + i1), TBL(1280u + i2), byte_of(sgw, l), q[2u * l], q[2u * l + 1u])
+#else
         uint sg = byte_of(sgw, l);
         q[2u * l] = apply_signs4(TBL(1280u + i1), sg);
         q[2u * l + 1u] = apply_signs4(TBL(1280u + i2), sg >> 4);
+#endif
     }
     dm = vec4(d, d, 0.0, 0.0);
 #elif defined(IQ1_S)

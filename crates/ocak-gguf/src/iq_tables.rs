@@ -20,8 +20,10 @@ pub const IQ1S_GRID: [u64; 2048] = [0xffffffffffffffff, 0xffffffffffffff01, 0xff
 /// - [2448..4496): IQ2S_GRID as (lo, hi) u32 pairs
 /// - [4496..8592): IQ1S_GRID as (lo, hi) u32 pairs
 /// - [8592..12688): IQ1S_GRID with each byte g mapped to 8 * (g + 1) (int8 decoders)
+/// - [12688..12944): per KSIGNS index, (lo, hi) byte masks: 0xFF where the weight is negative
+/// - [12944..13456): per raw sign byte, (lo, hi) byte masks (IQ2_S / IQ3_S)
 pub fn packed_gpu_table() -> Vec<u32> {
-    let mut v = Vec::with_capacity(12688);
+    let mut v = Vec::with_capacity(13456);
     for &g in &IQ2XS_GRID { v.push(g as u32); v.push((g >> 32) as u32); }
     v.extend_from_slice(&IQ3XXS_GRID);
     v.extend_from_slice(&IQ3S_GRID);
@@ -41,5 +43,15 @@ pub fn packed_gpu_table() -> Vec<u32> {
         v.push(t as u32);
         v.push((t >> 32) as u32);
     }
+    // Sign byte masks: the int8 decoders negate bytes with (g ^ M) + ((M >> 7) & 0x01010101).
+    let masks = |s: u8| -> (u32, u32) {
+        let mut m = 0u64;
+        for i in 0..8 {
+            if (s >> i) & 1 != 0 { m |= 0xFF << (8 * i); }
+        }
+        (m as u32, (m >> 32) as u32)
+    };
+    for &s in &KSIGNS_IQ2XS { let (lo, hi) = masks(s); v.push(lo); v.push(hi); }
+    for s in 0..=255u8 { let (lo, hi) = masks(s); v.push(lo); v.push(hi); }
     v
 }
