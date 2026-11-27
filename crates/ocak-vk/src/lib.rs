@@ -375,6 +375,13 @@ struct ExecState {
     /// timed dispatch in the current recording.
     qpool: vk::QueryPool,
     q_names: Vec<&'static str>,
+    /// Pipelined weight uploads (`upload_async`): two command buffers / fences, each owning half
+    /// of the staging buffer, so the CPU copy of one chunk overlaps the DMA of the previous one.
+    /// Every other use of this state drains them first (`drain_async`).
+    up_cmds: [vk::CommandBuffer; 2],
+    up_fences: [vk::Fence; 2],
+    up_pending: [bool; 2],
+    up_next: usize,
 }
 
 unsafe impl Send for ExecState {}
@@ -924,6 +931,11 @@ impl VkContext {
                 None,
             )?;
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let up_cmd_vec = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2),
+            )?;
+            let up_cmds = [up_cmd_vec[0], up_cmd_vec[1]];
+            let up_fences = [device.create_fence(&vk::FenceCreateInfo::default(), None)?, device.create_fence(&vk::FenceCreateInfo::default(), None)?];
 
             // Host-cached staging when available: downloads (e.g. 1 MB of logits per sampled token)
             // read it back on the CPU, and uncached (write-combined) memory reads at ~200 MB/s.
@@ -1003,6 +1015,10 @@ impl VkContext {
                     staging_cap: STAGING_SIZE,
                     qpool,
                     q_names: Vec::new(),
+                    up_cmds,
+                    up_fences,
+                    up_pending: [false; 2],
+                    up_next: 0,
                 }),
                 ts_period_ns,
             }))
@@ -1065,10 +1081,72 @@ impl VkContext {
         }
     }
 
+    /// Wait for pipelined uploads still in flight (they use the staging buffer).
+    fn drain_async(&self, exec: &mut ExecState) {
+        for i in 0..2 {
+            if exec.up_pending[i] {
+                unsafe {
+                    let _ = self.device.wait_for_fences(&[exec.up_fences[i]], true, u64::MAX);
+                    let _ = self.device.reset_fences(&[exec.up_fences[i]]);
+                }
+                exec.up_pending[i] = false;
+            }
+        }
+    }
+
+    /// Like `upload`, but returns once the copy is submitted: the next call's CPU copy (into the
+    /// other half of the staging buffer) overlaps this DMA. Any later operation on the context
+    /// waits for it, so callers need no explicit flush; `upload_flush` makes it explicit.
+    pub fn upload_async(&self, dst: &Buffer, dst_off: u64, data: &[u8]) -> Result<(), VkError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        assert!(dst_off.saturating_add(data.len() as u64) <= dst.size, "vk upload out of bounds");
+        let mut exec = self.exec.lock().unwrap();
+        let half = (exec.staging_cap / 2) as usize;
+        let mut off = 0usize;
+        while off < data.len() {
+            let chunk = (data.len() - off).min(half);
+            let slot = exec.up_next;
+            exec.up_next ^= 1;
+            unsafe {
+                if exec.up_pending[slot] {
+                    self.device.wait_for_fences(&[exec.up_fences[slot]], true, u64::MAX)?;
+                    self.device.reset_fences(&[exec.up_fences[slot]])?;
+                    exec.up_pending[slot] = false;
+                }
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(off), exec.staging_ptr.add(slot * half), chunk);
+                let cb = exec.up_cmds[slot];
+                self.device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+                self.device.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+                let region = [vk::BufferCopy::default().src_offset((slot * half) as u64).dst_offset(dst_off + off as u64).size(chunk as u64)];
+                self.device.cmd_copy_buffer(cb, exec.staging_buf, dst.buf, &region);
+                let bar = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                self.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &bar, &[], &[]);
+                self.device.end_command_buffer(cb)?;
+                let bufs = [cb];
+                let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
+                self.device.queue_submit(self.queue, &si, exec.up_fences[slot])?;
+                exec.up_pending[slot] = true;
+            }
+            off += chunk;
+        }
+        Ok(())
+    }
+
+    /// Wait for all `upload_async` copies.
+    pub fn upload_flush(&self) {
+        let mut exec = self.exec.lock().unwrap();
+        self.drain_async(&mut exec);
+    }
+
     pub fn upload(&self, dst: &Buffer, dst_off: u64, data: &[u8]) -> Result<(), VkError> {
         if data.is_empty() { return Ok(()); }
         assert!(dst_off.saturating_add(data.len() as u64) <= dst.size, "vk upload out of bounds");
-        let exec = self.exec.lock().unwrap();
+        let mut exec = self.exec.lock().unwrap();
+        self.drain_async(&mut exec);
         let mut off = 0usize;
         while off < data.len() {
             let chunk = (data.len() - off).min(exec.staging_cap as usize);
@@ -1107,7 +1185,8 @@ impl VkContext {
     pub fn download(&self, src: &Buffer, src_off: u64, out: &mut [u8]) -> Result<(), VkError> {
         if out.is_empty() { return Ok(()); }
         assert!(src_off.saturating_add(out.len() as u64) <= src.size, "vk download out of bounds");
-        let exec = self.exec.lock().unwrap();
+        let mut exec = self.exec.lock().unwrap();
+        self.drain_async(&mut exec);
         let mut off = 0usize;
         while off < out.len() {
             let chunk = (out.len() - off).min(exec.staging_cap as usize);
@@ -1165,7 +1244,8 @@ impl VkContext {
     }
 
     pub fn zero_buffer(&self, dst: &Buffer) -> Result<(), VkError> {
-        let exec = self.exec.lock().unwrap();
+        let mut exec = self.exec.lock().unwrap();
+        self.drain_async(&mut exec);
         unsafe {
             self.device.reset_command_buffer(exec.cmd_buf, vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(
@@ -1180,7 +1260,8 @@ impl VkContext {
     }
 
     pub fn begin(&self) -> Recorder<'_> {
-        let exec = self.exec.lock().unwrap();
+        let mut exec = self.exec.lock().unwrap();
+        self.drain_async(&mut exec);
         unsafe {
             if self.push_desc.is_none() {
                 self.device.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty()).unwrap();
@@ -1212,6 +1293,9 @@ impl Drop for VkContext {
                 self.device.destroy_buffer(exec.staging_buf, None);
                 self.device.free_memory(exec.staging_mem, None);
                 self.device.destroy_fence(exec.fence, None);
+                for f in exec.up_fences {
+                    self.device.destroy_fence(f, None);
+                }
                 self.device.destroy_descriptor_pool(exec.desc_pool, None);
                 self.device.destroy_command_pool(exec.cmd_pool, None);
             }
@@ -2889,6 +2973,17 @@ mod tests {
             for i in 0..nb * m {
                 assert!(a[i].to_bits() == b[i].to_bits(), "{wt:?} batch {nb} idx {i}: batch {} vs single {}", a[i], b[i]);
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn vk_context_init_bench() {
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let c = VkContext::new().expect("vulkan init");
+            eprintln!("VkContext::new: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            drop(c);
         }
     }
 

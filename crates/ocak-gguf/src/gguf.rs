@@ -233,6 +233,61 @@ impl GgufFile {
 
     pub fn file_len(&self) -> u64 { self.mmap.len() as u64 }
 
+    /// Estimated fraction of the mapped file resident in the page cache (mincore on 256 evenly
+    /// spaced pages; a full scan of a 10 GB mapping costs tens of ms). 0 when unknown.
+    pub fn resident_fraction(&self) -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            let page = 4096usize;
+            let pages = self.mmap.len() / page;
+            if pages == 0 {
+                return 0.0;
+            }
+            let samples = pages.min(256);
+            let mut hit = 0usize;
+            for i in 0..samples {
+                let off = (i * pages / samples) * page;
+                let mut v = 0u8;
+                // SAFETY: page-aligned address inside the live mapping, one page, one result byte.
+                let r = unsafe { libc::mincore(self.mmap.as_ptr().add(off) as *mut libc::c_void, page, &mut v) };
+                if r == 0 && v & 1 != 0 {
+                    hit += 1;
+                }
+            }
+            hit as f64 / samples as f64
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0.0
+        }
+    }
+
+    /// Pull the tensor data into the page cache on a background thread with large sequential
+    /// reads (in file order), so a cold load's uploads hit the page cache instead of faulting
+    /// the mmap in small pieces. posix_fadvise(WILLNEED) did not help (5.5 s either way).
+    pub fn prefetch_background(&self) {
+        if self.resident_fraction() > 0.9 {
+            return; // already cached: reading it again only competes for memory bandwidth (~110 ms)
+        }
+        let (path, start, end) = (self.path.clone(), self.data_offset, self.mmap.len() as u64);
+        std::thread::spawn(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let Ok(mut f) = File::open(&path) else { return };
+            if f.seek(SeekFrom::Start(start)).is_err() {
+                return;
+            }
+            let mut buf = vec![0u8; 16 << 20];
+            let mut left = end - start;
+            while left > 0 {
+                let n = (left as usize).min(buf.len());
+                match f.read(&mut buf[..n]) {
+                    Ok(0) | Err(_) => return,
+                    Ok(r) => left -= r as u64,
+                }
+            }
+        });
+    }
+
     pub fn get_str(&self, k: &str) -> Option<&str> { self.kv.get(k).and_then(|v| v.as_str()) }
     pub fn get_u64(&self, k: &str) -> Option<u64> { self.kv.get(k).and_then(|v| v.as_u64()) }
     pub fn get_f64(&self, k: &str) -> Option<f64> { self.kv.get(k).and_then(|v| v.as_f64()) }

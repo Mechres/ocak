@@ -139,7 +139,7 @@ fn upload_weight(ctx: &Arc<VkContext>, g: &GgufFile, ti: &TensorInfo) -> Result<
     let ty = WType::from_ggml(ti.ty).map_err(|e| EngineError::Unsupported(e.to_string()))?;
     let raw = g.tensor_data(ti);
     let buf = ctx.create_device_buffer(raw.len() as u64).map_err(|e| EngineError::Backend(e.to_string()))?;
-    ctx.upload(&buf, 0, raw).map_err(|e| EngineError::Backend(e.to_string()))?;
+    ctx.upload_async(&buf, 0, raw).map_err(|e| EngineError::Backend(e.to_string()))?;
     Ok(WeightBuf { buf: Arc::new(buf), ty, k: ti.n_cols() as u32, m: ti.n_rows() as u32 })
 }
 
@@ -155,6 +155,7 @@ impl VkExec {
                 cfg.head_dim
             )));
         }
+        g.prefetch_background();
         let ctx = VkContext::new().map_err(|e| EngineError::Backend(e.to_string()))?;
         let mk = |elems: usize| -> Result<Buffer, EngineError> {
             ctx.create_device_buffer((elems.max(4) * 4) as u64)

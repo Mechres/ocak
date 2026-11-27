@@ -94,6 +94,7 @@ experiments are not repeated. Keep it up to date when you try something new: add
 | Page-table upload skipped when unchanged (it changes once per 16-token page; each upload was a submit + fence wait) | Qwen3.8 IQ2_S decode 36.2-36.3 -> 36.4-36.5 tok/s (small model: no measurable change) |
 | Batched MTP prompt warmup (`warmup_kv_batch`: two uploads + one submit per 128 rows with batched norms / qmm / rope / kv_write, instead of two uploads + a submit per token) | 500-token prompt with MTP on: 308.2 -> 317 tok/s (MTP off: 319.8); same acceptance (75/115 on an 833-token summary) |
 | Readbacks recorded into the compute submit (`Recorder::finish_and_read`) for decode / verify / drafter, and the drafter's inputs written with `vkCmdUpdateBuffer` (`Recorder::update`) instead of separate upload / download submits | Qwen3.8 IQ2_S MTP 51.7 -> ~51.9 tok/s (+0.5%, near noise); plain decode unchanged; output identical (greedy and seeded sampled) |
+| Model load: background sequential read of the file into the page cache when it is not already resident (mincore sample), and pipelined weight uploads (`upload_async`: two staging halves / fences, CPU copy of one tensor overlaps the DMA of the previous) | Qwen3.8 IQ2_S (8.4 GB) cold load 5.2-5.8 -> 4.3 s (disk reads 2.5 GB/s: ~3.4 s floor), warm 1.47 -> 1.15 s |
 | Parallel MoE top-k | 235 -> 8 us per call (Inkling decode +40% with the int8 work) |
 | Two-pass argmax, wide norms | argmax 252 -> 5 us, add_rms_norm 11 -> 3.7 us |
 | int8 matvec in 8-token groups for 9..31-token batches (short prompts; used to fall back to the old 8-token float kernels at ~1.4 ms per call) | Qwen3.8 IQ2_S 12-token prompt 22 -> 115 tok/s; Qwen3.5-4B 219 -> 337 |
@@ -147,6 +148,8 @@ Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit.
 | Fuse decode activation quantization into `add_rms_norm` / `rms_norm` (norm kernel also writes the int8 copy; bit-identical, MTP stays exact) | no change (Qwen3.8 IQ2_S 36.2-36.3 tok/s; standalone quant_q8 dispatches halved) | the separate quant dispatch + barrier was not on the critical path |
 | Q3_K: fold the -4 offset into the min term (unsigned 0..7 weights, dot(q - 4, x) = dot(q, x) - 4 sum(x)) | no change (154 vs 155 us; 110 us either way after the scale fix) | the kernel was load-bound (byte loads), not ALU-bound; dropped to keep the old bits |
 | int8 decode path for Q8_0 matvecs (Inkling's dense Q8_0 tensors, ~290 calls / token on the float kernel) | slower (Inkling decode 24.5 -> 23.8 tok/s) | the float Q8_0 kernel is already cheap per weight; the int8 path adds activation quantization |
+| Load: posix_fadvise(WILLNEED) readahead thread | no change (5.5 s cold) | real sequential reads were needed; on a warm cache a read-ahead pass costs ~110 ms, hence the residency check |
+| Lazy pipeline creation | not needed | VkContext::new (all ~240 pipelines) takes 16-17 ms warm thanks to Mesa's shader cache |
 | Pitfall: changing `add_rms_norm` / `rms_norm` thread counts independently | broke lossless MTP (text changed with MTP on) | different reduction order in decode vs verify; int8 quantization amplifies the last-bit difference |
 | Driver note | RADV/ACO (Mesa 26.2.6) segfaulted compiling a qmm_q8 variant with a vec4 shared array whose components went unused | scalar shared arrays avoid it |
 

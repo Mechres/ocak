@@ -705,6 +705,7 @@ name = "ocak-gguf"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
  "memmap2",
  "serde",
  "sha2",
