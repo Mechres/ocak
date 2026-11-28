@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["vulkan"]
+default = ["vulkan", "hip"]
 vulkan = ["dep:ocak-vk"]
+hip = ["dep:ocak-hip"]
 
 [dependencies]
 ocak-gguf.workspace = true
@@ -14,6 +15,7 @@ ocak-kv = { path = "../ocak-kv" }
 ocak-cpu = { path = "../ocak-cpu" }
 ocak-sysfs.workspace = true
 ocak-vk = { path = "../ocak-vk", optional = true }
+ocak-hip = { path = "../ocak-hip", optional = true }
 half.workspace = true
 rayon.workspace = true
 thiserror.workspace = true

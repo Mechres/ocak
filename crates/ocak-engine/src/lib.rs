@@ -4,6 +4,8 @@ pub mod config;
 pub mod cpu_exec;
 pub mod engine;
 pub mod exec;
+#[cfg(feature = "hip")]
+pub mod hip_exec;
 #[cfg(feature = "vulkan")]
 pub mod inkling_exec;
 pub mod mtp;

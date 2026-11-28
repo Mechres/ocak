@@ -1,15 +1,17 @@
 //! Dynamic `dlopen` AMD HIP runtime (`libamdhip64.so`) + `libhiprtc.so` JIT compiler.
 //! Builds cleanly with zero ROCm SDK installed; lights up automatically when ROCm is present.
+pub mod dense_ops;
 pub mod ffi;
 pub mod kernels;
 pub mod rtc;
 pub mod runtime;
 
+pub use dense_ops::HipDenseOps;
 pub use ffi::{
     DeviceInfo, HipError, HipStatus, MemcpyKind, HIP_MEMCPY_D2D, HIP_MEMCPY_D2H, HIP_MEMCPY_H2D,
     HIP_MEMCPY_H2H,
 };
-pub use kernels::HipKernels;
+pub use kernels::{HipKernels, HipWType};
 pub use rtc::Hiprtc;
 pub use runtime::{
     HipBuffer, HipContext, HipEvent, HipFunction, HipGraphExec, HipModule, HipPinnedBuffer,
@@ -73,15 +75,30 @@ mod tests {
         let (be, bb) = ty.block().unwrap();
         let mut v: Vec<u8> = (0..(k / be * m * bb)).map(|_| rng.next() as u8).collect();
         match ty {
-            GgmlType::Q8_0 => {
+            GgmlType::F32 => {
+                for c in v.chunks_exact_mut(4) {
+                    c.copy_from_slice(&(rng.f() * 0.5).to_le_bytes());
+                }
+            }
+            GgmlType::F16 => {
+                for c in v.chunks_exact_mut(2) {
+                    c.copy_from_slice(&f16::from_f32(rng.f() * 0.5).to_le_bytes());
+                }
+            }
+            GgmlType::Q4_0 | GgmlType::Q8_0 => {
                 for blk in v.chunks_exact_mut(bb) {
                     blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                 }
             }
-            GgmlType::Q4K => {
+            GgmlType::Q4K | GgmlType::Q5K => {
                 for blk in v.chunks_exact_mut(bb) {
                     blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                     blk[2..4].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                }
+            }
+            GgmlType::Q6K => {
+                for blk in v.chunks_exact_mut(bb) {
+                    blk[208..210].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                 }
             }
             _ => unreachable!(),
@@ -161,7 +178,15 @@ mod tests {
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(1337);
 
-        for (ty, is_q4k) in [(GgmlType::Q8_0, false), (GgmlType::Q4K, true)] {
+        for (ty, hty) in [
+            (GgmlType::F32, HipWType::F32),
+            (GgmlType::F16, HipWType::F16),
+            (GgmlType::Q4_0, HipWType::Q4_0),
+            (GgmlType::Q8_0, HipWType::Q8_0),
+            (GgmlType::Q4K, HipWType::Q4K),
+            (GgmlType::Q5K, HipWType::Q5K),
+            (GgmlType::Q6K, HipWType::Q6K),
+        ] {
             let (k, m, batch) = (512usize, 70usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);
             let x: Vec<f32> = (0..batch * k).map(|_| rng.f()).collect();
@@ -178,15 +203,13 @@ mod tests {
             let bxsc = ctx.alloc_buffer(n_blocks as usize * 16).unwrap();
             let by = ctx.alloc_buffer(batch * m * 4).unwrap();
 
-            kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+            if hty.uses_q8_act() {
+                kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+            }
 
             // 1) Decode qmv for batch = 3
             let b_dec = 3u32;
-            if is_q4k {
-                kernels.qmv_q4_k(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, b_dec).unwrap();
-            } else {
-                kernels.qmv_q8_0(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, b_dec).unwrap();
-            }
+            kernels.qmv(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, b_dec).unwrap();
             stream.synchronize().unwrap();
             let mut y_dec = vec![0f32; b_dec as usize * m];
             by.download_at(0, bytemuck::cast_slice_mut(&mut y_dec)).unwrap();
@@ -201,11 +224,7 @@ mod tests {
             assert!(mean <= 3e-3 * scale as f64, "qmv {ty:?}: mean err {mean} (scale {scale})");
 
             // 2) Prefill qmm for full batch = 37
-            if is_q4k {
-                kernels.qmm_q4_k(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
-            } else {
-                kernels.qmm_q8_0(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
-            }
+            kernels.qmm(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
             stream.synchronize().unwrap();
             let mut y_mm = vec![0f32; batch * m];
             by.download(bytemuck::cast_slice_mut(&mut y_mm)).unwrap();
@@ -217,14 +236,14 @@ mod tests {
             }
             let mean_mm = sum_err_mm / y_mm.len() as f64;
             assert!(mean_mm <= 3e-3 * scale as f64, "qmm {ty:?}: mean err {mean_mm} (scale {scale})");
-            // qmv and qmm use the exact same int8 activations -> should agree tightly on batch 0..3
+            // qmv and qmm use the exact same activations -> should agree tightly on batch 0..3
             for i in 0..y_dec.len() {
                 let err = (y_dec[i] - y_mm[i]).abs();
                 assert!(err < 1e-4 * scale, "qmv vs qmm {ty:?}[{i}]: {} vs {}", y_dec[i], y_mm[i]);
             }
 
             // 3) Opt-in GROUP256 Q4_K (rescale once per 256)
-            if is_q4k {
+            if hty == HipWType::Q4K {
                 kernels.quant_q8_g256(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
                 kernels.qmm_q4_k_g256(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
                 stream.synchronize().unwrap();
@@ -240,6 +259,74 @@ mod tests {
                 assert!(mean_g256 <= 4e-3 * scale as f64, "qmm_g256 Q4K: mean err {mean_g256} (scale {scale})");
             }
         }
+    }
+
+    #[test]
+    fn hip_dense_ops_match_cpu() {
+        let Some(ctx) = try_ctx() else { return };
+        let ops = HipDenseOps::compile(&ctx).unwrap();
+        let stream = ctx.create_stream().unwrap();
+        let mut rng = Lcg(777);
+
+        // 1) Embed Q4K + Q6K
+        for (ty, hty) in [(GgmlType::Q4K, HipWType::Q4K), (GgmlType::Q6K, HipWType::Q6K)] {
+            let w = rand_weights(ty, 512, 5, &mut rng);
+            let bw = ctx.buffer_from_slice(&w).unwrap();
+            let bo = ctx.alloc_buffer(512 * 4).unwrap();
+            ops.embed_token(&stream, &bw, hty, &bo, 3, 512).unwrap();
+            stream.synchronize().unwrap();
+            let mut e_gpu = vec![0f32; 512];
+            bo.download(bytemuck::cast_slice_mut(&mut e_gpu)).unwrap();
+            let rb = hty.row_bytes(512) as usize;
+            let mut e_cpu = vec![0f32; 512];
+            ocak_gguf::quant::dequantize_row(ty, &w[3 * rb..4 * rb], &mut e_cpu, 512);
+            for i in 0..512 {
+                assert!((e_cpu[i] - e_gpu[i]).abs() < 1e-4, "embed {ty:?}[{i}]");
+            }
+        }
+
+        // 2) Paged FP16 kv_write + attention (non-identity page table [5, 2, 9], pos=37)
+        let (nh, nkv, hd, pos) = (16usize, 4usize, 64usize, 37usize);
+        let kv_dim = nkv * hd;
+        let n_pages = 12usize;
+        let pt = vec![5u32, 2, 9];
+        let mut kv_cpu = vec![0f32; n_pages * 2 * 16 * kv_dim];
+        let bkv = ctx.alloc_buffer(n_pages * 2 * 16 * kv_dim * 2).unwrap();
+        let bpt = ctx.buffer_from_slice(&pt).unwrap();
+        for t in 0..=pos {
+            let k: Vec<f32> = (0..kv_dim).map(|_| rng.f()).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|_| rng.f()).collect();
+            ocak_cpu::ops::kv_write(&k, &v, &mut kv_cpu, 0, &pt, t, kv_dim);
+            let bk = ctx.buffer_from_slice(&k).unwrap();
+            let bv = ctx.buffer_from_slice(&v).unwrap();
+            ops.kv_write(&stream, &bk, &bv, &bkv, 0, &bpt, t as u32, kv_dim as u32, 1).unwrap();
+            stream.synchronize().unwrap();
+        }
+        let q: Vec<f32> = (0..nh * hd).map(|_| rng.f()).collect();
+        let mut a_cpu = vec![0f32; nh * hd];
+        ocak_cpu::ops::attention(&q, &kv_cpu, 0, &pt, &mut a_cpu, nh, nkv, hd, pos);
+        let bq = ctx.buffer_from_slice(&q).unwrap();
+        let bo = ctx.alloc_buffer(nh * hd * 4).unwrap();
+        ops.attention(&stream, &bq, &bkv, 0, &bpt, &bo, nh as u32, nkv as u32, hd as u32, pos as u32, 0, 1).unwrap();
+        stream.synchronize().unwrap();
+        let mut a_gpu = vec![0f32; nh * hd];
+        bo.download(bytemuck::cast_slice_mut(&mut a_gpu)).unwrap();
+        for i in 0..a_cpu.len() {
+            assert!((a_cpu[i] - a_gpu[i]).abs() < 2e-3, "attn[{i}]: cpu={} gpu={}", a_cpu[i], a_gpu[i]);
+        }
+
+        // 3) GPU argmax
+        let mut logits: Vec<f32> = (0..32000).map(|_| rng.f()).collect();
+        logits[17321] = 42.5;
+        let bl = ctx.buffer_from_slice(&logits).unwrap();
+        let bpv = ctx.alloc_buffer(256 * 4).unwrap();
+        let bpi = ctx.alloc_buffer(256 * 4).unwrap();
+        let bi = ctx.alloc_buffer(4).unwrap();
+        ops.argmax(&stream, &bl, &bpv, &bpi, &bi, logits.len() as u32).unwrap();
+        stream.synchronize().unwrap();
+        let mut idx = [0u32; 1];
+        bi.download(bytemuck::cast_slice_mut(&mut idx)).unwrap();
+        assert_eq!(idx[0], 17321);
     }
 
     #[test]

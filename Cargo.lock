@@ -678,6 +678,7 @@ dependencies = [
  "half",
  "ocak-cpu",
  "ocak-gguf",
+ "ocak-hip",
  "ocak-kv",
  "ocak-sysfs",
  "ocak-tok",

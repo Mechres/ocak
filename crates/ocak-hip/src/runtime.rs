@@ -397,6 +397,40 @@ impl HipBuffer {
             .api
             .check(unsafe { (self.ctx.api.memset_async)(self.ptr, 0, self.size, stream.raw) })
     }
+
+    /// Asynchronously copies `bytes` from `src[src_offset..]` to `self[dst_offset..]` on `stream`.
+    pub fn copy_from_at_async(
+        &self,
+        dst_offset: usize,
+        src: &HipBuffer,
+        src_offset: usize,
+        bytes: usize,
+        stream: &HipStream,
+    ) -> Result<(), HipError> {
+        let d_end = dst_offset
+            .checked_add(bytes)
+            .ok_or_else(|| HipError::InvalidArg("copy dst overflow".into()))?;
+        let s_end = src_offset
+            .checked_add(bytes)
+            .ok_or_else(|| HipError::InvalidArg("copy src overflow".into()))?;
+        if d_end > self.size || s_end > src.size {
+            return Err(HipError::InvalidArg("D2D copy out of bounds".into()));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        let dst_p = self.device_ptr_at(dst_offset)?;
+        let src_p = src.device_ptr_at(src_offset)?;
+        self.ctx.api.check(unsafe {
+            (self.ctx.api.memcpy_async)(
+                dst_p,
+                src_p as *const c_void,
+                bytes,
+                MemcpyKind::D2D.raw(),
+                stream.raw,
+            )
+        })
+    }
 }
 
 impl Drop for HipBuffer {

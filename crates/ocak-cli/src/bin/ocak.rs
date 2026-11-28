@@ -172,7 +172,11 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Run { model, prompt, max_tokens, backend, temp, max_ctx } => {
-            let bk = if backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
+            let bk = match backend.as_str() {
+                "cpu" => BackendKind::CpuAvx2,
+                "hip" => BackendKind::Hip,
+                _ => BackendKind::Vulkan,
+            };
             let t0 = Instant::now();
             let mut eng = NativeEngine::load(&model, EngineOptions { backend: bk, max_ctx, kv_pages: 128 })?;
             eprintln!("Loaded {} on {} in {:.0} ms", model.display(), eng.backend_name(), t0.elapsed().as_secs_f64() * 1000.0);
@@ -354,7 +358,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Bench { models_dir, filter, prompt_tokens, decode_tokens, backend } => {
             let models_dir = models_dir.unwrap_or_else(default_models_dir);
-            let bk = if backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
+            let bk = match backend.as_str() {
+                "cpu" => BackendKind::CpuAvx2,
+                "hip" => BackendKind::Hip,
+                _ => BackendKind::Vulkan,
+            };
             let mut entries: Vec<_> = scan(&[models_dir])
                 .into_iter()
                 .filter(|e| {

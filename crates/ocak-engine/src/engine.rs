@@ -2,6 +2,8 @@ use crate::config::ModelConfig;
 use crate::cpu_exec::CpuExec;
 use crate::exec::{EngineError, Executor, Out, SlotStep};
 use crate::sampler::{Sampler, SamplerParams};
+#[cfg(feature = "hip")]
+use crate::hip_exec::HipExec;
 #[cfg(feature = "vulkan")]
 use crate::vk_exec::VkExec;
 use ocak_gguf::GgufFile;
@@ -15,6 +17,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Vulkan,
+    Hip,
     CpuAvx2,
 }
 
@@ -97,7 +100,7 @@ impl NativeEngine {
         let mut n_pages = opts.kv_pages.max(max_ctx.div_ceil(PAGE_TOKENS) + 16);
         // Size the paged KV cache to the VRAM that is actually free (dense / hybrid VkExec models;
         // Xing and Inkling manage their own placement). Shrinks the context rather than overcommit.
-        if opts.backend == BackendKind::Vulkan && cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && page_bytes > 0 {
+        if matches!(opts.backend, BackendKind::Vulkan | BackendKind::Hip) && cfg.arch != "xing4_0" && cfg.arch != "inkling2_loop" && page_bytes > 0 {
             if let Some(budget) = vram_kv_budget(g.file_len()) {
                 let fit_pages = (budget / page_bytes) as usize;
                 let min_pages = max_ctx.div_ceil(PAGE_TOKENS) + 16;
@@ -129,6 +132,10 @@ impl NativeEngine {
             BackendKind::Vulkan => Box::new(VkExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
             #[cfg(not(feature = "vulkan"))]
             BackendKind::Vulkan => return Err(EngineError::Backend("vulkan feature disabled".into())),
+            #[cfg(feature = "hip")]
+            BackendKind::Hip => Box::new(HipExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
+            #[cfg(not(feature = "hip"))]
+            BackendKind::Hip => return Err(EngineError::Backend("hip feature disabled".into())),
             BackendKind::CpuAvx2 => Box::new(CpuExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
         } };
         let backend_name = exec.name();

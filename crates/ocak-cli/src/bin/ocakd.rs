@@ -37,7 +37,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
-    let backend = if args.backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
+    let backend = match args.backend.as_str() {
+        "cpu" => BackendKind::CpuAvx2,
+        "hip" => BackendKind::Hip,
+        _ => BackendKind::Vulkan,
+    };
     let allow_remote_host = !matches!(args.host.trim_matches(['[', ']']), "127.0.0.1" | "localhost" | "::1")
         || std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1");
     let models_dir = args.models_dir.unwrap_or_else(|| {
