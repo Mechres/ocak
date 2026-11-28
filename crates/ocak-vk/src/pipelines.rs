@@ -68,17 +68,6 @@ pub(crate) struct Pipelines {
     pub(crate) inkling_ctrl: PipelineBundle,
     pub(crate) inkling_conv: PipelineBundle,
     pub(crate) inkling_attn: PipelineBundle,
-    pub(crate) qmm_q4_k: PipelineBundle,
-    pub(crate) qmm_q6_k: PipelineBundle,
-    pub(crate) qmm_q5_k: PipelineBundle,
-    pub(crate) qmm_q4_0: PipelineBundle,
-    pub(crate) qmm_q8_0: PipelineBundle,
-    pub(crate) qmm_f16: PipelineBundle,
-    pub(crate) qmm_f32: PipelineBundle,
-    pub(crate) qmm_iq2_s: PipelineBundle,
-    pub(crate) qmm_iq2_xs: PipelineBundle,
-    pub(crate) qmm_iq3_xxs: PipelineBundle,
-    pub(crate) qmm_iq3_s: PipelineBundle,
     /// Tiled prefill matmul, indexed by `qmmt_index`.
     pub(crate) qmmt: Vec<PipelineBundle>,
     /// Grouped (MoE expert / per-head) variant of `qmmt`, same indexing.
@@ -131,8 +120,8 @@ impl Pipelines {
             &self.qmv_nvfp4_id, &self.qmv_q4_k_id, &self.situ_id,
             &self.add_scaled_id, &self.add_scaled_exp_id,
             &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
-            &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
-            &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_xxs, &self.qmm_iq3_s,
+            
+            
             
             &self.argmax,
         ]
@@ -285,17 +274,6 @@ impl Pipelines {
             inkling_ctrl: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_ctrl.spv")), "inkling_ctrl", 3, 16)?,
             inkling_conv: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_conv.spv")), "inkling_conv", 5, 48)?,
             inkling_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn.spv")), "inkling_attn", 12, 72)?,
-            qmm_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_k.spv")), "qmm_q4_k", 3, 28)?,
-            qmm_q6_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q6_k.spv")), "qmm_q6_k", 3, 28)?,
-            qmm_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q5_k.spv")), "qmm_q5_k", 3, 28)?,
-            qmm_q4_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q4_0.spv")), "qmm_q4_0", 3, 28)?,
-            qmm_q8_0: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_q8_0.spv")), "qmm_q8_0", 3, 28)?,
-            qmm_f16: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f16.spv")), "qmm_f16", 3, 28)?,
-            qmm_f32: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_f32.spv")), "qmm_f32", 3, 28)?,
-            qmm_iq2_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_s.spv")), "qmm_iq2_s", 4, 28)?,
-            qmm_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), "qmm_iq2_xs", 4, 28)?,
-            qmm_iq3_xxs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_xxs.spv")), "qmm_iq3_xxs", 4, 28)?,
-            qmm_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), "qmm_iq3_s", 4, 28)?,
             qmmt: vec![
                 bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_k.spv")), "qmmt_q4_k", 4, 36)?,
                 bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q5_k.spv")), "qmmt_q5_k", 4, 36)?,

@@ -189,16 +189,23 @@ impl<'a> Recorder<'a> {
             }
             return;
         }
+        if batch > 8 && batch < qmmt_min_batch() && k.is_multiple_of(32) {
+            // 9..31 tokens the int8 path declined (Q8_0, small or float matrices): float
+            // small-batch matvec in groups of 8 tokens (one weight read per group).
+            let mut t = 0u32;
+            while t < batch {
+                let nb = (batch - t).min(8);
+                let pcg = [off_u32(w_off), off_u32(x_off) + t * k, off_u32(y_off) + t * m, k, m, ty.row_bytes(k), nb];
+                let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
+                self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pcg), gx, 1, 1);
+                t += nb;
+            }
+            return;
+        }
         if batch <= 8 && k.is_multiple_of(32) {
             // Small batch: one weight read for all tokens.
             let p = &self.ctx.pipelines.qmvm[qmmt_index(ty)];
             self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
-            return;
-        }
-        if batch == 2 {
-            // Only reached when k is not a multiple of 32 (no block-quantized format).
-            self.qmv(ty, w, w_off, x, x_off, y, y_off, k, m);
-            self.qmv(ty, w, w_off, x, x_off + k as u64, y, y_off + m as u64, k, m);
             return;
         }
         if batch >= qmmt_min_batch() && k.is_multiple_of(32) {
@@ -234,25 +241,10 @@ impl<'a> Recorder<'a> {
             self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, gy, 1);
             return;
         }
-        let gy = batch.div_ceil(8);
-        let gx8 = m.div_ceil(8);
-        match ty {
-            WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::Q6K => self.dispatch_raw(&self.ctx.pipelines.qmm_q6_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::Q5K => self.dispatch_raw(&self.ctx.pipelines.qmm_q5_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::Q4_0 => self.dispatch_raw(&self.ctx.pipelines.qmm_q4_0, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
-            WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmm_q8_0, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::F16 => self.dispatch_raw(&self.ctx.pipelines.qmm_f16, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
-            WType::F32 => self.dispatch_raw(&self.ctx.pipelines.qmm_f32, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, gy, 1),
-            WType::IQ2S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::IQ2XS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_xxs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmm_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx8, gy, 1),
-            _ => {
-                for b in 0..batch {
-                    self.qmv(ty, w, w_off, x, x_off + (b * k) as u64, y, y_off + (b * m) as u64, k, m);
-                }
-            }
+        // Only k not a multiple of 32 (float weights) gets here: one matvec per token.
+        for b in 0..batch {
+            self.qmv(ty, w, w_off, x, x_off + (b * k) as u64, y, y_off + (b * m) as u64, k, m);
         }
     }
 }
+

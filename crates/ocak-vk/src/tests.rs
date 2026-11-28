@@ -1091,7 +1091,12 @@ fn vk_qmm_matches_qmv() {
     let by_qmm = c.create_device_buffer((batch * m * 4) as u64).unwrap();
     let by_qmv = c.create_device_buffer((batch * m * 4) as u64).unwrap();
 
-    for wt in [WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::IQ2S, WType::IQ2XS, WType::IQ3S, WType::IQ3XXS] {
+    // batch 11 on a 13-row matrix: below the tiled threshold and too small for int8, so this
+    // covers the float small-batch matvec in 8-token groups for every format.
+    for wt in [
+        WType::Q4K, WType::Q6K, WType::Q5K, WType::Q4_0, WType::Q8_0, WType::F16, WType::F32, WType::BF16, WType::Q2K, WType::Q3K,
+        WType::IQ2S, WType::IQ2XS, WType::IQ2XXS, WType::IQ3S, WType::IQ3XXS, WType::IQ1S, WType::IQ1M, WType::IQ4NL, WType::IQ4XS, WType::NVFP4,
+    ] {
         let rb = wt.row_bytes(k as u32) as usize;
         let raw: Vec<u8> = if wt == WType::F32 {
             let f: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
