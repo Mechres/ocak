@@ -482,6 +482,106 @@ DEFINE_QMV_NOMIN(qmv_q8_0, dqi32_q8_0)
 DEFINE_QMV_MIN(qmv_q4_k, dqi32_q4_k)
 DEFINE_QMV_MIN(qmv_q5_k, dqi32_q5_k)
 
+// Specialized batch == 1 decode matvec (scalar acc, no MAXB=8 array/loop)
+#define DEFINE_QMV1_NOMIN(NAME, UNPACK) \
+extern "C" __global__ __launch_bounds__(128) \
+void NAME( \
+    const u32* __restrict__ w32, \
+    const u32x4* __restrict__ xq4, \
+    const f32x4* __restrict__ xsc, \
+    float* __restrict__ y, \
+    u32 k, u32 m, u32 row_bytes \
+) { \
+    u32 tid = threadIdx.x; \
+    u32 row = blockIdx.x * 4u + threadIdx.y; \
+    float acc = 0.0f; \
+    if (row < m) { \
+        u32 rb = row * row_bytes; \
+        u32 kblocks = k >> 5; \
+        for (u32 blk = tid; blk < kblocks; blk += 32u) { \
+            u32 q[8]; float d; \
+            UNPACK(w32, rb, blk, q, d); \
+            u32x4 xa = xq4[blk * 2u]; \
+            u32x4 xc = xq4[blk * 2u + 1u]; \
+            i32 s = sdot4_zero(q[0], xa.x); \
+            s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s); \
+            s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s); \
+            acc = __fmaf_rn(d * xsc[blk].x, (float)s, acc); \
+        } \
+    } \
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32); \
+    if (tid == 0u && row < m) y[row] = acc; \
+}
+
+#define DEFINE_QMV1_MIN(NAME, UNPACK) \
+extern "C" __global__ __launch_bounds__(128) \
+void NAME( \
+    const u32* __restrict__ w32, \
+    const u32x4* __restrict__ xq4, \
+    const f32x4* __restrict__ xsc, \
+    float* __restrict__ y, \
+    u32 k, u32 m, u32 row_bytes \
+) { \
+    u32 tid = threadIdx.x; \
+    u32 row = blockIdx.x * 4u + threadIdx.y; \
+    float acc = 0.0f; \
+    if (row < m) { \
+        u32 rb = row * row_bytes; \
+        u32 kblocks = k >> 5; \
+        for (u32 blk = tid; blk < kblocks; blk += 32u) { \
+            u32 q[8]; float d, mn; \
+            UNPACK(w32, rb, blk, q, d, mn); \
+            u32x4 xa = xq4[blk * 2u]; \
+            u32x4 xc = xq4[blk * 2u + 1u]; \
+            i32 s = sdot4_zero(q[0], xa.x); \
+            s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s); \
+            s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s); \
+            f32x4 xs = xsc[blk]; \
+            acc = __fmaf_rn(d * xs.x, (float)s, acc); \
+            acc = __fmaf_rn(-mn, xs.y + xs.z, acc); \
+        } \
+    } \
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32); \
+    if (tid == 0u && row < m) y[row] = acc; \
+}
+
+DEFINE_QMV1_NOMIN(qmv1_q4_0, dqi32_q4_0)
+DEFINE_QMV1_NOMIN(qmv1_q8_0, dqi32_q8_0)
+DEFINE_QMV1_MIN(qmv1_q4_k, dqi32_q4_k)
+DEFINE_QMV1_MIN(qmv1_q5_k, dqi32_q5_k)
+
+extern "C" __global__ __launch_bounds__(128)
+void qmv1_q6_k(
+    const u32* __restrict__ w32,
+    const u32x4* __restrict__ xq4,
+    const f32x4* __restrict__ xsc,
+    float* __restrict__ y,
+    u32 k, u32 m, u32 row_bytes
+) {
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.x * 4u + threadIdx.y;
+    float acc = 0.0f;
+    if (row < m) {
+        u32 rb = row * row_bytes;
+        u32 kblocks = k >> 5;
+        for (u32 blk = tid; blk < kblocks; blk += 32u) {
+            u32 q[8]; float d0, d1;
+            dqi32_q6_k(w32, rb, blk, q, d0, d1);
+            u32x4 xa = xq4[blk * 2u];
+            u32x4 xc = xq4[blk * 2u + 1u];
+            i32 i0 = sdot4_zero(q[0], xa.x);
+            i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0);
+            i32 i1 = sdot4_zero(q[4], xc.x);
+            i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1);
+            float dx = xsc[blk].x;
+            acc = __fmaf_rn(dx, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (tid == 0u && row < m) y[row] = acc;
+}
+
 extern "C" __global__ __launch_bounds__(128)
 void qmv_q6_k(
     const u32* __restrict__ w32,
@@ -1106,6 +1206,11 @@ pub struct HipKernels {
     qmv_q4_k: HipFunction,
     qmv_q5_k: HipFunction,
     qmv_q6_k: HipFunction,
+    qmv1_q4_0: HipFunction,
+    qmv1_q8_0: HipFunction,
+    qmv1_q4_k: HipFunction,
+    qmv1_q5_k: HipFunction,
+    qmv1_q6_k: HipFunction,
     qmm_f32: HipFunction,
     qmm_f16: HipFunction,
     qmm_q4_0: HipFunction,
@@ -1131,6 +1236,11 @@ impl HipKernels {
             qmv_q4_k: module.function("qmv_q4_k")?,
             qmv_q5_k: module.function("qmv_q5_k")?,
             qmv_q6_k: module.function("qmv_q6_k")?,
+            qmv1_q4_0: module.function("qmv1_q4_0")?,
+            qmv1_q8_0: module.function("qmv1_q8_0")?,
+            qmv1_q4_k: module.function("qmv1_q4_k")?,
+            qmv1_q5_k: module.function("qmv1_q5_k")?,
+            qmv1_q6_k: module.function("qmv1_q6_k")?,
             qmm_f32: module.function("qmm_f32")?,
             qmm_f16: module.function("qmm_f16")?,
             qmm_q4_0: module.function("qmm_q4_0")?,
@@ -1227,6 +1337,17 @@ impl HipKernels {
         m: u32,
         batch: u32,
     ) -> Result<(), HipError> {
+        if batch == 1 {
+            return match ty {
+                HipWType::F32 => self.launch_qmv_float(&self.qmv_f32, stream, w, x_f32, y, k, m, 1),
+                HipWType::F16 => self.launch_qmv_float(&self.qmv_f16, stream, w, x_f32, y, k, m, 1),
+                HipWType::Q4_0 => self.launch_qmv1(&self.qmv1_q4_0, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q8_0 => self.launch_qmv1(&self.qmv1_q8_0, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q4K => self.launch_qmv1(&self.qmv1_q4_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q5K => self.launch_qmv1(&self.qmv1_q5_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q6K => self.launch_qmv1(&self.qmv1_q6_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+            };
+        }
         match ty {
             HipWType::F32 => self.launch_qmv_float(&self.qmv_f32, stream, w, x_f32, y, k, m, batch),
             HipWType::F16 => self.launch_qmv_float(&self.qmv_f16, stream, w, x_f32, y, k, m, batch),
@@ -1394,6 +1515,37 @@ impl HipKernels {
             &mut b as *mut _ as *mut c_void,
         ];
         unsafe { func.launch(stream, (m.div_ceil(32), batch.div_ceil(32), 1), (16, 16, 1), 0, &mut params) }
+    }
+
+    fn launch_qmv1(
+        &self,
+        func: &HipFunction,
+        stream: &HipStream,
+        w: &HipBuffer,
+        xq: &HipBuffer,
+        xsc: &HipBuffer,
+        y: &HipBuffer,
+        k: u32,
+        m: u32,
+        row_bytes: u32,
+    ) -> Result<(), HipError> {
+        let mut wp = w.as_device_ptr();
+        let mut qp = xq.as_device_ptr();
+        let mut sp = xsc.as_device_ptr();
+        let mut yp = y.as_device_ptr();
+        let mut k = k;
+        let mut m = m;
+        let mut rb = row_bytes;
+        let mut params: [*mut c_void; 7] = [
+            &mut wp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut m as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+        ];
+        unsafe { func.launch(stream, (m.div_ceil(4), 1, 1), (32, 4, 1), 0, &mut params) }
     }
 
     fn launch_qmv(

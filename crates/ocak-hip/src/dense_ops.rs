@@ -15,6 +15,8 @@ typedef unsigned long long u64;
 typedef int                i32;
 typedef signed char        i8;
 
+struct __align__(16) f32x4 { float x, y, z, w; };
+
 __device__ __forceinline__ float f16_to_f32(u16 h) {
     union { u16 u; _Float16 f; } v;
     v.u = h;
@@ -34,6 +36,40 @@ __device__ __forceinline__ float f16at(const u8* __restrict__ w, u64 off) {
 
 __device__ __forceinline__ void lds_barrier() {
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
+// Helper: quantize one 32-element block held across 32 lanes (1 float per lane) into xq/xsc.
+__device__ __forceinline__ void warp_quant_q8_block(
+    float v, u32 lane, u32 blk, u32* __restrict__ xq, f32x4* __restrict__ xsc
+) {
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    float dx = amax * (1.0f / 127.0f);
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    i32 q = min(127, max(-127, __float2int_rn(v * inv)));
+
+    // Pack 4 consecutive lanes into 1 u32 via shuffle-down; lane % 4 == 0 writes.
+    i32 q1 = __shfl_down(q, 1, 32);
+    i32 q2 = __shfl_down(q, 2, 32);
+    i32 q3 = __shfl_down(q, 3, 32);
+    if ((lane & 3u) == 0u) {
+        xq[blk * 8u + (lane >> 2)] = (u32)(q & 0xFF)
+            | ((u32)(q1 & 0xFF) << 8)
+            | ((u32)(q2 & 0xFF) << 16)
+            | ((u32)(q3 & 0xFF) << 24);
+    }
+
+    i32 s0 = (lane < 16u) ? q : 0;
+    i32 s1 = (lane < 16u) ? 0 : q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s0 += __shfl_xor(s0, off, 32);
+        s1 += __shfl_xor(s1, off, 32);
+    }
+    if (lane == 0u) {
+        xsc[blk] = { dx, dx * (float)s0, dx * (float)s1, 0.0f };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +301,175 @@ void swiglu_f32(
     if (i < n) {
         float g = gate[i];
         out[i] = (g / (1.0f + __expf(-g))) * up[i];
+    }
+}
+
+// Fused RMSNorm + Q8 activation quantize (single row, n % 32 == 0).
+extern "C" __global__ __launch_bounds__(256)
+void rms_norm_q8_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    u32* __restrict__ xq,
+    f32x4* __restrict__ xsc,
+    u32 n,
+    float eps
+) {
+    __shared__ float smem[8];
+    u32 lid = threadIdx.x;
+    u32 warp = lid >> 5;
+    u32 lane = lid & 31u;
+    float ss = 0.0f;
+    for (u32 i = lid; i < n; i += 256u) {
+        float v = x[i];
+        ss += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if (lane == 0u) smem[warp] = ss;
+    lds_barrier();
+    if (lid < 8u) {
+        float v = smem[lid];
+        for (int off = 4; off > 0; off >>= 1) v += __shfl_xor(v, off, 8);
+        smem[lid] = v;
+    }
+    lds_barrier();
+    float scale = rsqrtf(smem[0] / (float)n + eps);
+    u32 n_blocks = n >> 5;
+    for (u32 blk = warp; blk < n_blocks; blk += 8u) {
+        u32 idx = blk * 32u + lane;
+        float v = x[idx] * scale * w[idx];
+        y[idx] = v;
+        warp_quant_q8_block(v, lane, blk, xq, xsc);
+    }
+}
+
+// Fused residual add + RMSNorm + Q8 activation quantize (single row, n % 32 == 0).
+extern "C" __global__ __launch_bounds__(256)
+void add_rms_norm_q8_f32(
+    float* __restrict__ x,
+    const float* __restrict__ r,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    u32* __restrict__ xq,
+    f32x4* __restrict__ xsc,
+    u32 n,
+    float eps
+) {
+    __shared__ float smem[8];
+    u32 lid = threadIdx.x;
+    u32 warp = lid >> 5;
+    u32 lane = lid & 31u;
+    float ss = 0.0f;
+    for (u32 i = lid; i < n; i += 256u) {
+        float v = x[i] + r[i];
+        x[i] = v;
+        ss += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    if (lane == 0u) smem[warp] = ss;
+    lds_barrier();
+    if (lid < 8u) {
+        float v = smem[lid];
+        for (int off = 4; off > 0; off >>= 1) v += __shfl_xor(v, off, 8);
+        smem[lid] = v;
+    }
+    lds_barrier();
+    float scale = rsqrtf(smem[0] / (float)n + eps);
+    u32 n_blocks = n >> 5;
+    for (u32 blk = warp; blk < n_blocks; blk += 8u) {
+        u32 idx = blk * 32u + lane;
+        float v = x[idx] * scale * w[idx];
+        y[idx] = v;
+        warp_quant_q8_block(v, lane, blk, xq, xsc);
+    }
+}
+
+// Fused SwiGLU + Q8 activation quantize (1 warp per 32-element block, 8 blocks/WG).
+extern "C" __global__ __launch_bounds__(256)
+void swiglu_q8_f32(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    u32* __restrict__ xq,
+    f32x4* __restrict__ xsc,
+    u32 n
+) {
+    u32 lid = threadIdx.x;
+    u32 warp = lid >> 5;
+    u32 lane = lid & 31u;
+    u32 blk = blockIdx.x * 8u + warp;
+    if (blk >= (n >> 5)) return;
+    u32 idx = blk * 32u + lane;
+    float g = gate[idx];
+    float v = (g / (1.0f + __expf(-g))) * up[idx];
+    out[idx] = v;
+    warp_quant_q8_block(v, lane, blk, xq, xsc);
+}
+
+// Fused RoPE(Q) + RoPE(K) + paged FP16 KV write for 1-token decode (reads pos from step_meta[1]).
+// Grid: (n_heads + n_kv_heads, 1, 1), Block: (128, 1, 1) (supports head_dim <= 256).
+extern "C" __global__ __launch_bounds__(128)
+void rope_qk_kv_write_meta(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ v,
+    u32* __restrict__ kv_layer,
+    const u32* __restrict__ page_table,
+    const u32* __restrict__ step_meta,
+    u32 n_heads,
+    u32 n_kv_heads,
+    u32 head_dim,
+    u32 n_rot,
+    float rope_base,
+    u32 mode
+) {
+    u32 bid = blockIdx.x;
+    u32 lid = threadIdx.x;
+    u32 pos = step_meta[1];
+    u32 half_rot = n_rot >> 1;
+    u32 half_hd = head_dim >> 1;
+
+    if (bid < n_heads) {
+        // Apply RoPE to Q head `bid`
+        if (lid < half_rot) {
+            float freq = powf(rope_base, -(2.0f * (float)lid) / (float)n_rot);
+            float c, s;
+            sincosf((float)pos * freq, &s, &c);
+            float* base = q + (u64)bid * head_dim;
+            u32 i0 = (mode == 0u) ? (2u * lid) : lid;
+            u32 i1 = (mode == 0u) ? (2u * lid + 1u) : (lid + half_rot);
+            float x0 = base[i0], x1 = base[i1];
+            base[i0] = x0 * c - x1 * s;
+            base[i1] = x0 * s + x1 * c;
+        }
+    } else {
+        // Apply RoPE to K head `kvh` AND immediately write K, V head `kvh` to FP16 KV page
+        u32 kvh = bid - n_heads;
+        if (kvh >= n_kv_heads) return;
+        float* kbase = k + (u64)kvh * head_dim;
+        if (lid < half_rot) {
+            float freq = powf(rope_base, -(2.0f * (float)lid) / (float)n_rot);
+            float c, s;
+            sincosf((float)pos * freq, &s, &c);
+            u32 i0 = (mode == 0u) ? (2u * lid) : lid;
+            u32 i1 = (mode == 0u) ? (2u * lid + 1u) : (lid + half_rot);
+            float x0 = kbase[i0], x1 = kbase[i1];
+            kbase[i0] = x0 * c - x1 * s;
+            kbase[i1] = x0 * s + x1 * c;
+        }
+        lds_barrier();
+        if (lid < half_hd) {
+            u32 page = page_table[pos >> 4];
+            u32 slot = pos & 15u;
+            u32 half_kv = n_kv_heads * half_hd;
+            u64 k_off = ((u64)page * 32u + slot) * half_kv + (u64)kvh * half_hd + lid;
+            u64 v_off = ((u64)page * 32u + 16u + slot) * half_kv + (u64)kvh * half_hd + lid;
+            const float* vbase = v + (u64)kvh * head_dim;
+            u32 pk = (u32)f32_to_f16(kbase[2u * lid]) | ((u32)f32_to_f16(kbase[2u * lid + 1u]) << 16);
+            u32 pv = (u32)f32_to_f16(vbase[2u * lid]) | ((u32)f32_to_f16(vbase[2u * lid + 1u]) << 16);
+            kv_layer[k_off] = pk;
+            kv_layer[v_off] = pv;
+        }
     }
 }
 
@@ -547,6 +752,52 @@ void attention_merge_f16(
             }
         }
         orow[d] = acc * inv_l;
+    }
+}
+
+// Fused Split-K attention merge + Q8 quantize (head_dim % 32 == 0, 1 WG of 64 threads = 2 warps per head).
+extern "C" __global__ __launch_bounds__(64)
+void attention_merge_q8_f16(
+    const float* __restrict__ part_out,
+    const float* __restrict__ part_ml,
+    float* __restrict__ out,
+    u32* __restrict__ xq,
+    f32x4* __restrict__ xsc,
+    u32 head_dim,
+    u32 n_splits
+) {
+    u32 h = blockIdx.x;
+    u32 lid = threadIdx.x;
+    u32 warp = lid >> 5;
+    u32 lane = lid & 31u;
+
+    float mg = -1e30f;
+    for (u32 sp = 0; sp < n_splits; sp++) {
+        mg = fmaxf(mg, part_ml[(h * n_splits + sp) * 2u]);
+    }
+    float ltot = 0.0f;
+    float sc[8];
+    for (u32 sp = 0; sp < n_splits; sp++) {
+        float l = part_ml[(h * n_splits + sp) * 2u + 1u];
+        float m = part_ml[(h * n_splits + sp) * 2u];
+        float w = (l > 0.0f) ? __expf(m - mg) : 0.0f;
+        sc[sp] = w;
+        ltot += l * w;
+    }
+    float inv_l = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    float* orow = out + (u64)h * head_dim;
+    u32 blocks_per_head = head_dim >> 5;
+    for (u32 b = warp; b < blocks_per_head; b += 2u) {
+        u32 d = b * 32u + lane;
+        float acc = 0.0f;
+        for (u32 sp = 0; sp < n_splits; sp++) {
+            if (sc[sp] > 0.0f) {
+                acc = __fmaf_rn(part_out[(u64)(h * n_splits + sp) * head_dim + d], sc[sp], acc);
+            }
+        }
+        float v = acc * inv_l;
+        orow[d] = v;
+        warp_quant_q8_block(v, lane, h * blocks_per_head + b, xq, xsc);
     }
 }
 
@@ -904,15 +1155,20 @@ pub struct HipDenseOps {
     add_f32: HipFunction,
     add_bias_f32: HipFunction,
     add_rms_norm_f32: HipFunction,
+    rms_norm_q8_f32: HipFunction,
+    add_rms_norm_q8_f32: HipFunction,
     rms_norm_heads_f32: HipFunction,
     swiglu_f32: HipFunction,
+    swiglu_q8_f32: HipFunction,
     rope_f32: HipFunction,
     rope_f32_meta: HipFunction,
+    rope_qk_kv_write_meta: HipFunction,
     kv_write_f16: HipFunction,
     kv_write_f16_meta: HipFunction,
     attention_f16: HipFunction,
     attention_split_f16_meta: HipFunction,
     attention_merge_f16: HipFunction,
+    attention_merge_q8_f16: HipFunction,
     attention_prefill_f16: HipFunction,
     argmax_p1: HipFunction,
     argmax_p2: HipFunction,
@@ -928,15 +1184,20 @@ impl HipDenseOps {
             add_f32: module.function("add_f32")?,
             add_bias_f32: module.function("add_bias_f32")?,
             add_rms_norm_f32: module.function("add_rms_norm_f32")?,
+            rms_norm_q8_f32: module.function("rms_norm_q8_f32")?,
+            add_rms_norm_q8_f32: module.function("add_rms_norm_q8_f32")?,
             rms_norm_heads_f32: module.function("rms_norm_heads_f32")?,
             swiglu_f32: module.function("swiglu_f32")?,
+            swiglu_q8_f32: module.function("swiglu_q8_f32")?,
             rope_f32: module.function("rope_f32")?,
             rope_f32_meta: module.function("rope_f32_meta")?,
+            rope_qk_kv_write_meta: module.function("rope_qk_kv_write_meta")?,
             kv_write_f16: module.function("kv_write_f16")?,
             kv_write_f16_meta: module.function("kv_write_f16_meta")?,
             attention_f16: module.function("attention_f16")?,
             attention_split_f16_meta: module.function("attention_split_f16_meta")?,
             attention_merge_f16: module.function("attention_merge_f16")?,
+            attention_merge_q8_f16: module.function("attention_merge_q8_f16")?,
             attention_prefill_f16: module.function("attention_prefill_f16")?,
             argmax_p1: module.function("argmax_p1")?,
             argmax_p2: module.function("argmax_p2")?,
@@ -1367,6 +1628,213 @@ impl HipDenseOps {
             &mut ns2 as *mut _ as *mut c_void,
         ];
         unsafe { self.attention_merge_f16.launch(stream, (n_heads, 1, 1), (64, 1, 1), 0, &mut p2) }
+    }
+
+    pub fn rms_norm_q8(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        w: &HipBuffer,
+        y: &HipBuffer,
+        xq: &HipBuffer,
+        xsc: &HipBuffer,
+        n: u32,
+        eps: f32,
+    ) -> Result<(), HipError> {
+        let mut xp = x.as_device_ptr();
+        let mut wp = w.as_device_ptr();
+        let mut yp = y.as_device_ptr();
+        let mut qp = xq.as_device_ptr();
+        let mut sp = xsc.as_device_ptr();
+        let mut n = n;
+        let mut eps = eps;
+        let mut params: [*mut c_void; 7] = [
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+        ];
+        unsafe { self.rms_norm_q8_f32.launch(stream, (1, 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn add_rms_norm_q8(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        r: &HipBuffer,
+        w: &HipBuffer,
+        y: &HipBuffer,
+        xq: &HipBuffer,
+        xsc: &HipBuffer,
+        n: u32,
+        eps: f32,
+    ) -> Result<(), HipError> {
+        let mut xp = x.as_device_ptr();
+        let mut rp = r.as_device_ptr();
+        let mut wp = w.as_device_ptr();
+        let mut yp = y.as_device_ptr();
+        let mut qp = xq.as_device_ptr();
+        let mut sp = xsc.as_device_ptr();
+        let mut n = n;
+        let mut eps = eps;
+        let mut params: [*mut c_void; 8] = [
+            &mut xp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+        ];
+        unsafe { self.add_rms_norm_q8_f32.launch(stream, (1, 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn swiglu_q8(
+        &self,
+        stream: &HipStream,
+        gate: &HipBuffer,
+        up: &HipBuffer,
+        out: &HipBuffer,
+        xq: &HipBuffer,
+        xsc: &HipBuffer,
+        n: u32,
+    ) -> Result<(), HipError> {
+        let mut gp = gate.as_device_ptr();
+        let mut up_p = up.as_device_ptr();
+        let mut op = out.as_device_ptr();
+        let mut qp = xq.as_device_ptr();
+        let mut sp = xsc.as_device_ptr();
+        let mut n = n;
+        let mut params: [*mut c_void; 6] = [
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        let n_blocks = n / 32;
+        unsafe { self.swiglu_q8_f32.launch(stream, (n_blocks.div_ceil(8), 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn rope_qk_kv_write_meta(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        k: &HipBuffer,
+        v: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        step_meta: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        rope_base: f32,
+        mode: u32,
+    ) -> Result<(), HipError> {
+        let mut qp = q.as_device_ptr();
+        let mut kp = k.as_device_ptr();
+        let mut vp = v.as_device_ptr();
+        let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
+        let mut ptp = page_table.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut nh = n_heads;
+        let mut nkv = n_kv_heads;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut rb = rope_base;
+        let mut md = mode;
+        let mut params: [*mut c_void; 12] = [
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut kvp as *mut _ as *mut c_void,
+            &mut ptp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+            &mut md as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.rope_qk_kv_write_meta
+                .launch(stream, (n_heads + n_kv_heads, 1, 1), (128, 1, 1), 0, &mut params)
+        }
+    }
+
+    pub fn attention_decode_split_q8_meta(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        step_meta: &HipBuffer,
+        part_out: &HipBuffer,
+        part_ml: &HipBuffer,
+        out: &HipBuffer,
+        xq: &HipBuffer,
+        xsc: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        sliding_window: u32,
+        n_splits: u32,
+    ) -> Result<(), HipError> {
+        let mut qp = q.as_device_ptr();
+        let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
+        let mut ptp = page_table.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut pop = part_out.as_device_ptr();
+        let mut pmlp = part_ml.as_device_ptr();
+        let mut nh = n_heads;
+        let mut nkv = n_kv_heads;
+        let mut hd = head_dim;
+        let mut sw = sliding_window;
+        let mut ns = n_splits;
+        let mut p1: [*mut c_void; 11] = [
+            &mut qp as *mut _ as *mut c_void,
+            &mut kvp as *mut _ as *mut c_void,
+            &mut ptp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut pop as *mut _ as *mut c_void,
+            &mut pmlp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.attention_split_f16_meta
+                .launch(stream, (n_heads, n_splits, 1), (32, 1, 1), 0, &mut p1)
+        }?;
+
+        let mut pop2 = part_out.as_device_ptr();
+        let mut pmlp2 = part_ml.as_device_ptr();
+        let mut op = out.as_device_ptr();
+        let mut xqp = xq.as_device_ptr();
+        let mut xscp = xsc.as_device_ptr();
+        let mut hd2 = head_dim;
+        let mut ns2 = n_splits;
+        let mut p2: [*mut c_void; 7] = [
+            &mut pop2 as *mut _ as *mut c_void,
+            &mut pmlp2 as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut xqp as *mut _ as *mut c_void,
+            &mut xscp as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void,
+            &mut ns2 as *mut _ as *mut c_void,
+        ];
+        unsafe { self.attention_merge_q8_f16.launch(stream, (n_heads, 1, 1), (64, 1, 1), 0, &mut p2) }
     }
 
     pub fn attention_prefill(
