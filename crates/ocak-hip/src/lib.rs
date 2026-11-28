@@ -222,6 +222,23 @@ mod tests {
                 let err = (y_dec[i] - y_mm[i]).abs();
                 assert!(err < 1e-4 * scale, "qmv vs qmm {ty:?}[{i}]: {} vs {}", y_dec[i], y_mm[i]);
             }
+
+            // 3) Opt-in GROUP256 Q4_K (rescale once per 256)
+            if is_q4k {
+                kernels.quant_q8_g256(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+                kernels.qmm_q4_k_g256(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+                stream.synchronize().unwrap();
+                let mut y_g256 = vec![0f32; batch * m];
+                by.download(bytemuck::cast_slice_mut(&mut y_g256)).unwrap();
+                let mut sum_err_g256 = 0f64;
+                for i in 0..y_g256.len() {
+                    let err = (y_cpu[i] - y_g256[i]).abs();
+                    sum_err_g256 += err as f64;
+                    assert!(err <= 3e-2 * scale, "qmm_g256 Q4K[{i}]: cpu={} gpu={} err={err} scale={scale}", y_cpu[i], y_g256[i]);
+                }
+                let mean_g256 = sum_err_g256 / y_g256.len() as f64;
+                assert!(mean_g256 <= 4e-3 * scale as f64, "qmm_g256 Q4K: mean err {mean_g256} (scale {scale})");
+            }
         }
     }
 
@@ -277,18 +294,30 @@ mod tests {
         let ev0 = ctx.create_event(true).unwrap();
         let ev1 = ctx.create_event(true).unwrap();
 
-        for (label, ty, is_q4k) in [("Q8_0", GgmlType::Q8_0, false), ("Q4K", GgmlType::Q4K, true)] {
+        for (label, ty, mode) in [
+            ("Q8_0", GgmlType::Q8_0, 0u8),
+            ("Q4K", GgmlType::Q4K, 1u8),
+            ("Q4K_g256", GgmlType::Q4K, 2u8),
+        ] {
             let (be, bb) = ty.block().unwrap();
             let rb = (k / be) * bb;
             let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
             let bw = ctx.buffer_from_slice(&raw).unwrap();
             let iters = 20;
             let run_once = || {
-                kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
-                if is_q4k {
-                    kernels.qmm_q4_k(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
-                } else {
-                    kernels.qmm_q8_0(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+                match mode {
+                    0 => {
+                        kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+                        kernels.qmm_q8_0(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+                    }
+                    1 => {
+                        kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+                        kernels.qmm_q4_k(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+                    }
+                    _ => {
+                        kernels.quant_q8_g256(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
+                        kernels.qmm_q4_k_g256(&stream, &bw, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+                    }
                 }
             };
             for _ in 0..2 { run_once(); }
