@@ -532,14 +532,13 @@ impl HipExec {
                             &self.attn_part_out, &self.attn_part_ml, &self.attn,
                             nh, *n_head_kv, hd, *sliding_window, DECODE_ATTN_SPLITS,
                         )?;
-                        if *gated_q {
+                        if *gated_q && head_gate_w.is_none() {
+                            self.hops.mul_sigmoid_q8(s, &self.attn, &self.q_gate, &self.xq, &self.xsc, nh * hd)?;
+                        } else if !*gated_q && head_gate_w.is_some() {
+                            self.hops.mul_head_sigmoid_q8(s, &self.attn, &self.head_gate_buf, &self.xq, &self.xsc, nh, hd)?;
+                        } else {
                             self.hops.mul_sigmoid(s, &self.attn, &self.q_gate, nh * hd)?;
-                        }
-                        if head_gate_w.is_some() {
-                            self.hops.mul_head_sigmoid(s, &self.attn, &self.head_gate_buf, nh, hd, 1)?;
-                        }
-                        if wo.ty.uses_q8_act() {
-                            self.kernels.quant_q8(s, &self.attn, &self.xq, &self.xsc, wo.k / 32)?;
+                            self.hops.mul_head_sigmoid_q8(s, &self.attn, &self.head_gate_buf, &self.xq, &self.xsc, nh, hd)?;
                         }
                     } else {
                         self.ops.attention_decode_split_q8_meta(
@@ -552,11 +551,7 @@ impl HipExec {
                 }
                 HipMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
                     self.kernels.qmv(in_proj.ty, s, &in_proj.buf, &self.xn, &self.xq, &self.xsc, &self.bcx, in_proj.k, in_proj.m, 1)?;
-                    // Reuse `self.gate` (size >= n_embd) as ShortConv output before out_proj.
-                    self.hops.shortconv_step(s, &self.bcx, conv_w, state, &self.gate, ne, *l_cache, 1)?;
-                    if out_proj.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.gate, &self.xq, &self.xsc, ne / 32)?;
-                    }
+                    self.hops.shortconv_step_q8(s, &self.bcx, conv_w, state, &self.gate, &self.xq, &self.xsc, ne, *l_cache)?;
                     self.kernels.qmv(out_proj.ty, s, &out_proj.buf, &self.gate, &self.xq, &self.xsc, &self.o, out_proj.k, out_proj.m, 1)?;
                 }
                 HipMixer::DeltaNet {
@@ -583,18 +578,16 @@ impl HipExec {
                         *n_k_heads, *n_v_heads, *state_dim, eps, 1,
                     )?;
                     s.wait_event(&self.ev_join_b)?;
-                    self.hops.gated_rms_norm(s, &self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, eps, 1)?;
-                    if wout.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.dn_norm, &self.xq, &self.xsc, wout.k / 32)?;
-                    }
+                    self.hops.gated_rms_norm_q8(s, &self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, &self.xq, &self.xsc, *n_v_heads, *state_dim, eps)?;
                     self.kernels.qmv(wout.ty, s, &wout.buf, &self.dn_norm, &self.xq, &self.xsc, &self.o, wout.k, wout.m, 1)?;
                 }
             }
 
             if let Some(pan) = &l.post_attn_norm {
-                self.kernels.rms_norm(s, &self.o, pan, &self.o, ne, 1, eps)?;
+                self.hops.post_rms_add_rms_norm_q8(s, &self.x, &self.o, pan, &l.ffn_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
+            } else {
+                self.ops.add_rms_norm_q8(s, &self.x, &self.o, &l.ffn_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
             }
-            self.ops.add_rms_norm_q8(s, &self.x, &self.o, &l.ffn_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
 
             self.ev_fork.record(s)?;
             sb.wait_event(&self.ev_fork)?;
@@ -606,15 +599,16 @@ impl HipExec {
             self.ops.swiglu_q8(s, &self.gate, &self.up, &self.act, &self.xq, &self.xsc, self.cfg.n_ff as u32)?;
             self.kernels.qmv(l.down.ty, s, &l.down.buf, &self.act, &self.xq, &self.xsc, &self.o, l.down.k, l.down.m, 1)?;
 
-            if let Some(pfn) = &l.post_ffw_norm {
-                self.kernels.rms_norm(s, &self.o, pfn, &self.o, ne, 1, eps)?;
-            }
             let next_norm = if li + 1 < self.layers.len() {
                 &self.layers[li + 1].attn_norm
             } else {
                 &self.out_norm
             };
-            self.ops.add_rms_norm_q8(s, &self.x, &self.o, next_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
+            if let Some(pfn) = &l.post_ffw_norm {
+                self.hops.post_rms_add_rms_norm_q8(s, &self.x, &self.o, pfn, next_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
+            } else {
+                self.ops.add_rms_norm_q8(s, &self.x, &self.o, next_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
+            }
         }
 
         let head = self.output.as_ref().unwrap_or(&self.embd);
