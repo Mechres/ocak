@@ -139,7 +139,11 @@ impl NativeEngine {
             BackendKind::CpuAvx2 => Box::new(CpuExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
         } };
         let backend_name = exec.name();
-        let mut mtp = crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten();
+        let mut mtp = if opts.backend == BackendKind::Vulkan {
+            crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten()
+        } else {
+            None
+        };
         // Experimental: borrow the NextN MTP head from another GGUF of the same base model when
         // this file has none (e.g. a quant whose converter dropped blk.{n_layer}).
         if mtp.is_none() && opts.backend == BackendKind::Vulkan {

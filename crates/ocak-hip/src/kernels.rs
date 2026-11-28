@@ -15,6 +15,8 @@ pub enum HipWType {
     Q4K,
     Q5K,
     Q6K,
+    Q2K,
+    Q3K,
 }
 
 impl HipWType {
@@ -27,6 +29,8 @@ impl HipWType {
             Self::Q4K => 4,
             Self::Q5K => 5,
             Self::Q6K => 6,
+            Self::Q2K => 7,
+            Self::Q3K => 8,
         }
     }
 
@@ -39,6 +43,8 @@ impl HipWType {
             Self::Q4K => (k / 256) * 144,
             Self::Q5K => (k / 256) * 176,
             Self::Q6K => (k / 256) * 210,
+            Self::Q2K => (k / 256) * 84,
+            Self::Q3K => (k / 256) * 110,
         }
     }
 
@@ -342,6 +348,60 @@ __device__ __forceinline__ void dqi32_q6_k(
     }
 }
 
+__device__ __forceinline__ void dqi32_q2_k(
+    const u32* __restrict__ w32, u32 rb, u32 blk, u32 q[8], float& d_out, float& m0_out, float& m1_out
+) {
+    u32 b = rb + (blk >> 3) * 84u;
+    u32 ib = blk & 7u;
+    u32 half_ = ib >> 2;
+    u32 g = ib & 3u;
+    u32 s_off = b + half_ * 8u + 2u * g;
+    u32 s01 = (w32[s_off >> 2] >> ((s_off & 2u) << 3)) & 0xFFFFu;
+    u32 s0 = s01 & 0xFFu, s1 = s01 >> 8;
+    u32 qo = (b + 16u + half_ * 32u) >> 2;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        q[i] = ((w32[qo + i] >> (2u * g)) & 0x03030303u) * ((i < 4) ? (s0 & 0xFu) : (s1 & 0xFu));
+    }
+    u32 dd = w32[(b + 80u) >> 2];
+    d_out = f16_bits_to_f32((u16)(dd & 0xFFFFu));
+    float dmin = f16_bits_to_f32((u16)(dd >> 16));
+    m0_out = dmin * (float)(s0 >> 4);
+    m1_out = dmin * (float)(s1 >> 4);
+}
+
+__device__ __forceinline__ void dqi32_q3_k(
+    const u32* __restrict__ w32, u32 rb, u32 blk, u32 q[8], float& d0_out, float& d1_out
+) {
+    u32 b = rb + (blk >> 3) * 110u;
+    u32 ib = blk & 7u;
+    u32 half_ = ib >> 2;
+    u32 g = ib & 3u;
+    u32 qo = b + 32u + half_ * 32u;
+    u32 hs = half_ * 4u + g;
+    u32 sh = (b & 3u) << 3;
+    u32 qa = qo >> 2, ha = b >> 2;
+    u32 prev = ((w32[qa] >> (2u * g)) & 0x03030303u) | (((w32[ha] >> hs) & 0x01010101u) << 2);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        u32 next = ((w32[qa + i + 1] >> (2u * g)) & 0x03030303u) | (((w32[ha + i + 1] >> hs) & 0x01010101u) << 2);
+        u32 aligned = (sh == 0u) ? prev : ((prev >> sh) | (next << (32u - sh)));
+        q[i] = sub_bytes(aligned, 0x04040404u);
+        prev = next;
+    }
+    float d = f16at(w32, b + 108u);
+    u32 s01 = bytes4(w32, b + 96u + 4u * (g >> 1));
+    u32 s2w = bytes4(w32, b + 104u);
+    u32 is0 = half_ * 8u + 2u * g;
+    u32 lo0 = (s01 >> (8u * (is0 & 3u) + 4u * half_)) & 0xFu;
+    u32 hi0 = (s2w >> (8u * (is0 & 3u) + 2u * (is0 >> 2))) & 3u;
+    d0_out = d * (float)((i32)(lo0 | (hi0 << 4)) - 32);
+    u32 is1 = is0 + 1u;
+    u32 lo1 = (s01 >> (8u * (is1 & 3u) + 4u * half_)) & 0xFu;
+    u32 hi1 = (s2w >> (8u * (is1 & 3u) + 2u * (is1 >> 2))) & 3u;
+    d1_out = d * (float)((i32)(lo1 | (hi1 << 4)) - 32);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Decode matvec (batch = 1..8): 32 lanes/row, 4 rows/workgroup
 // ---------------------------------------------------------------------------
@@ -623,6 +683,132 @@ void qmv_q6_k(
     }
 }
 
+extern "C" __global__ __launch_bounds__(128)
+void qmv_q2_k(
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes, u32 batch
+) {
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.x * 4u + threadIdx.y;
+    float acc[MAXB];
+    #pragma unroll
+    for (u32 t = 0; t < MAXB; t++) acc[t] = 0.0f;
+    if (row < m) {
+        u32 rb = row * row_bytes;
+        u32 kblocks = k >> 5;
+        for (u32 blk = tid; blk < kblocks; blk += 32u) {
+            u32 q[8]; float d, m0, m1;
+            dqi32_q2_k(w32, rb, blk, q, d, m0, m1);
+            for (u32 t = 0; t < batch; t++) {
+                u32 xb = t * kblocks + blk;
+                u32x4 xa = xq4[xb * 2u], xc = xq4[xb * 2u + 1u];
+                i32 s = sdot4_zero(q[0], xa.x);
+                s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s);
+                s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s);
+                f32x4 xs = xsc[xb];
+                acc[t] = __fmaf_rn(d * xs.x, (float)s, acc[t]);
+                acc[t] = __fmaf_rn(-m0, xs.y, __fmaf_rn(-m1, xs.z, acc[t]));
+            }
+        }
+    }
+    for (u32 t = 0; t < batch; t++) {
+        float v = acc[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+        if (tid == 0u && row < m) y[(u64)t * m + row] = v;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void qmv1_q2_k(
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes
+) {
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.x * 4u + threadIdx.y;
+    float acc = 0.0f;
+    if (row < m) {
+        u32 rb = row * row_bytes;
+        u32 kblocks = k >> 5;
+        for (u32 blk = tid; blk < kblocks; blk += 32u) {
+            u32 q[8]; float d, m0, m1;
+            dqi32_q2_k(w32, rb, blk, q, d, m0, m1);
+            u32x4 xa = xq4[blk * 2u], xc = xq4[blk * 2u + 1u];
+            i32 s = sdot4_zero(q[0], xa.x);
+            s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s);
+            s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s);
+            f32x4 xs = xsc[blk];
+            acc = __fmaf_rn(d * xs.x, (float)s, acc);
+            acc = __fmaf_rn(-m0, xs.y, __fmaf_rn(-m1, xs.z, acc));
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (tid == 0u && row < m) y[row] = acc;
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void qmv_q3_k(
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes, u32 batch
+) {
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.x * 4u + threadIdx.y;
+    float acc[MAXB];
+    #pragma unroll
+    for (u32 t = 0; t < MAXB; t++) acc[t] = 0.0f;
+    if (row < m) {
+        u32 rb = row * row_bytes;
+        u32 kblocks = k >> 5;
+        for (u32 blk = tid; blk < kblocks; blk += 32u) {
+            u32 q[8]; float d0, d1;
+            dqi32_q3_k(w32, rb, blk, q, d0, d1);
+            for (u32 t = 0; t < batch; t++) {
+                u32 xb = t * kblocks + blk;
+                u32x4 xa = xq4[xb * 2u], xc = xq4[xb * 2u + 1u];
+                i32 i0 = sdot4_zero(q[0], xa.x);
+                i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0);
+                i32 i1 = sdot4_zero(q[4], xc.x);
+                i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1);
+                acc[t] = __fmaf_rn(xsc[xb].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc[t]);
+            }
+        }
+    }
+    for (u32 t = 0; t < batch; t++) {
+        float v = acc[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+        if (tid == 0u && row < m) y[(u64)t * m + row] = v;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128)
+void qmv1_q3_k(
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes
+) {
+    u32 tid = threadIdx.x;
+    u32 row = blockIdx.x * 4u + threadIdx.y;
+    float acc = 0.0f;
+    if (row < m) {
+        u32 rb = row * row_bytes;
+        u32 kblocks = k >> 5;
+        for (u32 blk = tid; blk < kblocks; blk += 32u) {
+            u32 q[8]; float d0, d1;
+            dqi32_q3_k(w32, rb, blk, q, d0, d1);
+            u32x4 xa = xq4[blk * 2u], xc = xq4[blk * 2u + 1u];
+            i32 i0 = sdot4_zero(q[0], xa.x);
+            i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0);
+            i32 i1 = sdot4_zero(q[4], xc.x);
+            i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1);
+            acc = __fmaf_rn(xsc[blk].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (tid == 0u && row < m) y[row] = acc;
+}
+
 // ---------------------------------------------------------------------------
 // 5. Prefill tiled int8-dot matmul: BM=64, BN=128, BK=32, TM=4, TN=8, 256 threads
 // ---------------------------------------------------------------------------
@@ -737,6 +923,48 @@ __device__ __forceinline__ void dqi8_q6_k(
     u32 u1 = ((lo1 >> sl) & 0x0F0F0F0Fu) | (((hi1 >> sh) & 0x03030303u) << 4);
     q0 = sub_bytes(u0, 0x20202020u);
     q1 = sub_bytes(u1, 0x20202020u);
+}
+
+__device__ __forceinline__ void dqi8_q2_k(
+    const u32* __restrict__ w32, u32 rb, u32 k0, u32& q0, u32& q1, float& d, float& mn
+) {
+    u32 b = rb + (k0 >> 8) * 84u;
+    u32 n = k0 & 255u;
+    u32 half_ = n >> 7;
+    u32 g = (n >> 5) & 3u;
+    u32 l = n & 31u;
+    u32 sc_off = b + half_ * 8u + 2u * g + (l >> 4);
+    u32 sc = (w32[sc_off >> 2] >> ((sc_off & 3u) << 3)) & 0xFFu;
+    u32 dd = w32[(b + 80u) >> 2];
+    d = f16_bits_to_f32((u16)(dd & 0xFFFFu));
+    mn = f16_bits_to_f32((u16)(dd >> 16)) * (float)(sc >> 4);
+    u32 qo = (b + 16u + half_ * 32u + l) >> 2;
+    q0 = ((w32[qo] >> (2u * g)) & 0x03030303u) * (sc & 0xFu);
+    q1 = ((w32[qo + 1u] >> (2u * g)) & 0x03030303u) * (sc & 0xFu);
+}
+
+__device__ __forceinline__ void dqi8_q3_k(
+    const u32* __restrict__ w32, u32 rb, u32 k0, u32& q0, u32& q1, float& d
+) {
+    u32 b = rb + (k0 >> 8) * 110u;
+    u32 n = k0 & 255u;
+    u32 half_ = n >> 7;
+    u32 g = (n >> 5) & 3u;
+    u32 l = n & 31u;
+    u32 is = half_ * 8u + 2u * g + (l >> 4);
+    u32 s01 = bytes4(w32, b + 96u + 4u * (g >> 1));
+    u32 s2w = bytes4(w32, b + 104u);
+    u32 lo4 = (s01 >> (8u * (is & 3u) + 4u * half_)) & 0xFu;
+    u32 hi2 = (s2w >> (8u * (is & 3u) + 2u * (is >> 2))) & 3u;
+    d = f16at(w32, b + 108u) * (float)((i32)(lo4 | (hi2 << 4)) - 32);
+    u32 qo = b + 32u + half_ * 32u + l;
+    u32 hs = half_ * 4u + g;
+    u32 lo0 = (bytes4(w32, qo) >> (2u * g)) & 0x03030303u;
+    u32 lo1 = (bytes4(w32, qo + 4u) >> (2u * g)) & 0x03030303u;
+    u32 hm0 = (bytes4(w32, b + l) >> hs) & 0x01010101u;
+    u32 hm1 = (bytes4(w32, b + l + 4u) >> hs) & 0x01010101u;
+    q0 = sub_bytes(lo0 | (hm0 << 2), 0x04040404u);
+    q1 = sub_bytes(lo1 | (hm1 << 2), 0x04040404u);
 }
 
 #define DEFINE_QMM_NOMIN(NAME, UNPACK) \
@@ -1013,6 +1241,189 @@ void sum_splits_f32(
     out[i] = s;
 }
 
+// Q2_K: one weight scale per 32 (sub-scales folded into int8 weights), two mins per 32 (per 16).
+extern "C" __global__ __launch_bounds__(256, 2)
+void qmm_q2_k(
+    const u32* __restrict__ w32, const u32* __restrict__ xq, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes, u32 batch, u32 kbchunk, u32 split_stride
+) {
+    __shared__ u32x4 ws[8u * (BM / 4u)];
+    __shared__ u32x4 xs[8u * (BN / 4u)];
+    __shared__ float wsd[BM];
+    __shared__ float wsm[2u * BM];
+    __shared__ float xsd[BN];
+    __shared__ float xsm[2u * BN];
+    u32 lid = threadIdx.x; u32 row0 = blockIdx.x * BM; u32 tok0 = blockIdx.y * BN;
+    u32 ld_row = lid >> 2; u32 ld_part = lid & 3u;
+    u32 rb = min(row0 + ld_row, m - 1u) * row_bytes;
+    u32 x_col = lid >> 1; u32 x_part = lid & 1u;
+    u32 col = min(tok0 + x_col, batch - 1u);
+    u32 kblocks = k >> 5; u32 xblk0 = col * kblocks;
+    u32 kb_beg = blockIdx.z * kbchunk;
+    u32 kb_end = min(kblocks, kb_beg + kbchunk);
+    if (kb_beg >= kb_end) return;
+    float* ybase = y + (u64)blockIdx.z * split_stride;
+    u32 tx = lid & 15u; u32 ty = lid >> 4;
+    float acc[TN][TM];
+    #pragma unroll
+    for (u32 j = 0; j < TN; j++) for (u32 i = 0; i < TM; i++) acc[j][i] = 0.0f;
+    u32 pq0, pq1; float pd, pm; u32 pxv[4]; f32x4 pxs;
+    dqi8_q2_k(w32, rb, (kb_beg << 5) + ld_part * 8u, pq0, pq1, pd, pm);
+    #pragma unroll
+    for (u32 c = 0; c < 4u; c++) pxv[c] = xq[(xblk0 + kb_beg) * 8u + x_part * 4u + c];
+    pxs = xsc[xblk0 + kb_beg];
+    for (u32 kb = kb_beg; kb < kb_end; kb++) {
+        u32 kw = ld_part * 2u;
+        ((u32*)&ws[kw * (BM / 4u) + (ld_row >> 2)])[ld_row & 3u] = pq0;
+        ((u32*)&ws[(kw + 1u) * (BM / 4u) + (ld_row >> 2)])[ld_row & 3u] = pq1;
+        if (ld_part == 0u) wsd[ld_row] = pd;
+        if ((ld_part & 1u) == 0u) wsm[(ld_part >> 1) * BM + ld_row] = pm;
+        #pragma unroll
+        for (u32 c = 0; c < 4u; c++)
+            ((u32*)&xs[(x_part * 4u + c) * (BN / 4u) + (x_col >> 2)])[x_col & 3u] = pxv[c];
+        if (x_part == 0u) { xsd[x_col] = pxs.x; xsm[x_col] = -pxs.y; xsm[BN + x_col] = -pxs.z; }
+        lds_barrier();
+        if (kb + 1u < kb_end) {
+            dqi8_q2_k(w32, rb, ((kb + 1u) << 5) + ld_part * 8u, pq0, pq1, pd, pm);
+            #pragma unroll
+            for (u32 c = 0; c < 4u; c++) pxv[c] = xq[(xblk0 + kb + 1u) * 8u + x_part * 4u + c];
+            pxs = xsc[xblk0 + kb + 1u];
+        }
+        i32 ia[TN][TM];
+        const u32x4* wp = &ws[tx]; const u32x4* xp = &xs[ty * 2u];
+        #pragma unroll
+        for (u32 kk = 0; kk < 8u; kk++) {
+            u32x4 wv = wp[kk * (BM / 4u)];
+            u32x4 xv0 = xp[kk * (BN / 4u)], xv1 = xp[kk * (BN / 4u) + 1u];
+            u32 xv[8] = { xv0.x, xv0.y, xv0.z, xv0.w, xv1.x, xv1.y, xv1.z, xv1.w };
+            #pragma unroll
+            for (u32 j = 0; j < TN; j++) {
+                if (kk == 0u) {
+                    ia[j][0] = sdot4_zero(wv.x, xv[j]); ia[j][1] = sdot4_zero(wv.y, xv[j]);
+                    ia[j][2] = sdot4_zero(wv.z, xv[j]); ia[j][3] = sdot4_zero(wv.w, xv[j]);
+                } else {
+                    ia[j][0] = sdot4(wv.x, xv[j], ia[j][0]); ia[j][1] = sdot4(wv.y, xv[j], ia[j][1]);
+                    ia[j][2] = sdot4(wv.z, xv[j], ia[j][2]); ia[j][3] = sdot4(wv.w, xv[j], ia[j][3]);
+                }
+            }
+        }
+        float wd[4], wm0[4], wm1[4];
+        #pragma unroll
+        for (u32 i = 0; i < 4u; i++) {
+            wd[i] = wsd[tx * 4u + i];
+            wm0[i] = wsm[tx * 4u + i];
+            wm1[i] = wsm[BM + tx * 4u + i];
+        }
+        #pragma unroll
+        for (u32 j = 0; j < TN; j++) {
+            float dx = xsd[ty * TN + j];
+            float sx0 = xsm[ty * TN + j], sx1 = xsm[BN + ty * TN + j];
+            #pragma unroll
+            for (u32 i = 0; i < 4u; i++) {
+                acc[j][i] = __fmaf_rn(wd[i] * dx, (float)ia[j][i], acc[j][i]);
+                acc[j][i] = __fmaf_rn(wm0[i], sx0, __fmaf_rn(wm1[i], sx1, acc[j][i]));
+            }
+        }
+        lds_barrier();
+    }
+    #pragma unroll
+    for (u32 j = 0; j < TN; j++) {
+        u32 c = tok0 + ty * TN + j;
+        if (c < batch) for (u32 i = 0; i < TM; i++) {
+            u32 r = row0 + tx * 4u + i;
+            if (r < m) ybase[(u64)c * m + r] = acc[j][i];
+        }
+    }
+}
+
+// Q3_K: per-16 scale (two halves per 32-block, no min).
+extern "C" __global__ __launch_bounds__(256, 2)
+void qmm_q3_k(
+    const u32* __restrict__ w32, const u32* __restrict__ xq, const f32x4* __restrict__ xsc,
+    float* __restrict__ y, u32 k, u32 m, u32 row_bytes, u32 batch, u32 kbchunk, u32 split_stride
+) {
+    __shared__ u32x4 ws[8u * (BM / 4u)];
+    __shared__ u32x4 xs[8u * (BN / 4u)];
+    __shared__ float wsd[2u * BM];
+    __shared__ float xsd[BN];
+    u32 lid = threadIdx.x; u32 row0 = blockIdx.x * BM; u32 tok0 = blockIdx.y * BN;
+    u32 ld_row = lid >> 2; u32 ld_part = lid & 3u;
+    u32 rb = min(row0 + ld_row, m - 1u) * row_bytes;
+    u32 x_col = lid >> 1; u32 x_part = lid & 1u;
+    u32 col = min(tok0 + x_col, batch - 1u);
+    u32 kblocks = k >> 5; u32 xblk0 = col * kblocks;
+    u32 kb_beg = blockIdx.z * kbchunk;
+    u32 kb_end = min(kblocks, kb_beg + kbchunk);
+    if (kb_beg >= kb_end) return;
+    float* ybase = y + (u64)blockIdx.z * split_stride;
+    u32 tx = lid & 15u; u32 ty = lid >> 4;
+    float acc[TN][TM];
+    #pragma unroll
+    for (u32 j = 0; j < TN; j++) for (u32 i = 0; i < TM; i++) acc[j][i] = 0.0f;
+    u32 pq0, pq1; float pd; u32 pxv[4]; float pxs;
+    dqi8_q3_k(w32, rb, (kb_beg << 5) + ld_part * 8u, pq0, pq1, pd);
+    #pragma unroll
+    for (u32 c = 0; c < 4u; c++) pxv[c] = xq[(xblk0 + kb_beg) * 8u + x_part * 4u + c];
+    pxs = xsc[xblk0 + kb_beg].x;
+    for (u32 kb = kb_beg; kb < kb_end; kb++) {
+        u32 kw = ld_part * 2u;
+        ((u32*)&ws[kw * (BM / 4u) + (ld_row >> 2)])[ld_row & 3u] = pq0;
+        ((u32*)&ws[(kw + 1u) * (BM / 4u) + (ld_row >> 2)])[ld_row & 3u] = pq1;
+        if ((ld_part & 1u) == 0u) wsd[(ld_part >> 1) * BM + ld_row] = pd;
+        #pragma unroll
+        for (u32 c = 0; c < 4u; c++)
+            ((u32*)&xs[(x_part * 4u + c) * (BN / 4u) + (x_col >> 2)])[x_col & 3u] = pxv[c];
+        if (x_part == 0u) xsd[x_col] = pxs;
+        lds_barrier();
+        if (kb + 1u < kb_end) {
+            dqi8_q3_k(w32, rb, ((kb + 1u) << 5) + ld_part * 8u, pq0, pq1, pd);
+            #pragma unroll
+            for (u32 c = 0; c < 4u; c++) pxv[c] = xq[(xblk0 + kb + 1u) * 8u + x_part * 4u + c];
+            pxs = xsc[xblk0 + kb + 1u].x;
+        }
+        const u32x4* wp = &ws[tx]; const u32x4* xp = &xs[ty * 2u];
+        #pragma unroll
+        for (u32 half_ = 0; half_ < 2u; half_++) {
+            i32 ia[TN][TM];
+            #pragma unroll
+            for (u32 k2 = 0; k2 < 4u; k2++) {
+                u32 kk = half_ * 4u + k2;
+                u32x4 wv = wp[kk * (BM / 4u)];
+                u32x4 xv0 = xp[kk * (BN / 4u)], xv1 = xp[kk * (BN / 4u) + 1u];
+                u32 xv[8] = { xv0.x, xv0.y, xv0.z, xv0.w, xv1.x, xv1.y, xv1.z, xv1.w };
+                #pragma unroll
+                for (u32 j = 0; j < TN; j++) {
+                    if (k2 == 0u) {
+                        ia[j][0] = sdot4_zero(wv.x, xv[j]); ia[j][1] = sdot4_zero(wv.y, xv[j]);
+                        ia[j][2] = sdot4_zero(wv.z, xv[j]); ia[j][3] = sdot4_zero(wv.w, xv[j]);
+                    } else {
+                        ia[j][0] = sdot4(wv.x, xv[j], ia[j][0]); ia[j][1] = sdot4(wv.y, xv[j], ia[j][1]);
+                        ia[j][2] = sdot4(wv.z, xv[j], ia[j][2]); ia[j][3] = sdot4(wv.w, xv[j], ia[j][3]);
+                    }
+                }
+            }
+            float wd[4];
+            #pragma unroll
+            for (u32 i = 0; i < 4u; i++) wd[i] = wsd[half_ * BM + tx * 4u + i];
+            #pragma unroll
+            for (u32 j = 0; j < TN; j++) {
+                float dx = xsd[ty * TN + j];
+                #pragma unroll
+                for (u32 i = 0; i < 4u; i++) acc[j][i] = __fmaf_rn(wd[i] * dx, (float)ia[j][i], acc[j][i]);
+            }
+        }
+        lds_barrier();
+    }
+    #pragma unroll
+    for (u32 j = 0; j < TN; j++) {
+        u32 c = tok0 + ty * TN + j;
+        if (c < batch) for (u32 i = 0; i < TM; i++) {
+            u32 r = row0 + tx * 4u + i;
+            if (r < m) ybase[(u64)c * m + r] = acc[j][i];
+        }
+    }
+}
+
 // Opt-in GROUP256 Q4_K prefill (64x128, TM=4, TN=8): rescales acc once per 256 elements.
 extern "C" __global__ __launch_bounds__(256, 2)
 void qmm_q4_k_g256(
@@ -1206,11 +1617,15 @@ pub struct HipKernels {
     qmv_q4_k: HipFunction,
     qmv_q5_k: HipFunction,
     qmv_q6_k: HipFunction,
+    qmv_q2_k: HipFunction,
+    qmv_q3_k: HipFunction,
     qmv1_q4_0: HipFunction,
     qmv1_q8_0: HipFunction,
     qmv1_q4_k: HipFunction,
     qmv1_q5_k: HipFunction,
     qmv1_q6_k: HipFunction,
+    qmv1_q2_k: HipFunction,
+    qmv1_q3_k: HipFunction,
     qmm_f32: HipFunction,
     qmm_f16: HipFunction,
     qmm_q4_0: HipFunction,
@@ -1218,6 +1633,8 @@ pub struct HipKernels {
     qmm_q4_k: HipFunction,
     qmm_q5_k: HipFunction,
     qmm_q6_k: HipFunction,
+    qmm_q2_k: HipFunction,
+    qmm_q3_k: HipFunction,
     qmm_q4_k_g256: HipFunction,
     sum_splits_f32: HipFunction,
 }
@@ -1236,11 +1653,15 @@ impl HipKernels {
             qmv_q4_k: module.function("qmv_q4_k")?,
             qmv_q5_k: module.function("qmv_q5_k")?,
             qmv_q6_k: module.function("qmv_q6_k")?,
+            qmv_q2_k: module.function("qmv_q2_k")?,
+            qmv_q3_k: module.function("qmv_q3_k")?,
             qmv1_q4_0: module.function("qmv1_q4_0")?,
             qmv1_q8_0: module.function("qmv1_q8_0")?,
             qmv1_q4_k: module.function("qmv1_q4_k")?,
             qmv1_q5_k: module.function("qmv1_q5_k")?,
             qmv1_q6_k: module.function("qmv1_q6_k")?,
+            qmv1_q2_k: module.function("qmv1_q2_k")?,
+            qmv1_q3_k: module.function("qmv1_q3_k")?,
             qmm_f32: module.function("qmm_f32")?,
             qmm_f16: module.function("qmm_f16")?,
             qmm_q4_0: module.function("qmm_q4_0")?,
@@ -1248,6 +1669,8 @@ impl HipKernels {
             qmm_q4_k: module.function("qmm_q4_k")?,
             qmm_q5_k: module.function("qmm_q5_k")?,
             qmm_q6_k: module.function("qmm_q6_k")?,
+            qmm_q2_k: module.function("qmm_q2_k")?,
+            qmm_q3_k: module.function("qmm_q3_k")?,
             qmm_q4_k_g256: module.function("qmm_q4_k_g256")?,
             sum_splits_f32: module.function("sum_splits_f32")?,
             _module: module,
@@ -1346,6 +1769,8 @@ impl HipKernels {
                 HipWType::Q4K => self.launch_qmv1(&self.qmv1_q4_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
                 HipWType::Q5K => self.launch_qmv1(&self.qmv1_q5_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
                 HipWType::Q6K => self.launch_qmv1(&self.qmv1_q6_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q2K => self.launch_qmv1(&self.qmv1_q2_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                HipWType::Q3K => self.launch_qmv1(&self.qmv1_q3_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
             };
         }
         match ty {
@@ -1356,6 +1781,8 @@ impl HipKernels {
             HipWType::Q4K => self.launch_qmv(&self.qmv_q4_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
             HipWType::Q5K => self.launch_qmv(&self.qmv_q5_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
             HipWType::Q6K => self.launch_qmv(&self.qmv_q6_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
+            HipWType::Q2K => self.launch_qmv(&self.qmv_q2_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
+            HipWType::Q3K => self.launch_qmv(&self.qmv_q3_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
         }
     }
 
@@ -1402,6 +1829,8 @@ impl HipKernels {
             HipWType::Q4K => &self.qmm_q4_k,
             HipWType::Q5K => &self.qmm_q5_k,
             HipWType::Q6K => &self.qmm_q6_k,
+            HipWType::Q2K => &self.qmm_q2_k,
+            HipWType::Q3K => &self.qmm_q3_k,
         };
         let gx = m.div_ceil(64);
         let gy = batch.div_ceil(128);

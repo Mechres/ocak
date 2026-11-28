@@ -135,7 +135,7 @@ __device__ __forceinline__ float dequant_elem(
         u32 qlo = (j & 1u) ? (qb >> 4) : (qb & 0xFu);
         u32 qhi = (row[b + 16u + l] >> j) & 1u;
         return d * (float)(qlo | (qhi << 4)) - m;
-    } else {
+    } else if (wtype == 6u) {
         // Q6_K: 210 bytes / 256 elems
         u32 b = (col >> 8) * 210u;
         u32 n = col & 255u;
@@ -149,6 +149,33 @@ __device__ __forceinline__ float dequant_elem(
         i32 q = (i32)(qlo | (qhi << 4)) - 32;
         float d = f16at(row, b + 208u) * (float)((i8)row[b + 192u + half_ * 8u + (l >> 4) + 2u * g]);
         return d * (float)q;
+    } else if (wtype == 7u) {
+        // Q2_K: 84 bytes / 256 elems
+        u32 b = (col >> 8) * 84u;
+        u32 n = col & 255u;
+        u32 half_ = n >> 7;
+        u32 g = (n >> 5) & 3u;
+        u32 l = n & 31u;
+        u8 sc = row[b + half_ * 8u + 2u * g + (l >> 4)];
+        float d = f16at(row, b + 80u) * (float)(sc & 0xFu);
+        float m = f16at(row, b + 82u) * (float)(sc >> 4);
+        u8 qb = row[b + 16u + half_ * 32u + l];
+        u32 q = (qb >> (2u * g)) & 3u;
+        return d * (float)q - m;
+    } else {
+        // Q3_K: 110 bytes / 256 elems
+        u32 b = (col >> 8) * 110u;
+        u32 n = col & 255u;
+        u32 half_ = n >> 7;
+        u32 g = (n >> 5) & 3u;
+        u32 l = n & 31u;
+        u32 is = half_ * 8u + 2u * g + (l >> 4);
+        u32 lo4 = (is < 8u) ? (row[b + 96u + is] & 0xFu) : (row[b + 96u + is - 8u] >> 4);
+        u32 hi2 = (row[b + 104u + (is & 3u)] >> (2u * (is >> 2))) & 3u;
+        float d = f16at(row, b + 108u) * (float)((i32)(lo4 | (hi2 << 4)) - 32);
+        u32 qlo = (row[b + 32u + half_ * 32u + l] >> (2u * g)) & 3u;
+        u32 qhi = (row[b + l] >> (half_ * 4u + g)) & 1u;
+        return d * (float)((i32)(qlo | (qhi << 2)) - 4);
     }
 }
 

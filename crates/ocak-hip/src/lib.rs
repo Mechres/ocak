@@ -103,6 +103,17 @@ mod tests {
                     blk[208..210].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                 }
             }
+            GgmlType::Q2K => {
+                for blk in v.chunks_exact_mut(bb) {
+                    blk[80..82].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                    blk[82..84].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                }
+            }
+            GgmlType::Q3K => {
+                for blk in v.chunks_exact_mut(bb) {
+                    blk[108..110].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                }
+            }
             _ => unreachable!(),
         }
         v
@@ -188,6 +199,8 @@ mod tests {
             (GgmlType::Q4K, HipWType::Q4K),
             (GgmlType::Q5K, HipWType::Q5K),
             (GgmlType::Q6K, HipWType::Q6K),
+            (GgmlType::Q2K, HipWType::Q2K),
+            (GgmlType::Q3K, HipWType::Q3K),
         ] {
             let (k, m, batch) = (512usize, 70usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);

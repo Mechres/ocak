@@ -154,6 +154,8 @@ fn hip_wtype(ty: GgmlType) -> Result<HipWType, EngineError> {
         GgmlType::Q4K => Ok(HipWType::Q4K),
         GgmlType::Q5K => Ok(HipWType::Q5K),
         GgmlType::Q6K => Ok(HipWType::Q6K),
+        GgmlType::Q2K => Ok(HipWType::Q2K),
+        GgmlType::Q3K => Ok(HipWType::Q3K),
         other => Err(EngineError::Unsupported(format!(
             "HIP backend does not yet support weight format {other:?}"
         ))),
