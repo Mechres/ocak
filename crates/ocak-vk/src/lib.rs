@@ -200,6 +200,7 @@ struct Pipelines {
     inkling_kv_store: PipelineBundle,
     inkling_attn_batch: PipelineBundle,
     inkling_attn_prefill: PipelineBundle,
+    inkling_attn_prefill_f2: Option<PipelineBundle>,
     mla_attn_prefill: PipelineBundle,
     inkling_attn_split: PipelineBundle,
     inkling_attn_merge: PipelineBundle,
@@ -356,6 +357,7 @@ impl Pipelines {
         .chain(self.qmvq.iter())
         .chain(self.attention_prefill_128_f2.iter())
         .chain(self.mla_attn_prefill_f2.iter())
+        .chain(self.inkling_attn_prefill_f2.iter())
         .chain(self.attention_prefill_256_f2.iter())
         .chain(self.qmmqg.iter())
         .chain([
@@ -838,6 +840,7 @@ impl VkContext {
                 inkling_attn_merge: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_merge.spv")), "inkling_attn_merge", 3, 16)?,
                 mla_attn_prefill_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn_prefill_f2.spv")), "mla_attn_prefill_f2", 4, 24)?) } else { None },
                 inkling_attn_prefill: bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill.spv")), "inkling_attn_prefill", 10, 92)?,
+                inkling_attn_prefill_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/inkling_attn_prefill_f2.spv")), "inkling_attn_prefill_f2", 10, 92)?) } else { None },
                 attention_prefill_128: bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128.spv")), "attention_prefill_128", 4, 40)?,
                 attention_prefill_128_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_128_f2.spv")), "attention_prefill_128_f2", 4, 40)?) } else { None },
                 attention_prefill_256_f2: if has_mixed_dot { Some(bp(include_bytes!(concat!(env!("OUT_DIR"), "/attention_prefill_256_f2.spv")), "attention_prefill_256_f2", 4, 40)?) } else { None },
@@ -2299,8 +2302,9 @@ impl<'a> Recorder<'a> {
                 n_head, n_head_kv, hd, n_rel, n_extent, n_swa, is_swa as u32, cap, pos, kv_slot_off,
                 qk_clip.to_bits(), rel_clip.to_bits(), log_alpha.to_bits(), log_floor.to_bits(), n_tok,
             ];
+            let p = self.ctx.pipelines.inkling_attn_prefill_f2.as_ref().unwrap_or(&self.ctx.pipelines.inkling_attn_prefill);
             self.dispatch_raw(
-                &self.ctx.pipelines.inkling_attn_prefill,
+                p,
                 &[q.buf, r.buf, sinks.buf, gate.buf, q_clip.buf, r_clip.buf, r_bias.buf, k_cache.buf, v_cache.buf, out.buf],
                 bytemuck::cast_slice(&pc), n_head_kv, n_tok.div_ceil(64 / group), 1,
             );

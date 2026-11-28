@@ -1,21 +1,33 @@
 #version 460
 #extension GL_KHR_shader_subgroup_clustered : require
+#ifdef FDOT2
+// fp16 x fp16 dot with fp32 accumulate (VK_VALVE_shader_mixed_float_dot_product).
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float fdot2mix(f16vec2 a, f16vec2 b, float c);
+#endif
 // Flash-style Inkling prefill attention (replaces inkling_attn_batch.comp for batches): same
 // math (Q/R clipping, log-scale temperature tau, relative-position bias, zero-logit sink,
 // sigmoid output gate, SWA ring cache), but a workgroup (kv head, tile) owns R = group * (64 /
 // group) query rows (the `group` heads sharing KV head kvh, for 64 / group tokens) and stages
 // each BK-key tile of K, V and the relative-bias rows it needs in shared memory once for all
 // rows. Thread layout as attention_prefill.comp: row r = tid / 4, the 4 lanes of a row split
-// the keys (scores) and the output dims. Requires head_dim == 128 and n_rel <= 16.
+// the keys (lane sub owns keys sub + 4j) and the output dims (lane sub owns 16 consecutive
+// packed dims). Requires head_dim == 128 and n_rel <= 16.
+// The kernel is shared-memory bound, so every hot shared read is 128 bits wide: Q lives in
+// registers, K/V rows are 17 uvec4 (68 words: the 4 keys read together land on different bank
+// quads), P and the relative-bias rows are read as vec4.
 #define HD 128u
 #define HHD 64u            // packed f16x2 per row
+#define HQ 16u             // uvec4 per row
 #define BK 32u
 #define KPT (BK / 4u)      // keys per lane
-#define DPT (HHD / 4u)     // packed output dims per lane
 #define NREL 16u
 #define RB_ROWS 64u        // relative-bias rows staged per tile (>= BK + 64 / group - 1)
-#define HS (HHD + 1u)      // padded shared row stride (rows land in different banks)
-#define PS (BK + 1u)       // padded P row stride
+#define KS4 17u            // K/V shared row stride in uvec4
+#define PS4 9u             // P shared row stride in vec4 (36 floats)
+#define RS4 5u             // relative-bias shared row stride in vec4 (20 floats)
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
 layout(set = 0, binding = 1) readonly buffer Rr { float rr[]; };
@@ -49,11 +61,24 @@ layout(push_constant) uniform PC {
     uint n_tok;
 } pc;
 
-shared uint qs[64u * HS];
-shared uint ks[BK * HS];
-shared uint vs[BK * HS];
-shared float ps[64u * PS];
-shared float rbs[RB_ROWS * NREL];
+shared uvec4 ks[BK * KS4];
+shared uvec4 vs[BK * KS4];
+shared vec4 ps[64u * PS4];
+shared vec4 rbs[RB_ROWS * RS4];
+
+#ifdef FDOT2
+#define QK4(acc, qq, kk) \
+    acc = fdot2mix(unpackFloat2x16(qq.x), unpackFloat2x16(kk.x), acc); \
+    acc = fdot2mix(unpackFloat2x16(qq.y), unpackFloat2x16(kk.y), acc); \
+    acc = fdot2mix(unpackFloat2x16(qq.z), unpackFloat2x16(kk.z), acc); \
+    acc = fdot2mix(unpackFloat2x16(qq.w), unpackFloat2x16(kk.w), acc);
+#else
+#define QK4(acc, qq, kk) \
+    acc += dot(unpackHalf2x16(qq.x), unpackHalf2x16(kk.x)); \
+    acc += dot(unpackHalf2x16(qq.y), unpackHalf2x16(kk.y)); \
+    acc += dot(unpackHalf2x16(qq.z), unpackHalf2x16(kk.z)); \
+    acc += dot(unpackHalf2x16(qq.w), unpackHalf2x16(kk.w));
+#endif
 
 void main() {
     uint kvh = gl_WorkGroupID.x;
@@ -75,7 +100,9 @@ void main() {
     float tau = (pc.is_swa == 0u) ? (1.0 + pc.log_alpha * log(max((float(tpos) + 1.0) / pc.log_floor, 1.0))) : 1.0;
 
     // Q: clip by qclip, row norm clip to qk_clip, times tau and 1/sqrt(hd); the 4 lanes of a
-    // row each own 32 dims. Stored as packed f16.
+    // row each own 32 dims, exchanged through shared memory (rows 0-31 in ks, 32-63 in vs) so
+    // every lane ends up with the whole row as packed f16 in registers.
+    uvec4 qr[HQ];
     {
         uint qb = pc.q_off + tok_c * pc.q_stride + h * HD + sub * 32u;
         float qv[32];
@@ -87,99 +114,111 @@ void main() {
         ss = subgroupClusteredAdd(ss, 4u);
         float qn = sqrt(ss);
         float qf = ((qn > pc.qk_clip) ? (pc.qk_clip / qn) : 1.0) * tau * scale;
-        for (uint e = 0u; e < 16u; e++)
-            qs[r * HS + sub * 16u + e] = packHalf2x16(vec2(qv[2u * e], qv[2u * e + 1u]) * (row_valid ? qf : 0.0));
+        if (!row_valid) qf = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            uvec4 w;
+            w.x = packHalf2x16(vec2(qv[8u * i + 0u], qv[8u * i + 1u]) * qf);
+            w.y = packHalf2x16(vec2(qv[8u * i + 2u], qv[8u * i + 3u]) * qf);
+            w.z = packHalf2x16(vec2(qv[8u * i + 4u], qv[8u * i + 5u]) * qf);
+            w.w = packHalf2x16(vec2(qv[8u * i + 6u], qv[8u * i + 7u]) * qf);
+            uint a = (r & 31u) * KS4 + sub * 4u + i;
+            if (r < 32u) ks[a] = w; else vs[a] = w;
+        }
+        barrier();
+        for (uint i = 0u; i < HQ; i++) {
+            uint a = (r & 31u) * KS4 + i;
+            qr[i] = (r < 32u) ? ks[a] : vs[a];
+        }
     }
     // R (relative query, n_rel <= 16): clip, norm clip to rel_clip, times tau. Kept in registers
     // (all 4 lanes of the row hold the full vector).
-    float srow[NREL];
+    vec4 srow[NREL / 4u];
     {
+        float sr[NREL];
         float rs = 0.0;
         for (uint j = 0u; j < NREL; j++) {
             float v = (j < pc.n_rel) ? rr[pc.r_off + tok_c * pc.r_stride + h * pc.n_rel + j] * rclip[h * pc.n_rel + j] : 0.0;
-            srow[j] = v;
+            sr[j] = v;
             rs += v * v;
         }
         float rn = sqrt(rs);
         float rf = ((rn > pc.rel_clip) ? (pc.rel_clip / rn) : 1.0) * tau;
-        for (uint j = 0u; j < NREL; j++) srow[j] *= rf;
+        for (uint i = 0u; i < NREL / 4u; i++) srow[i] = vec4(sr[4u * i], sr[4u * i + 1u], sr[4u * i + 2u], sr[4u * i + 3u]) * rf;
     }
     float sink_t = sinks[pc.s_off + tok_c * pc.s_stride + h];
 
     uint ntq = min(bq, pc.n_tok - q0);
     uint min_qpos = pc.pos + q0;
     uint max_qpos = pc.pos + q0 + ntq - 1u;
+    uint qpos = pc.pos + tok_c;
     uint t_lo = (pc.is_swa != 0u && min_qpos + 1u > pc.n_swa) ? (min_qpos + 1u - pc.n_swa) : 0u;
     t_lo = (t_lo / BK) * BK;
 
     // Online softmax; the zero-logit sink is the initial state (m = 0, l = 1).
     float m = 0.0;
     float l = 1.0;
-    vec2 acc[DPT];
-    for (uint j = 0u; j < DPT; j++) acc[j] = vec2(0.0);
-    barrier();
+    vec2 acc[16];
+    for (uint j = 0u; j < 16u; j++) acc[j] = vec2(0.0);
 
     // K/V tile staging with a register prefetch of the next tile (cache slot = t, or t % cap in
-    // the SWA ring). BK * HHD = 2048 words: 8 per thread.
-    #define LPT ((BK * HHD) / 256u)
-    uint pk[LPT];
-    uint pv[LPT];
-    for (uint u = 0u; u < LPT; u++) {
-        uint idx = tid + 256u * u;
-        uint t = t_lo + idx / HHD;
-        pk[u] = 0u; pv[u] = 0u;
-        if (t <= max_qpos) {
-            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-            uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + idx % HHD;
-            pk[u] = kcache[kb];
-            pv[u] = vcache[kb];
-        }
-    }
+    // the SWA ring). BK * HQ = 512 uvec4: 2 per thread, 4 consecutive words each.
+    #define LPT ((BK * HQ) / 256u)
+    uvec4 pk[LPT];
+    uvec4 pv[LPT];
+    #define LOAD_KV(T0, u) { \
+        uint idx = tid + 256u * u; \
+        uint t = (T0) + idx / HQ; \
+        pk[u] = uvec4(0u); pv[u] = uvec4(0u); \
+        if (t <= max_qpos) { \
+            uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t; \
+            uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + (idx % HQ) * 4u; \
+            pk[u] = uvec4(kcache[kb], kcache[kb + 1u], kcache[kb + 2u], kcache[kb + 3u]); \
+            pv[u] = uvec4(vcache[kb], vcache[kb + 1u], vcache[kb + 2u], vcache[kb + 3u]); \
+        } }
+    for (uint u = 0u; u < LPT; u++) LOAD_KV(t_lo, u);
+    barrier();   // Q exchange reads done before the first tile overwrites ks / vs
     for (uint t0 = t_lo; t0 <= max_qpos; t0 += BK) {
         for (uint u = 0u; u < LPT; u++) {
             uint idx = tid + 256u * u;
-            ks[(idx / HHD) * HS + idx % HHD] = pk[u];
-            vs[(idx / HHD) * HS + idx % HHD] = pv[u];
+            ks[(idx / HQ) * KS4 + idx % HQ] = pk[u];
+            vs[(idx / HQ) * KS4 + idx % HQ] = pv[u];
         }
         // Stage relative-bias rows for distances dist_base .. dist_base + RB_ROWS - 1.
         uint dist_base = (min_qpos + 1u > t0 + BK) ? (min_qpos + 1u - t0 - BK) : 0u;
-        for (uint idx = tid; idx < RB_ROWS * NREL; idx += 256u) {
-            uint dd = dist_base + idx / NREL;
-            uint j = idx % NREL;
-            rbs[idx] = (dd < pc.n_extent && j < pc.n_rel) ? rbias[dd * pc.n_rel + j] : 0.0;
+        for (uint idx = tid; idx < RB_ROWS * (NREL / 4u); idx += 256u) {
+            uint dd = dist_base + idx / (NREL / 4u);
+            uint j0 = (idx % (NREL / 4u)) * 4u;
+            vec4 v = vec4(0.0);
+            if (dd < pc.n_extent) {
+                uint rb0 = dd * pc.n_rel + j0;
+                v = vec4(j0 < pc.n_rel ? rbias[rb0] : 0.0, j0 + 1u < pc.n_rel ? rbias[rb0 + 1u] : 0.0,
+                         j0 + 2u < pc.n_rel ? rbias[rb0 + 2u] : 0.0, j0 + 3u < pc.n_rel ? rbias[rb0 + 3u] : 0.0);
+            }
+            rbs[(idx / (NREL / 4u)) * RS4 + idx % (NREL / 4u)] = v;
         }
         barrier();
         if (t0 + BK <= max_qpos) {
-            for (uint u = 0u; u < LPT; u++) {
-                uint idx = tid + 256u * u;
-                uint t = t0 + BK + idx / HHD;
-                pk[u] = 0u; pv[u] = 0u;
-                if (t <= max_qpos) {
-                    uint sp = (pc.is_swa != 0u) ? (t % pc.cap) : t;
-                    uint kb = pc.kv_slot_off + sp * half_kv_dim + kvh * HHD + idx % HHD;
-                    pk[u] = kcache[kb];
-                    pv[u] = vcache[kb];
-                }
-            }
+            for (uint u = 0u; u < LPT; u++) LOAD_KV(t0 + BK, u);
         }
 
         float s[KPT];
         for (uint j = 0u; j < KPT; j++) s[j] = 0.0;
-        for (uint e = 0u; e < HHD; e++) {
-            vec2 qv = unpackHalf2x16(qs[r * HS + e]);
-            for (uint j = 0u; j < KPT; j++) s[j] += dot(qv, unpackHalf2x16(ks[(sub * KPT + j) * HS + e]));
+        for (uint e = 0u; e < HQ; e++) {
+            for (uint j = 0u; j < KPT; j++) {
+                uvec4 kv = ks[(sub + 4u * j) * KS4 + e];
+                QK4(s[j], qr[e], kv)
+            }
         }
         float tmax = -3.0e38;
         for (uint j = 0u; j < KPT; j++) {
-            uint t = t0 + sub * KPT + j;
-            uint qpos = pc.pos + tok_c;
+            uint t = t0 + sub + 4u * j;
             bool ok = row_valid && t <= qpos && (pc.is_swa == 0u || qpos - t < pc.n_swa);
             if (ok) {
                 uint dist = qpos - t;
                 float rb = 0.0;
                 if (dist < pc.n_extent) {
-                    uint ro = (dist - dist_base) * NREL;
-                    for (uint jj = 0u; jj < NREL; jj++) rb += rbs[ro + jj] * srow[jj];
+                    uint ro = (dist - dist_base) * RS4;
+                    for (uint i = 0u; i < NREL / 4u; i++) rb += dot(rbs[ro + i], srow[i]);
                 }
                 s[j] = s[j] + rb - sink_t;
             } else {
@@ -193,18 +232,28 @@ void main() {
         float psum = 0.0;
         for (uint j = 0u; j < KPT; j++) {
             float p = (s[j] > -1.0e38) ? exp(s[j] - m_new) : 0.0;
-            ps[r * PS + sub * KPT + j] = p;
+            ps[r * PS4 + j][sub] = p;   // key sub + 4j
             psum += p;
         }
         psum = subgroupClusteredAdd(psum, 4u);
         l = l * alpha + psum;
         m = m_new;
-        for (uint j = 0u; j < DPT; j++) acc[j] *= alpha;
+        for (uint j = 0u; j < 16u; j++) acc[j] *= alpha;
         barrier();
 
-        for (uint kk = 0u; kk < BK; kk++) {
-            float p = ps[r * PS + kk];
-            for (uint j = 0u; j < DPT; j++) acc[j] += p * unpackHalf2x16(vs[kk * HS + sub + 4u * j]);
+        for (uint k4 = 0u; k4 < BK / 4u; k4++) {
+            vec4 p4 = ps[r * PS4 + k4];
+            for (uint c = 0u; c < 4u; c++) {
+                float p = p4[c];
+                uint kk = 4u * k4 + c;
+                for (uint i = 0u; i < 4u; i++) {
+                    uvec4 v = vs[kk * KS4 + sub * 4u + i];
+                    acc[4u * i + 0u] += p * unpackHalf2x16(v.x);
+                    acc[4u * i + 1u] += p * unpackHalf2x16(v.y);
+                    acc[4u * i + 2u] += p * unpackHalf2x16(v.z);
+                    acc[4u * i + 3u] += p * unpackHalf2x16(v.w);
+                }
+            }
         }
         barrier();
     }
@@ -213,8 +262,8 @@ void main() {
         float inv = 1.0 / l;
         uint gb = pc.g_off + tok_r * pc.g_stride + h * HD;
         uint ob = (tok_r * pc.n_head + h) * HD;
-        for (uint j = 0u; j < DPT; j++) {
-            uint d = 2u * (sub + 4u * j);
+        for (uint j = 0u; j < 16u; j++) {
+            uint d = 2u * (sub * 16u + j);
             float g0 = 1.0 / (1.0 + exp(-gate[gb + d]));
             float g1 = 1.0 / (1.0 + exp(-gate[gb + d + 1u]));
             o[ob + d] = acc[j].x * inv * g0;
