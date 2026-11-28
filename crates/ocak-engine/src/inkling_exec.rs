@@ -201,6 +201,8 @@ struct InklingGpuState {
     moe_out: Buffer,      // ne
     hidden_buf: Buffer,   // ne
     logits_buf: Buffer,   // n_vocab_padded
+    /// Device-side greedy pick (`forward_argmax`).
+    argmax_buf: Buffer,
     // Persistent slot states (KV + ShortConv histories)
     k_cache: Buffer,
     v_cache: Buffer,
@@ -766,6 +768,7 @@ impl InklingExec {
                     moe_out: mk(n_embd)?,
                     hidden_buf: mk(n_embd)?,
                     logits_buf: mk(n_vocab_padded)?,
+                    argmax_buf: mk(4)?,
                     k_cache: mk(total_kv_u32)?,
                     v_cache: mk(total_kv_u32)?,
                     k_hist,
@@ -780,6 +783,14 @@ impl InklingExec {
         } else {
             None
         };
+        if gpu_pipe.is_some() {
+            // The GPU pipeline keeps its own fp16 KV cache; the host copy (~6 GB at 65k context)
+            // would never be used.
+            for s in &mut slots {
+                s.k_cache = Vec::new();
+                s.v_cache = Vec::new();
+            }
+        }
 
         Ok(Self {
             gguf: g, vk, n_phys, core_start, core_end, n_passes,
@@ -990,6 +1001,9 @@ impl InklingExec {
         }
 
         // 6. Store K, V in slot cache (ring buffer for SWA, linear for Full)
+        if self.slots[il].k_cache.is_empty() {
+            return Err(EngineError::Backend("inkling: host KV cache not allocated (GPU pipeline active)".into()));
+        }
         let cap = self.slots[il].k_cache.len() / kv_dim;
         let slot_pos = if is_swa { pos % cap } else { pos };
         self.slots[il].k_cache[slot_pos * kv_dim..(slot_pos + 1) * kv_dim].copy_from_slice(&k);
@@ -1897,6 +1911,26 @@ impl Executor for InklingExec {
     }
 
     fn forward(&mut self, token: u32, pos: usize, _page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        self.forward_inner(token, pos, out, false).map(|_| ())
+    }
+
+    /// Greedy decode: argmax on the device (softcap's tanh is monotonic, so the pick is exact);
+    /// only the index crosses PCIe. `None` (caller falls back) without the full GPU pipeline.
+    fn forward_argmax(&mut self, token: u32, pos: usize, _page_table: &[u32]) -> Result<Option<u32>, EngineError> {
+        if self.gpu_pipe.is_none() {
+            return Ok(None);
+        }
+        self.forward_inner(token, pos, Out { logits: true, hidden: false }, true)
+    }
+
+    fn logits(&self) -> &[f32] { &self.logits }
+    fn hidden(&self) -> &[f32] { &self.hidden }
+}
+
+impl InklingExec {
+    /// Single-token forward; with `argmax` (GPU pipeline only) returns the greedy token instead
+    /// of reading back logits.
+    fn forward_inner(&mut self, token: u32, pos: usize, out: Out, argmax: bool) -> Result<Option<u32>, EngineError> {
         if pos >= self.max_ctx {
             return Err(EngineError::Context(format!("pos {pos} >= max_ctx {}", self.max_ctx)));
         }
@@ -1977,19 +2011,30 @@ impl Executor for InklingExec {
                 rec.qmv(*wto, bo, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, ne, self.output_w.m as u32);
                 rec.barrier();
             }
-            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            if argmax {
+                rec.argmax(&gp.logits_buf, 0, &gp.argmax_buf, self.n_vocab_unpadded as u32);
+                rec.barrier();
+                let mut idx = [0u32; 1];
+                rec.finish_and_read(&mut [(&gp.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx))]).map_err(|e| EngineError::Backend(e.to_string()))?;
+                return Ok(Some(idx[0]));
+            }
+            // Hidden state and logits are read back inside the same submit, straight into the
+            // executor's buffers (no per-token allocation).
+            let mut reads: Vec<(&Buffer, u64, &mut [u8])> = Vec::with_capacity(2);
             if out.hidden {
-                c.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                reads.push((&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)));
             }
             if out.logits {
-                let mut full = vec![0f32; self.n_vocab_unpadded];
-                c.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut full)).map_err(|e| EngineError::Backend(e.to_string()))?;
-                for i in 0..self.n_vocab_unpadded {
-                    let v = full[i];
-                    self.logits[i] = if self.softcap > 0.0 { self.softcap * (v / self.softcap).tanh() } else { v };
+                reads.push((&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits[..self.n_vocab_unpadded])));
+            }
+            rec.finish_and_read(&mut reads).map_err(|e| EngineError::Backend(e.to_string()))?;
+            if out.logits && self.softcap > 0.0 {
+                let sc = self.softcap;
+                for v in &mut self.logits[..self.n_vocab_unpadded] {
+                    *v = sc * (*v / sc).tanh();
                 }
             }
-            return Ok(());
+            return Ok(None);
         }
 
         let mut cur = rms_norm_weighted(&emb, &self.tok_norm, self.eps);
@@ -2050,9 +2095,6 @@ impl Executor for InklingExec {
                 };
             }
         }
-        Ok(())
+        Ok(None)
     }
-
-    fn logits(&self) -> &[f32] { &self.logits }
-    fn hidden(&self) -> &[f32] { &self.hidden }
 }

@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let backend = if args.backend == "cpu" { BackendKind::CpuAvx2 } else { BackendKind::Vulkan };
-    let allow_remote_host = !matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+    let allow_remote_host = !matches!(args.host.trim_matches(['[', ']']), "127.0.0.1" | "localhost" | "::1")
         || std::env::var("OCAK_ALLOW_REMOTE_HOST").ok().as_deref() == Some("1");
     let models_dir = args.models_dir.unwrap_or_else(|| {
         std::env::var("HOME")
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(models = state.catalog.len(), sleep_idle_seconds = args.sleep_idle_seconds, "ocakd catalog ready");
 
     if let Some(cp) = args.compat_port {
-        let addr: SocketAddr = format!("{}:{cp}", args.host).parse()?;
+        let addr = resolve_addr(&args.host, cp)?;
         let router = build_router(state.clone());
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(addr).await {
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+    let addr = resolve_addr(&args.host, args.port)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, ui = %format!("http://{addr}/ui"), "ocakd listening");
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -103,6 +103,15 @@ async fn main() -> anyhow::Result<()> {
     state.shutdown().await;
     res??;
     Ok(())
+}
+
+/// `--host` may be an IPv4 / IPv6 literal (with or without brackets) or a name like `localhost`.
+fn resolve_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<SocketAddr> = (h, port).to_socket_addrs()?.collect();
+    // Prefer IPv4 (`localhost` -> 127.0.0.1, which every client tries).
+    addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied().ok_or_else(|| anyhow::anyhow!("--host {host}: no address"))
 }
 
 /// Resolves on SIGINT (Ctrl-C) or SIGTERM.

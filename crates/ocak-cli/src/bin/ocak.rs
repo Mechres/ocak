@@ -105,6 +105,9 @@ enum Cmd {
     Top {
         #[arg(long, default_value = "127.0.0.1:8090")]
         addr: String,
+        /// API key of an ocakd started with --api-key.
+        #[arg(long, env = "OCAK_API_KEY")]
+        api_key: Option<String>,
     },
 }
 
@@ -442,11 +445,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Top { addr } => {
+        Cmd::Top { addr, api_key } => {
             let clean = addr.trim_start_matches("http://").to_string();
+            let auth = api_key.filter(|k| !k.is_empty()).map(|k| format!("Bearer {k}"));
+            let headers: Vec<(&str, &str)> = auth.as_deref().map(|a| vec![("Authorization", a)]).unwrap_or_default();
             loop {
                 print!("\x1b[2J\x1b[H");
-                match ocak_federation::bridges::http_request(&clean, "GET", "/v1/ocak/status", "application/json", &[]).await {
+                match ocak_federation::bridges::http_request_with_headers(&clean, "GET", "/v1/ocak/status", "application/json", &[], &headers).await {
                     Ok((200, body)) => {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
                             println!("=== OCAK TOP ({clean}) ===  [Ctrl+C to exit]");

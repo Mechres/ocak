@@ -71,7 +71,11 @@ def main():
         out.append(f"| {model} | {cells[0]} | {cells[1]} |")
     for model in base:
         if model not in cur:
+            # A model in the baseline must be benchmarked: an empty or truncated bench output
+            # (crash, missing model file) is a failure, not a pass.
+            print(f"::error::{model}: missing from the benchmark output")
             out.append(f"| {model} | (missing) | (missing) |")
+            failed = True
     print("\n".join(out))
     return 1 if failed else 0
 

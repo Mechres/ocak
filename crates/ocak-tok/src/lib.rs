@@ -102,6 +102,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark"]
+    fn encode_bench() {
+        let Some(p) = home_model("models/Qwen3.5-4B-Q4_K_M.gguf") else { return; };
+        let gf = ocak_gguf::GgufFile::open(&p).unwrap();
+        let tok = Tokenizer::from_gguf(&gf).unwrap();
+        let para = "The quick brown fox jumps over the lazy dog. Ölçüm sonuçları: 3.14159, 2718! fn main() { println!(\"hi\"); }\n";
+        let text = para.repeat(400);
+        let chat = format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n");
+        for (name, s, special) in [("plain", text.as_str(), false), ("special", chat.as_str(), true)] {
+            let t = std::time::Instant::now();
+            let mut n = 0;
+            for _ in 0..5 {
+                n = tok.encode(s, false, special).len();
+            }
+            eprintln!("encode {name}: {n} tokens, {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / 5.0);
+        }
+        let ids = tok.encode(&chat, false, true);
+        eprintln!("ids hash {}", ids.iter().fold(0u64, |h, &i| h.wrapping_mul(1_000_003).wrapping_add(i as u64)));
+    }
+
+    #[test]
     fn qwen35_real_gguf_tokenizer() {
         let Some(p) = home_model("models/Qwen3.5-4B-Q4_K_M.gguf") else { return; };
         let gf = ocak_gguf::GgufFile::open(&p).unwrap();

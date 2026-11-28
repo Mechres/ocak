@@ -675,16 +675,20 @@ struct ChatReq {
     messages: Vec<Value>,
     #[serde(default)]
     stream: bool,
-    #[serde(default = "def_max_tok")]
-    max_tokens: usize,
+    max_tokens: Option<usize>,
+    /// OpenAI's newer name for `max_tokens` (takes precedence).
+    max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
     min_p: Option<f32>,
     repeat_penalty: Option<f32>,
     presence_penalty: Option<f32>,
-    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    /// A single string or a list of strings.
+    #[serde(default, deserialize_with = "de_stop")]
     stop: Vec<String>,
+    stream_options: Option<Value>,
     reasoning_max_tokens: Option<usize>,
     chat_template_kwargs: Option<Value>,
     response_format: Option<Value>,
@@ -695,6 +699,25 @@ struct ChatReq {
 }
 
 fn def_max_tok() -> usize { 256 }
+
+fn de_stop<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stop {
+        One(String),
+        Many(Vec<String>),
+        None(()),
+    }
+    Ok(match Stop::deserialize(d)? {
+        Stop::One(s) => vec![s],
+        Stop::Many(v) => v,
+        Stop::None(()) => Vec::new(),
+    })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
 
 fn build_sampler(st: &AppState, model_id: &str, req: &ChatReq) -> SamplerParams {
     let p = st.presets.resolve(model_id);
@@ -707,6 +730,7 @@ fn build_sampler(st: &AppState, model_id: &str, req: &ChatReq) -> SamplerParams 
         min_p: req.min_p.unwrap_or_else(|| f("min-p", 0.0)),
         repeat_penalty: req.repeat_penalty.unwrap_or_else(|| f("repeat-penalty", 1.0)),
         presence_penalty: req.presence_penalty.unwrap_or_else(|| f("presence-penalty", 0.0)),
+        frequency_penalty: req.frequency_penalty.unwrap_or_else(|| f("frequency-penalty", 0.0)),
         ..Default::default()
     }
 }
@@ -770,6 +794,13 @@ async fn chat_completions(
         .unwrap_or(false);
     let sampler = build_sampler(&st, &entry.id, &req);
     let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let created = unix_now();
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let model_id = entry.id.clone();
     let tool_defs = tools::extract_openai_tools(&req.tools);
     let has_tools = !tool_defs.is_empty();
@@ -785,7 +816,7 @@ async fn chat_completions(
     let greq = GenRequest {
         prompt,
         parse_special: true,
-        max_tokens: req.max_tokens,
+        max_tokens: req.max_completion_tokens.or(req.max_tokens).unwrap_or_else(def_max_tok),
         sampler,
         stop: req.stop,
         json_mode,
@@ -815,6 +846,7 @@ async fn chat_completions(
                         let chunk = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
+                            "created": created,
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "reasoning_content": r_delta }, "finish_reason": null }]
                         });
@@ -826,6 +858,7 @@ async fn chat_completions(
                         let chunk = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
+                            "created": created,
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "content": c_delta }, "finish_reason": null }]
                         });
@@ -839,6 +872,7 @@ async fn chat_completions(
                     let chunk = json!({
                         "id": id,
                         "object": "chat.completion.chunk",
+                            "created": created,
                         "model": model_id,
                         "choices": [{ "index": 0, "delta": { "reasoning_content": r_tail }, "finish_reason": null }]
                     });
@@ -848,6 +882,7 @@ async fn chat_completions(
                     let chunk = json!({
                         "id": id,
                         "object": "chat.completion.chunk",
+                            "created": created,
                         "model": model_id,
                         "choices": [{ "index": 0, "delta": { "content": c_tail }, "finish_reason": null }]
                     });
@@ -862,6 +897,7 @@ async fn chat_completions(
                         let rc = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
+                            "created": created,
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "reasoning_content": r_txt }, "finish_reason": null }]
                         });
@@ -872,6 +908,7 @@ async fn chat_completions(
                         let c = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
+                            "created": created,
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "content": clean }, "finish_reason": null }]
                         });
@@ -891,6 +928,7 @@ async fn chat_completions(
                         let tc_chunk = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
+                            "created": created,
                             "model": model_id,
                             "choices": [{ "index": 0, "delta": { "tool_calls": tc_json }, "finish_reason": null }]
                         });
@@ -901,11 +939,28 @@ async fn chat_completions(
                 let done_chunk = json!({
                     "id": id,
                     "object": "chat.completion.chunk",
+                            "created": created,
                     "model": model_id,
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                     "timings": gr.timings
                 });
                 let _ = tx.send(Ok(Event::default().data(done_chunk.to_string()))).await;
+                if include_usage {
+                    // stream_options.include_usage: a final chunk with empty choices and usage.
+                    let usage_chunk = json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": gr.timings.prompt_n,
+                            "completion_tokens": gr.timings.predicted_n,
+                            "total_tokens": gr.timings.prompt_n + gr.timings.predicted_n
+                        }
+                    });
+                    let _ = tx.send(Ok(Event::default().data(usage_chunk.to_string()))).await;
+                }
                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
             } else {
                 let err_chunk = json!({ "error": { "message": "generation failed or model swapped" } });
@@ -960,6 +1015,7 @@ async fn chat_completions(
     Json(json!({
         "id": id,
         "object": "chat.completion",
+        "created": created,
         "model": model_id,
         "choices": [{
             "index": 0,
@@ -1112,6 +1168,13 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "type": "error", "error": { "type": "api_error", "message": e } }))).into_response();
     }
     let has_tools = !req.tools.is_empty();
+    // `thinking: {"type": "enabled", "budget_tokens": N}` caps the reasoning block.
+    let think_budget = req
+        .thinking
+        .as_ref()
+        .and_then(|v| v.get("budget_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
     let enable_thinking = req
         .thinking
         .as_ref()
@@ -1127,11 +1190,13 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
         let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
         let st_c = Arc::clone(&st);
         tokio::task::spawn_blocking(move || {
-            let start = json!({
-                "type": "message_start",
-                "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_id, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
-            });
-            let _ = tx.blocking_send(Ok(Event::default().event("message_start").data(start.to_string())));
+            let message_start = |input_tokens: usize| {
+                let start = json!({
+                    "type": "message_start",
+                    "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_id, "stop_reason": null, "usage": { "input_tokens": input_tokens, "output_tokens": 0 } }
+                });
+                Ok(Event::default().event("message_start").data(start.to_string()))
+            };
 
             let mut guard = st_c.native.blocking_lock();
             match guard.as_mut() {
@@ -1139,6 +1204,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                     let fam = detect_family(active.engine.tokenizer.chat_template());
                     let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
                     let prompt = render(fam, &chat_msgs, true, enable_thinking);
+                    let _ = tx.blocking_send(message_start(active.engine.tokenizer.encode(&prompt, true, true).len()));
                     let greq = GenRequest {
                         prompt,
                         parse_special: true,
@@ -1146,7 +1212,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                         sampler: SamplerParams { temperature: req.temperature.unwrap_or(0.7), ..Default::default() },
                         stop: Vec::new(),
                         json_mode: false,
-                        thinking: None,
+                        thinking: think_budget.map(|m| ThinkingCfg { max_tokens: m }),
                     };
                     let tx_c = tx.clone();
                     let mut splitter = reasoning::StreamReasoningSplitter::new(started_in_think);
@@ -1288,6 +1354,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                     }
                 }
                 _ => {
+                    let _ = tx.blocking_send(message_start(0));
                     let err = json!({ "type": "error", "error": { "type": "api_error", "message": "model unloaded or swapped before generation" } });
                     let _ = tx.blocking_send(Ok(Event::default().event("error").data(err.to_string())));
                 }
@@ -1319,7 +1386,7 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
             sampler: SamplerParams { temperature: temp, ..Default::default() },
             stop: Vec::new(),
             json_mode: false,
-            thinking: None,
+            thinking: think_budget.map(|m| ThinkingCfg { max_tokens: m }),
         };
         let out = active.engine.generate(&greq, |_, _| true).map_err(|e| e.to_string());
         st_c.governor.blocking_lock().touch(&model_id_c, Instant::now());
@@ -1380,13 +1447,42 @@ async fn anthropic_count_tokens(State(st): State<Arc<AppState>>, Json(req): Json
     };
     let chat_msgs = anthropic_to_chat(&req);
     let text: String = chat_msgs.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
-    if let Ok(gf) = ocak_gguf::GgufFile::open(&entry.path) {
-        if let Ok(tok) = ocak_tok::Tokenizer::from_gguf(&gf) {
-            let n = tok.encode(&text, true, true).len();
-            return Json(json!({ "input_tokens": n })).into_response();
-        }
-    }
-    Json(json!({ "input_tokens": text.len() / 4 })).into_response()
+    let fallback = text.len() / 4;
+    // Opening the GGUF and building the tokenizer is blocking work: off the async workers, and
+    // cached per model file.
+    let path = entry.path.clone();
+    let n = tokio::task::spawn_blocking(move || {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, Arc<ocak_tok::Tokenizer>>>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let cached = cache.lock().unwrap().get(&path).cloned();
+        let tok = match cached {
+            Some(t) => t,
+            None => {
+                let gf = ocak_gguf::GgufFile::open(&path).ok()?;
+                let t = Arc::new(ocak_tok::Tokenizer::from_gguf(&gf).ok()?);
+                cache.lock().unwrap().insert(path, Arc::clone(&t));
+                t
+            }
+        };
+        Some(tok.encode(&text, true, true).len())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(fallback);
+    Json(json!({ "input_tokens": n })).into_response()
+}
+
+/// Value of a simple text field `name` in a multipart/form-data body.
+fn multipart_field(body: &[u8], name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let at = body.windows(needle.len()).position(|w| w == needle.as_bytes())?;
+    let rest = &body[at + needle.len()..];
+    let start = rest.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let val = &rest[start..];
+    let end = val.windows(2).position(|w| w == b"\r\n")?;
+    let v = std::str::from_utf8(&val[..end]).ok()?.trim();
+    (!v.is_empty() && v.len() < 256).then(|| v.to_string())
 }
 
 async fn audio_transcriptions(
@@ -1395,12 +1491,22 @@ async fn audio_transcriptions(
     body: Bytes,
 ) -> Response {
     st.requests_total.fetch_add(1, Ordering::Relaxed);
-    let Some(entry) = st.find_model("Qwen3-ASR-1.7B").cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Qwen3-ASR-1.7B not found in model catalog" }))).into_response();
+    // The multipart `model` field picks the model; otherwise any ASR model in the catalog.
+    let requested = multipart_field(&body, "model");
+    let entry = requested
+        .as_deref()
+        .and_then(|m| st.find_model(m))
+        .or_else(|| st.find_model("Qwen3-ASR-1.7B"))
+        .or_else(|| st.catalog.iter().find(|e| !e.is_mmproj && e.id.to_ascii_lowercase().contains("asr")))
+        .cloned();
+    let Some(entry) = entry else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "no ASR model found in the model catalog" }))).into_response();
     };
     // Native path: if a RIFF/WAVE payload is present (raw or inside multipart) and mmproj exists alongside the model, transcribe natively on Vulkan
     if let Some(riff_pos) = body.windows(12).position(|w| &w[0..4] == b"RIFF" && &w[8..12] == b"WAVE") {
-        let wav_slice = &body[riff_pos..];
+        // The RIFF size field bounds the file: inside multipart, the closing boundary follows it.
+        let riff_len = u32::from_le_bytes(body[riff_pos + 4..riff_pos + 8].try_into().unwrap()) as usize + 8;
+        let wav_slice = &body[riff_pos..(riff_pos + riff_len).min(body.len())];
         let mmproj_path = entry.path.parent().and_then(|dir| {
             std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
                 let p = e.path();

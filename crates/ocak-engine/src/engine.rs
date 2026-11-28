@@ -332,8 +332,11 @@ impl NativeEngine {
         let prompt_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         let prefill_eval_n = prompt_len - cache_n;
 
-        // Register full prompt pages in Radix tree right away
-        self.pager.insert_prefix(&tokens, &pages);
+        // Register full prompt pages in Radix tree right away (hybrid models never reuse a prefix:
+        // their recurrent state is not cached, so registering would only pin pages until evicted).
+        if !self.cfg.is_hybrid {
+            self.pager.insert_prefix(&tokens, &pages);
+        }
 
         let mut sampler = Sampler::new(req.sampler.clone());
         for &t in &tokens {
@@ -719,7 +722,9 @@ impl NativeEngine {
         }
 
         // Only cache tokens whose forward pass actually populated the KV cache!
-        self.pager.insert_prefix(&tokens[..eval_len.min(tokens.len())], &pages);
+        if !self.cfg.is_hybrid {
+            self.pager.insert_prefix(&tokens[..eval_len.min(tokens.len())], &pages);
+        }
         self.pager.release(&pages);
 
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;

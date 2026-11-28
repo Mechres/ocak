@@ -193,6 +193,18 @@ pub async fn http_request(
     content_type: &str,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
+    http_request_with_headers(addr, method, path, content_type, body, &[]).await
+}
+
+/// `http_request` with extra request headers (e.g. `Authorization`).
+pub async fn http_request_with_headers(
+    addr: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), String> {
     let connect_timeout = Duration::from_secs(10);
     let write_timeout = Duration::from_secs(30);
     let read_idle_timeout = Duration::from_secs(300);
@@ -200,8 +212,13 @@ pub async fn http_request(
         .await
         .map_err(|_| format!("connect {addr}: timed out"))?
         .map_err(|e| format!("connect {addr}: {e}"))?;
+    let extra: String = headers
+        .iter()
+        .filter(|(k, v)| !k.contains(['\r', '\n']) && !v.contains(['\r', '\n']))
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
         body.len()
     );
     tokio::time::timeout(write_timeout, async {

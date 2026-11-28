@@ -249,6 +249,9 @@ impl MtpDrafter {
             head_k,
             head_m,
         });
+        // The drafter now runs on the GPU with its own KV cache: drop the host one (2 * max_ctx
+        // rows, ~512 MB at long context) so it is neither kept nor zeroed on every reset().
+        self.kv = Vec::new();
         Ok(())
     }
 

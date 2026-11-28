@@ -1,6 +1,6 @@
 # Ocak
 
-**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 73 custom GLSL/SPIR-V shaders with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & host-memory GTT overflow)** and an **x86-64 CPU fallback** (compiled with AVX2/FMA target flags) — with zero CUDA or ROCm SDK required to build or run.
+**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 85 custom GLSL compute shaders (229 SPIR-V modules) with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & host-memory GTT overflow)** and an **x86-64 CPU fallback** (compiled with AVX2/FMA target flags) — with zero CUDA or ROCm SDK required to build or run.
 
 Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Radeon RX 6700 XT 12 GiB VRAM, Mesa RADV Vulkan 1.4**), Ocak runs dense, hybrid-recurrent, looped MoE, and hybrid GPU+CPU Mixture-of-Experts GGUF models natively from 1B up to 29B parameters while automatically curing AMD RDNA 2's 54W idle compute clock-lock bug.
 
@@ -8,8 +8,8 @@ Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Rade
 
 ## Highlights
 
-- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 73 hand-written GLSL shaders compiled at build time via `glslc` or `glslangValidator` — zero graphics/render middleware, `VK_KHR_push_descriptor` zero-allocation dispatch, hardware `subgroupClusteredAdd(32)` reductions, 100% coalesced super-block `qmv` decode & Wave32 GPU `argmax` (4-byte greedy readback), fused `add_rms_norm`, 8-row LDS shared-memory tiled `qmm` prefill across 8 formats & 4-row-per-lane `qmm2` speculative verify shaders, `HOST_VISIBLE` GTT tensor placement for >12 GiB MoE models, deferred parallel barriers with single `vkQueueSubmit` forward pass per token across dense, hybrid-recurrent, and MoE architectures, and full `VkDevice` teardown on idle sleep.
-- **Zero-copy GGUF v2/v3 & 20 Vulkan / 23 CPU quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
+- **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 85 hand-written GLSL shaders (229 SPIR-V modules with per-format variants) compiled in parallel at build time via `glslc` or `glslangValidator` — zero graphics/render middleware, `VK_KHR_push_descriptor` zero-allocation dispatch, hardware `subgroupClusteredAdd(32)` reductions, 100% coalesced super-block `qmv` decode & Wave32 GPU `argmax` (4-byte greedy readback), fused `add_rms_norm`, 8-row LDS shared-memory tiled `qmm` prefill across 8 formats, int8 dot-product prefill matmuls and flash-style attention, `HOST_VISIBLE` GTT tensor placement for >12 GiB MoE models, deferred parallel barriers with single `vkQueueSubmit` forward pass per token across dense, hybrid-recurrent, and MoE architectures, and full `VkDevice` teardown on idle sleep.
+- **Zero-copy GGUF v2/v3 & 20 Vulkan / 20 CPU quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
   - Vulkan + CPU (20): `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `NVFP4` (plus `Q4_1`, `Q5_0`, `Q5_1` on CPU).
 - **Native architectures (`ocak-engine`)**:
   - **Llama / Qwen2** (dense GQA + NeoX / adjacent RoPE; also runs `llama`-architecture MiniCPM GGUFs)
@@ -39,7 +39,7 @@ flowchart TD
     Server --> Fed["ocak-federation (libllama parity/ASR bridge, Mergen fleet, HIP probe)"]
     Engine --> KV["ocak-kv (16-tok Paged Radix Prefix Tree)"]
     Engine --> Tok["ocak-tok (SentencePiece, Byte-BPE, Templates, Thinking Cap, JSON Grammar)"]
-    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 73 GLSL/SPIR-V Shaders)"]
+    Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 85 GLSL shaders)"]
     Engine --> CPU["ocak-cpu (x86-64 CPU Fallback + Hybrid CPU MoE)"]
     Engine --> GGUF["ocak-gguf (Zero-Copy mmap GGUF v2/v3, Presets, .digest)"]
 ```
@@ -48,25 +48,26 @@ flowchart TD
 
 ## Verified Benchmarks (Ryzen 5 5600 + RX 6700 XT, Mesa RADV Vulkan 1.4)
 
-Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak parity-test`:
+Throughput from the GPU CI baseline ([`ci/bench-baseline.md`](ci/bench-baseline.md): `ocak bench --prompt-tokens 512 --decode-tokens 64`, re-measured on every push to `master`); parity cross-checked with `ocak parity-test` against the CPU path and `libllama.so`:
 
-| Model | Architecture | Size | Vulkan vs CPU `cos_sim` | Vulkan vs `libllama.so` `cos_sim` | Native Decode |
+| Model | Architecture | Size | Vulkan vs `libllama.so` `cos_sim` | Prefill (512 tok) | Decode |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| `tinyllama-1.1b-chat-v1.0.Q4_0` | `llama` | 0.59 GB | `1.000000` | `0.999894` | **184.1 tok/s** |
-| `tinyllama-1.1b-chat-v1.0.Q4_K_M` | `llama` | 0.62 GB | `1.000000` | `0.999802` | **143.7 tok/s** |
-| `LFM3-1.7B-AD-Q6_K` | `lfm3` (ShortConv + Gated SWA) | 1.48 GB | `1.000000` | *native-only* | **114.0 tok/s** *(459.4 prefill)* |
-| `minicpm5-2b-abliterated-Q4_K_M` | `llama` | 1.45 GB | `1.000000` | `0.999706` | **62.6 tok/s** *(143.0 prefill)* |
-| `LFM2.5-2.6B-Q4_K_M` | `lfm2` (ShortConv + GQA) | 1.56 GB | `1.000000` | `0.999716` (1-tok) | **52.3 tok/s** |
-| `Qwen3.5-4B-Q4_K_M` | `qwen35` (Gated DeltaNet + Attn) | 2.55 GB | `1.000000` | `0.999336` | **72.4 tok/s** *(216.5 prefill)* |
-| `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GB | `1.000000` | `0.999584` | **43.9 tok/s** *(199.4 prefill)* |
-| `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GB | — | greedy verified | **7.9 tok/s** *(12.2 prefill)* |
-| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + 2-tok GPU MTP) | 9.14 GB | — | lossless 2-tok MTP (59–85% acc) | **12.1–14.3 tok/s** *(31.2 prefill)* |
-| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, 1-submit batched 2D GPU, FP16 MLA KV) | 10.79 GB | — | greedy verified | **28.6 tok/s** |
-| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× Looped `NVFP4`/`Q8_0` MoE, FP16 KV) | 16.42 GB | — | greedy verified | **17.5 tok/s** |
-| `Qwen3-ASR-1.7B` | `qwen3a` + `qwen3vl` (Native Audio) | 2.35 GB | — | end-to-end WAV verified | **1.49 s / clip** |
+| `LFM3-1.7B-AD-Q6_K` | `lfm3` (ShortConv + Gated SWA) | 1.48 GiB | *native-only* | 4040.8 tok/s | **170.2 tok/s** |
+| `minicpm5-2b-abliterated-Q4_K_M` | `llama` | 1.45 GiB | `0.999706` | 2730.5 tok/s | **128.9 tok/s** |
+| `LFM2.5-2.6B-Q4_K_M` | `lfm2` (ShortConv + GQA) | 1.56 GiB | `0.999716` (1-tok) | 2624.5 tok/s | **155.5 tok/s** |
+| `Qwen3.5-4B-Q4_K_M` | `qwen35` (Gated DeltaNet + Attn) | 2.55 GiB | `0.999336` | 1836.9 tok/s | **96.2 tok/s** |
+| `Qwopus3.5-9B-coder-Exp-Q4_K_M` | `qwen35` (9B Hybrid) | 5.24 GiB | `0.999584` | 976.6 tok/s | **59.5 tok/s** |
+| `Ornith-1.5-9B-Q4_K_M` | `qwen35` (9B Hybrid + MTP) | 5.38 GiB | — | 840.8 tok/s | **68.7 tok/s** |
+| `Qwen3.8-27B-UD-IQ2_S` | `qwen35` (27B Hybrid, `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`) | 7.80 GiB | greedy verified | 296.7 tok/s | **34.6 tok/s** |
+| `RVN-IQ2_S-mtp` | `qwen35` (27B Hybrid + GPU MTP) | 9.14 GiB | lossless MTP | 266.9 tok/s | **40.2 tok/s** |
+| `Xing4.0-29B-A4B-IQ3_XXS` | `xing4_0` (29B MoE, MLA, FP16 KV) | 10.79 GiB | greedy verified | 987.1 tok/s | **38.2 tok/s** |
+| `Inkling-2-Mini-UD-Q4_K_XL` | `inkling2_loop` (26.4B 3× looped `NVFP4`/`Q8_0` MoE, FP16 KV) | 16.42 GiB | greedy verified | 592.9 tok/s | **18.4 tok/s** |
+| `Qwen3-ASR-1.7B` | `qwen3a` + `qwen3vl` (Native Audio) | 2.35 GiB | end-to-end WAV verified | — | **1.49 s / clip** |
 
-- **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`).
-- **1-submit-per-token batched 2D full-GPU MoE (`XingExec` & `InklingExec`)**: Zero per-layer CPU↔GPU fence waits, 2D `top_k`-batched MoE dispatches, deferred parallel barriers, and 3×-looped-core VRAM priority — `Xing4.0-29B-A4B` reaches **26.7 tok/s** decode / **26.6 tok/s** prefill (15.7× over initial hybrid path), and `Inkling-2-Mini` reaches **17.5 tok/s** decode / **17.4 tok/s** prefill (17.5× over initial path, outpacing `llama.cpp` on the same 12 GiB RX 6700 XT).
+Decode in the CI table is measured right after a 512-token prompt; short-prompt greedy decode is higher (e.g. Xing ~47 tok/s, Inkling ~25 tok/s), and MTP models gain further with `OCAK_MTP_DRAFTS`. `docs/PERFORMANCE.md` logs how each number was reached and what was tried and rejected.
+
+- **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`). Greedy output with MTP on and off is identical (lossless).
+- **1-submit-per-token batched full-GPU MoE (`XingExec` & `InklingExec`)**: zero per-layer CPU↔GPU fence waits, top-k-batched MoE dispatches, device-side greedy argmax, and 3×-looped-core VRAM priority for Inkling (experts that do not fit the 12 GiB card live in host-visible GTT memory).
 - **`WarmSleep` idle power check**: Active VRAM `1.79 GiB` -> `1.07 GiB` on teardown, RX 6700 XT power returns to **`29.0 W`** idle, automatic wake on next request in **`307 ms`**.
 - **Radix KV prefix cache**: Verified 100% prefix hit (`cache_n=48` on 48-token conversation prefix).
 
@@ -75,7 +76,7 @@ Measured natively on `ocak-vk` and cross-checked against `libllama.so` via `ocak
 ## Prerequisites & Build
 
 - **Rust** (`cargo`, `rustc` 1.80+)
-- **Vulkan 1.3+ runtime & driver** (e.g., Mesa RADV on AMD, NVIDIA Vulkan, Intel ANV)
+- **Vulkan 1.3+ runtime & driver** with 32-wide (or wider) subgroups. Developed and tested on Mesa RADV (AMD RDNA2); the kernels assume Wave32 reductions (`subgroupClusteredAdd(..., 32)`), so other drivers are untested and devices reporting a subgroup size below 32 are rejected
 - **Shader compiler**: `glslc` (`shaderc`) or `glslangValidator` (`glslang-tools`)
 
 ```bash
@@ -142,7 +143,7 @@ cargo test --release --workspace
 | `crates/ocak-kv` | 16-token paged KV allocator + Radix prefix tree (plus standalone `CompressedKvStore` module) |
 | `crates/ocak-tok` | SentencePiece & byte-level BPE tokenizers, chat templates (ChatML/Llama2/3/Zephyr/Xing/Inkling), `<think>` budget, JSON grammar |
 | `crates/ocak-cpu` | x86-64 CPU quantized GEMV (compiled with AVX2/FMA target flags) and hybrid transformer ops |
-| `crates/ocak-vk` | Raw `ash` Vulkan 1.3/1.4 compute runtime + 73 GLSL/SPIR-V shaders (20 GPU weight quant formats + `qmm`/`qmm2`) |
+| `crates/ocak-vk` | Raw `ash` Vulkan 1.3/1.4 compute runtime + 85 GLSL compute shaders (20 GPU weight quant formats) |
 | `crates/ocak-hip` | Experimental standalone `dlopen("libamdhip64.so")` HSACO probe/launcher crate (not wired into engine) |
 | `crates/ocak-engine` | Native executors (`VkExec`, `CpuExec`, `XingExec`, `InklingExec`), `MtpDrafter`, sampler & generator |
 | `crates/ocak-federation` | `libllama.so` parity oracle, managed bridge, `mergen` fleet bridge, HIP `dlopen` probe |

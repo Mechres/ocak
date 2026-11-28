@@ -31,4 +31,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::type_complexity -D warnings
 
       - name: Unit tests (CPU / non-GPU crates)
-        run: cargo test --workspace --exclude ocak-vk --exclude ocak-engine --exclude ocak-server
+        # ocak-vk needs a GPU; ocak-server's end-to-end tests need models (both run on the GPU
+        # runner after every push), but its pure unit tests run here.
+        run: |
+          cargo test --workspace --exclude ocak-vk --exclude ocak-server
+          cargo test -p ocak-server --lib loopback

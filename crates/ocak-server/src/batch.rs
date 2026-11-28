@@ -120,6 +120,10 @@ impl BatchCoordinator {
                         true
                     }
                 });
+                if let Ok(gr) = &res {
+                    st.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
+                    st.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
+                }
                 let _ = first_job.done_tx.send(res.map_err(|e| e.to_string()));
                 st.governor.blocking_lock().touch(&target_model, Instant::now());
                 continue;

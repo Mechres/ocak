@@ -35,6 +35,7 @@ jobs:
 
       - name: Benchmark
         run: |
+          set -o pipefail   # a crashed `ocak bench` must fail the step, not vanish behind tee
           bench() { cargo run --release --bin ocak -- bench --prompt-tokens 512 --decode-tokens 64; }
           bench | tee bench.md
           runs="bench.md"

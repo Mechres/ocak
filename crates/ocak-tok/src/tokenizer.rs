@@ -23,8 +23,12 @@ pub struct Tokenizer {
     scores: Vec<f32>,
     token_types: Vec<i32>,
     tok_to_id: FxHashMap<String, u32>,
-    merges: FxHashMap<(String, String), usize>,
+    /// BPE merge ranks as left -> right -> rank (looked up with `&str` keys, no allocation).
+    merges: FxHashMap<String, FxHashMap<String, usize>>,
     specials: Vec<(String, u32)>,
+    /// Bytes that start some special token (a special can only begin at such a byte, which is
+    /// always a UTF-8 char boundary).
+    special_first: [bool; 256],
     byte_tokens: [Option<u32>; 256],
     bos: Option<u32>,
     eos: Option<u32>,
@@ -106,12 +110,16 @@ impl Tokenizer {
         }
         // Longest-first for greedy special-token matching
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        let mut special_first = [false; 256];
+        for (sp, _) in &specials {
+            special_first[sp.as_bytes()[0] as usize] = true;
+        }
 
         let mut merges = FxHashMap::default();
         if let Some(ms) = g.strings("tokenizer.ggml.merges") {
             for (rank, m) in ms.iter().enumerate() {
                 if let Some((a, b)) = m.split_once(' ') {
-                    merges.insert((a.to_string(), b.to_string()), rank);
+                    merges.entry(a.to_string()).or_insert_with(FxHashMap::default).insert(b.to_string(), rank);
                 }
             }
         }
@@ -155,6 +163,7 @@ impl Tokenizer {
             tok_to_id,
             merges,
             specials,
+            special_first,
             byte_tokens,
             bos,
             eos,
@@ -217,10 +226,12 @@ impl Tokenizer {
         while pos < text.len() {
             let rest = &text[pos..];
             let mut matched: Option<(usize, u32)> = None;
-            for (sp, id) in &self.specials {
-                if rest.starts_with(sp.as_str()) {
-                    matched = Some((sp.len(), *id));
-                    break;
+            if self.special_first[rest.as_bytes()[0] as usize] {
+                for (sp, id) in &self.specials {
+                    if rest.starts_with(sp.as_str()) {
+                        matched = Some((sp.len(), *id));
+                        break;
+                    }
                 }
             }
             if let Some((len, id)) = matched {
@@ -232,8 +243,10 @@ impl Tokenizer {
                 seg_start = pos;
                 first_fragment = false;
             } else {
+                // Skip to the next byte that can start a special token.
                 let ch_len = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                 pos += ch_len;
+                pos += text.as_bytes()[pos..].iter().position(|&b| self.special_first[b as usize]).unwrap_or(text.len() - pos);
             }
         }
         if seg_start < text.len() {
@@ -409,7 +422,7 @@ impl Tokenizer {
                     if l == NONE || r == NONE || !nodes[l].alive || !nodes[r].alive {
                         return;
                     }
-                    if let Some(&rank) = self.merges.get(&(nodes[l].sym.clone(), nodes[r].sym.clone())) {
+                    if let Some(&rank) = self.merges.get(nodes[l].sym.as_str()).and_then(|m| m.get(nodes[r].sym.as_str())) {
                         heap.push(Reverse((rank, l, r, nodes[l].gen, nodes[r].gen)));
                     }
                 };

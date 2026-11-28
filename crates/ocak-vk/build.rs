@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::process::Command;
 
 fn main() {
@@ -58,10 +59,7 @@ fn main() {
         "inkling_attn_split",
         "inkling_attn_merge",
         "moe_topk",
-        "qmv_iq3_xxs_id",
-        "qmv_iq3_s_id",
         "qmv_nvfp4_id",
-        "qmv_q8_0_id",
         "qmv_q4_k_id",
         "situ_id",
         "add_scaled_id",
@@ -81,10 +79,6 @@ fn main() {
         "qmm_iq2_xs",
         "qmm_iq3_xxs",
         "qmm_iq3_s",
-        "qmm2_iq2_xs",
-        "qmm2_q4_k",
-        "qmm2_q5_k",
-        "qmm2_iq3_s",
         "argmax",
         "sum_splits",
         "moe_group",
@@ -100,27 +94,12 @@ fn main() {
     if !has_glslc && !has_usr_glslc && !has_glslang {
         panic!("neither `glslc` (shaderc) nor `glslangValidator` (glslang-tools) found in PATH");
     }
+    // All modules are collected as jobs (output name, source, defines) and compiled in parallel.
+    let mut jobs: Vec<(String, String, Vec<String>)> = Vec::new();
     for name in shaders {
         let src = format!("shaders/{name}.comp");
         println!("cargo:rerun-if-changed={src}");
-        let dst = out_dir.join(format!("{name}.spv"));
-        let status = if has_glslc || has_usr_glslc {
-            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
-            Command::new(bin)
-                .args(["--target-env=vulkan1.3", "-O", &src, "-o"])
-                .arg(&dst)
-                .status()
-                .expect("failed to invoke glslc")
-        } else {
-            Command::new("glslangValidator")
-                .args(["-V", "--target-env", "vulkan1.3", "-o"])
-                .arg(&dst)
-                .arg(&src)
-                .status()
-                .expect("failed to invoke glslangValidator")
-        };
-        assert!(status.success(), "shader compilation failed on {src}");
-        let _ = fs::metadata(&dst).expect("spv missing");
+        jobs.push((name.to_string(), src, Vec::new()));
     }
     // Sources compiled several times with different defines: (output name, source, defines).
     println!("cargo:rerun-if-changed=shaders/dequant_i8.glsl");
@@ -201,22 +180,7 @@ fn main() {
     ];
     for (name, src, defs) in variants {
         println!("cargo:rerun-if-changed={src}");
-        let dst = out_dir.join(format!("{name}.spv"));
-        let status = if has_glslc || has_usr_glslc {
-            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
-            let st = Command::new(bin).args(["--target-env=vulkan1.3", "-O"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc");
-            if st.success() {
-                st
-            } else {
-                // Older spirv-opt builds reject newer capabilities (e.g. the VALVE mixed-float dot
-                // in the *_f2 attention variants): fall back to an unoptimized module.
-                println!("cargo:warning=glslc -O failed on {name}; retrying without optimization");
-                Command::new(bin).args(["--target-env=vulkan1.3"]).args(defs).args([src, "-o"]).arg(&dst).status().expect("failed to invoke glslc")
-            }
-        } else {
-            Command::new("glslangValidator").args(["-V", "--target-env", "vulkan1.3"]).args(defs).arg("-o").arg(&dst).arg(src).status().expect("failed to invoke glslangValidator")
-        };
-        assert!(status.success(), "shader compilation failed on {src} ({name})");
+        jobs.push((name.to_string(), src.to_string(), defs.iter().map(|d| d.to_string()).collect()));
     }
     // One tiled-prefill matmul source, specialised per weight format.
     let tiled = [
@@ -239,24 +203,50 @@ fn main() {
             3 => "shaders/qmv_id_multi.comp",
             _ => src,
         };
-        let dst = out_dir.join(format!("{prefix}_{name}.spv"));
-        let define = format!("-D{def}");
         let gdef = if kind == 1 { "-DGROUPED" } else { "-DUNGROUPED" };
-        let status = if has_glslc || has_usr_glslc {
-            let bin = if has_glslc { "glslc" } else { "/usr/bin/glslc" };
-            Command::new(bin)
-                .args(["--target-env=vulkan1.3", "-O", &define, gdef, src, "-o"])
-                .arg(&dst)
-                .status()
-                .expect("failed to invoke glslc")
-        } else {
-            Command::new("glslangValidator")
-                .args(["-V", "--target-env", "vulkan1.3", &define, gdef, "-o"])
-                .arg(&dst)
-                .arg(src)
-                .status()
-                .expect("failed to invoke glslangValidator")
-        };
-        assert!(status.success(), "shader compilation failed on {src} ({def})");
+        jobs.push((format!("{prefix}_{name}"), src.to_string(), vec![format!("-D{def}"), gdef.to_string()]));
     }
+
+    let compiler = if has_glslc {
+        Compiler::Glslc("glslc")
+    } else if has_usr_glslc {
+        Compiler::Glslc("/usr/bin/glslc")
+    } else {
+        Compiler::Glslang
+    };
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len().max(1));
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some((name, src, defs)) = jobs.get(i) else { break };
+                compile(&compiler, name, src, defs, &out_dir.join(format!("{name}.spv")));
+            });
+        }
+    });
+}
+
+enum Compiler {
+    Glslc(&'static str),
+    Glslang,
+}
+
+fn compile(c: &Compiler, name: &str, src: &str, defs: &[String], dst: &Path) {
+    let status = match c {
+        Compiler::Glslc(bin) => {
+            let st = Command::new(bin).args(["--target-env=vulkan1.3", "-O"]).args(defs).args([src, "-o"]).arg(dst).status().expect("failed to invoke glslc");
+            if st.success() {
+                st
+            } else {
+                // Older spirv-opt builds reject newer capabilities (e.g. the VALVE mixed-float dot
+                // in the *_f2 attention variants): fall back to an unoptimized module.
+                println!("cargo:warning=glslc -O failed on {name}; retrying without optimization");
+                Command::new(bin).args(["--target-env=vulkan1.3"]).args(defs).args([src, "-o"]).arg(dst).status().expect("failed to invoke glslc")
+            }
+        }
+        Compiler::Glslang => Command::new("glslangValidator").args(["-V", "--target-env", "vulkan1.3"]).args(defs).arg("-o").arg(dst).arg(src).status().expect("failed to invoke glslangValidator"),
+    };
+    assert!(status.success(), "shader compilation failed on {src} ({name})");
+    let _ = fs::metadata(dst).expect("spv missing");
 }

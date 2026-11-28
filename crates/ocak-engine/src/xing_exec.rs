@@ -189,6 +189,8 @@ struct XingGpuState {
     out_norm: Buffer,
     hidden_buf: Buffer,
     logits_buf: Buffer,
+    /// Device-side greedy pick (`forward_argmax`).
+    argmax_buf: Buffer,
     moe_tmp: Buffer,
     /// Per-expert entry lists for the grouped MoE matmul (moe_group.comp layout).
     moe_list: Buffer,
@@ -574,7 +576,7 @@ impl XingExec {
                         mk(pb * cfg.n_expert), mk(pb * cfg.n_used), mk(pb * cfg.n_used), upload_f32_buf(c, &zero_b),
                         upload_f32_buf(c, &out_norm), mk(cfg.n_embd), mk(cfg.n_vocab), mk(pb * cfg.n_used * cfg.n_embd),
                         mk(cfg.n_expert.max(1) * (pb + 1)),
-                        upload_f32_buf(c, &head_ids_v),
+                        upload_f32_buf(c, &head_ids_v), mk(4),
                     ) {
                         (
                             Some(ones), Some(streams_a), Some(streams_b), Some(streams_norm),
@@ -585,11 +587,11 @@ impl XingExec {
                             Some(router_logits), Some(top_ids), Some(top_w), Some(dummy_bias),
                             Some(out_norm_b), Some(hidden_buf), Some(logits_buf), Some(moe_tmp),
                             Some(moe_list),
-                            Some(head_ids),
+                            Some(head_ids), Some(argmax_buf),
                         ) => Some(XingGpuState {
                             layers: g_layers, ones, streams_a, streams_b, streams_norm, hc_mixes, hc_out,
                             inp, normed, block_out, q_a, q_an, kv_raw, q_full, q_lat, attn_lat, val_all,
-                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, moe_tmp, moe_list, head_ids,
+                            kv_cache, router_logits, top_ids, top_w, dummy_bias, out_norm: out_norm_b, hidden_buf, logits_buf, argmax_buf, moe_tmp, moe_list, head_ids,
                         }),
                         _ => None,
                     }
@@ -777,6 +779,325 @@ impl Executor for XingExec {
     }
 
     fn forward(&mut self, token: u32, pos: usize, _page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        self.forward_inner(token, pos, out, false).map(|_| ())
+    }
+
+    /// Greedy decode with the argmax on the device (only the index crosses PCIe). `None` (caller
+    /// falls back to `forward`) unless the whole forward runs on the GPU pipeline.
+    fn forward_argmax(&mut self, token: u32, pos: usize, _page_table: &[u32]) -> Result<Option<u32>, EngineError> {
+        #[cfg(feature = "vulkan")]
+        {
+            if self.vk.is_some() && self.gpu_pipe.is_some() && self.vk_g.is_some() && self.vk_u.is_some() && self.vk_a.is_some() && self.vk_output.is_some() {
+                if pos >= self.max_ctx {
+                    return Err(EngineError::Context(format!("pos {pos} >= max_ctx {}", self.max_ctx)));
+                }
+                return self.forward_inner(token, pos, Out { logits: true, hidden: false }, true);
+            }
+        }
+        let _ = (token, pos);
+        Ok(None)
+    }
+
+    fn logits(&self) -> &[f32] { &self.logits }
+    fn hidden(&self) -> &[f32] { &self.hidden }
+
+    fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
+        if tokens.len() <= 1 {
+            if let Some(&tok) = tokens.first() {
+                return self.forward(tok, pos0, page_table, out);
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "vulkan")]
+        if self.gpu_pipe.is_some() && self.vk.is_some() && self.vk_output.is_some() {
+            if pos0 + tokens.len() > self.max_ctx {
+                return Err(EngineError::Context(format!(
+                    "pos {} >= max_ctx {}",
+                    pos0 + tokens.len() - 1,
+                    self.max_ctx
+                )));
+            }
+            let mut off = 0usize;
+            while off < tokens.len() {
+                let chunk = &tokens[off..(off + XING_PREFILL_BATCH).min(tokens.len())];
+                let is_last = off + chunk.len() == tokens.len();
+                self.forward_batch_gpu_chunk(
+                    chunk,
+                    pos0 + off,
+                    Out { logits: is_last && out.logits, hidden: is_last && out.hidden },
+                )?;
+                off += chunk.len();
+            }
+            return Ok(());
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            let is_last = i + 1 == tokens.len();
+            self.forward(tok, pos0 + i, page_table, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn qmmt_ok(ty: ocak_vk::WType) -> bool {
+    ocak_vk::has_tiled_qmm(ty)
+}
+
+#[cfg(feature = "vulkan")]
+impl XingExec {
+    fn forward_batch_gpu_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
+        let c = self.cfg.clone();
+        let (ne, nh, latent, n_rot, nope, vdim) = (c.n_embd, c.n_head, c.kv_rank, c.n_rot, c.key_dim - c.n_rot, c.value_dim);
+        let hd = latent + n_rot;
+        let bs = chunk.len();
+        let batch = bs as u32;
+        let yarn = c.rope_factor > 1.0;
+        // Same as `forward`: yarn_log_mul is already the true multiplier (see the config load).
+        let mscale = if yarn { 1.0 + 0.1 * c.yarn_log_mul * c.rope_factor.ln() } else { 1.0 };
+        let kq_scale = mscale * mscale / (c.key_dim as f32).sqrt();
+
+        let rb = self.embd.row_bytes();
+        let emb_raw = self.g.tensor_data(&self.embd);
+        let mut streams = vec![0f32; bs * 4 * ne];
+        let mut emb = vec![0f32; ne];
+        for (t, &tok) in chunk.iter().enumerate() {
+            let r = tok as usize;
+            dequantize_row(self.embd.ty, &emb_raw[r * rb..(r + 1) * rb], &mut emb, ne);
+            for h in 0..4 {
+                let dst = (t * 4 + h) * ne;
+                streams[dst..dst + ne].copy_from_slice(&emb);
+            }
+        }
+
+        let (Some(c_vk), Some(gp), Some(bg), Some(bu), Some(ba), Some(vout)) = (
+            &self.vk, &self.gpu_pipe, &self.vk_g, &self.vk_u, &self.vk_a, &self.vk_output,
+        ) else {
+            return Err(EngineError::Backend("xing gpu_pipe unavailable".into()));
+        };
+
+        c_vk.upload(&gp.streams_a, 0, bytemuck::cast_slice(&streams)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let corr_dim = |n_r: f32| -> f32 {
+            (n_rot as f32 * (c.rope_orig_ctx as f32 / (n_r * 2.0 * std::f32::consts::PI)).ln())
+                / (2.0 * c.rope_base.ln())
+        };
+        let low = corr_dim(c.yarn_beta_fast).floor().max(0.0);
+        let high = corr_dim(c.yarn_beta_slow).ceil().min((n_rot - 1) as f32);
+        let attn_factor = if yarn { 1.0 / (1.0 + 0.1 * c.rope_factor.ln()) } else { 1.0 };
+        let rope_mscale = if yarn { (1.0 + 0.1 * c.rope_factor.ln()) * attn_factor } else { 1.0 };
+
+        let mut rec = c_vk.begin();
+        rec.set_defer_barriers(true);
+        let mut cur_a = true;
+        for li in 0..c.n_layer {
+            if li > 0 && li % XING_LAYERS_PER_SUBMIT == 0 {
+                rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+                rec = c_vk.begin();
+                rec.set_defer_barriers(true);
+            }
+            let l = &self.layers[li];
+            let gl = &gp.layers[li];
+            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+
+            // 1. HC pre (attn)
+            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
+            rec.barrier();
+            rec.qmm(gl.hc_attn_fn.ty, &gl.hc_attn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_attn_fn.k, gl.hc_attn_fn.m, batch);
+            rec.barrier();
+            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_attn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
+            rec.barrier();
+
+            // 2. MLA Attention (batched projections + causal batched attention)
+            rec.rms_norm_batch(&gp.inp, 0, &gl.attn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
+            rec.barrier();
+            let va = l.vk_wq_a.as_ref().unwrap();
+            let vkva = l.vk_wkv_a.as_ref().unwrap();
+            let vqb = l.vk_wq_b.as_ref().unwrap();
+            let vkb = l.vk_wk_b.as_ref().unwrap();
+            let vvb = l.vk_wv_b.as_ref().unwrap();
+            let vwo = l.vk_wo.as_ref().unwrap();
+            rec.qmm(va.ty, &va.buf, 0, &gp.normed, 0, &gp.q_a, 0, va.k, va.m, batch);
+            rec.qmm(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m, batch);
+            rec.barrier();
+            rec.rms_norm_batch(&gp.q_a, 0, &gl.q_a_norm, 0, &gp.q_an, 0, c.q_rank as u32, c.eps, batch);
+            rec.rms_norm_batch_strided(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_raw, 0, latent as u32, hd as u32, c.eps, batch);
+            rec.barrier();
+            rec.qmm(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m, batch);
+            rec.barrier();
+            let kv_layer_off = (li * self.max_ctx * (hd / 2)) as u32;
+            rec.rope_yarn_mla_batch(
+                &gp.q_full, &gp.kv_raw, &gp.kv_cache,
+                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                pos0 as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale, batch,
+            );
+            rec.barrier();
+            // Per-head absorbed K projection: one grouped matmul (group = head, entry = t*nh + h).
+            if !rec.qmm_grouped(vkb.ty, &vkb.buf, 0, vkb.slice_bytes, &gp.q_full, 0, c.key_dim as u32, 1, batch * nh as u32, &gp.q_lat, 0, vkb.k, vkb.m, nh as u32, None, batch) {
+                for t in 0..bs {
+                    for h in 0..nh {
+                        rec.qmv(
+                            vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes,
+                            &gp.q_full, ((t * nh + h) * c.key_dim) as u64,
+                            &gp.q_lat, ((t * nh + h) * latent) as u64,
+                            vkb.k, vkb.m,
+                        );
+                    }
+                }
+            }
+            rec.barrier();
+            rec.mla_attn_batch(
+                &gp.q_lat, &gp.q_full, &gp.kv_cache, &gp.attn_lat,
+                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
+                pos0 as u32, kv_layer_off, kq_scale, batch,
+            );
+            rec.barrier();
+            if !rec.qmm_grouped(vvb.ty, &vvb.buf, 0, vvb.slice_bytes, &gp.attn_lat, 0, latent as u32, 1, batch * nh as u32, &gp.val_all, 0, vvb.k, vvb.m, nh as u32, None, batch) {
+                for t in 0..bs {
+                    for h in 0..nh {
+                        rec.qmv(
+                            vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes,
+                            &gp.attn_lat, ((t * nh + h) * latent) as u64,
+                            &gp.val_all, ((t * nh + h) * vdim) as u64,
+                            vvb.k, vvb.m,
+                        );
+                    }
+                }
+            }
+            rec.barrier();
+            rec.qmm(vwo.ty, &vwo.buf, 0, &gp.val_all, 0, &gp.block_out, 0, vwo.k, vwo.m, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
+            rec.barrier();
+            cur_a = !cur_a;
+
+            // 3. HC pre (FFN)
+            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
+            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
+            rec.barrier();
+            rec.qmm(gl.hc_ffn_fn.ty, &gl.hc_ffn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_ffn_fn.k, gl.hc_ffn_fn.m, batch);
+            rec.barrier();
+            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_ffn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
+            rec.barrier();
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
+            rec.barrier();
+            rec.rms_norm_batch(&gp.inp, 0, &gl.ffn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
+            rec.barrier();
+
+            // 4. Dense or MoE FFN
+            match &l.ffn {
+                XingFfn::Dense { vk_gate, vk_up, vk_down, .. } => {
+                    let (vg, vu, vd) = (vk_gate.as_ref().unwrap(), vk_up.as_ref().unwrap(), vk_down.as_ref().unwrap());
+                    rec.qmm(vg.ty, &vg.buf, 0, &gp.normed, 0, bg, 0, vg.k, vg.m, batch);
+                    rec.qmm(vu.ty, &vu.buf, 0, &gp.normed, 0, bu, 0, vu.k, vu.m, batch);
+                    rec.barrier();
+                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * c.n_ff_dense as u32);
+                    rec.barrier();
+                    rec.qmm(vd.ty, &vd.buf, 0, ba, 0, &gp.block_out, 0, vd.k, vd.m, batch);
+                    rec.barrier();
+                }
+                XingFfn::Moe { vk_gate_exps, vk_up_exps, vk_down_exps, vk_gate_sh, vk_up_sh, vk_down_sh, .. } => {
+                    let vgi = gl.gate_inp.as_ref().unwrap();
+                    let (vgs, vus, vds) = (vk_gate_sh.as_ref().unwrap(), vk_up_sh.as_ref().unwrap(), vk_down_sh.as_ref().unwrap());
+                    let sh_off = (bs * c.n_used * c.n_ff_exp) as u64;
+                    rec.qmm(vgi.ty, &vgi.buf, 0, &gp.normed, 0, &gp.router_logits, 0, vgi.k, vgi.m, batch);
+                    rec.qmm(vgs.ty, &vgs.buf, 0, &gp.normed, 0, bg, sh_off, vgs.k, vgs.m, batch);
+                    rec.qmm(vus.ty, &vus.buf, 0, &gp.normed, 0, bu, sh_off, vus.k, vus.m, batch);
+                    rec.barrier();
+                    let (bias_buf, has_bias) = match &gl.exp_probs_b {
+                        Some(b) => (b, true),
+                        None => (&gp.dummy_bias, false),
+                    };
+                    let n_used = c.n_used as u32;
+                    rec.moe_topk_batch(&gp.router_logits, bias_buf, &gp.top_ids, &gp.top_w, c.n_expert as u32, n_used, has_bias, c.exp_weights_norm, c.exp_weights_scale, batch);
+                    rec.swiglu(bg, sh_off, bu, sh_off, ba, sh_off, batch * c.n_ff_exp as u32);
+                    rec.barrier();
+                    let (vg, vu, vd) = (vk_gate_exps.as_ref().unwrap(), vk_up_exps.as_ref().unwrap(), vk_down_exps.as_ref().unwrap());
+                    // Shared down (batched qmm) + all B tokens' routed gate/up in parallel!
+                    rec.qmm(vds.ty, &vds.buf, 0, ba, sh_off, &gp.block_out, 0, vds.k, vds.m, batch);
+                    // Routed experts: bucket the bs*n_used (token, slot) entries by expert, then one
+                    // grouped tiled matmul per projection (each expert's weights read once per tile).
+                    let grouped = qmmt_ok(vg.ty) && qmmt_ok(vu.ty) && qmmt_ok(vd.ty) && c.n_expert <= 256;
+                    let n_exp = c.n_expert as u32;
+                    // GTT-resident experts: one DMA copy per tensor into VRAM staging.
+                    let staged: Option<[&Buffer; 3]> = match &self.moe_stage {
+                        Some(st) if grouped && vg.in_gtt => {
+                            for (src, dst) in [(vg, &st[0]), (vu, &st[1]), (vd, &st[2])] {
+                                rec.copy_buf_bytes(&src.buf, dst, src.slice_bytes * c.n_expert as u64);
+                            }
+                            Some([&st[0], &st[1], &st[2]])
+                        }
+                        _ => None,
+                    };
+                    let (wg_buf, wu_buf, wd_buf) = match staged {
+                        Some([a, b, d]) => (a, b, d),
+                        None => (&vg.buf, &vu.buf, &vd.buf),
+                    };
+                    if grouped {
+                        rec.barrier();
+                        rec.moe_group(&gp.top_ids, &gp.moe_list, batch * n_used, n_exp, batch);
+                        rec.barrier();
+                        rec.qmm_grouped(vg.ty, wg_buf, 0, vg.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bg, 0, vg.k, vg.m, n_exp, Some(&gp.moe_list), batch);
+                        rec.qmm_grouped(vu.ty, wu_buf, 0, vu.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bu, 0, vu.k, vu.m, n_exp, Some(&gp.moe_list), batch);
+                    } else {
+                        for t in 0..bs {
+                            let slot_base = (t * c.n_used) as u32;
+                            let y_off = (t * c.n_used * c.n_ff_exp) as u64;
+                            rec.qmv_id_batch(vg.ty, &vg.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bg, y_off, vg.k, vg.m, vg.slice_bytes);
+                            rec.qmv_id_batch(vu.ty, &vu.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bu, y_off, vu.k, vu.m, vu.slice_bytes);
+                        }
+                    }
+                    rec.barrier();
+                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * n_used * c.n_ff_exp as u32);
+                    rec.barrier();
+                    if grouped {
+                        rec.qmm_grouped(vd.ty, wd_buf, 0, vd.slice_bytes, ba, 0, c.n_ff_exp as u32, 1, batch * n_used, &gp.moe_tmp, 0, vd.k, vd.m, n_exp, Some(&gp.moe_list), batch);
+                    } else {
+                        for t in 0..bs {
+                            let slot_base = (t * c.n_used) as u32;
+                            let a_off = (t * c.n_used * c.n_ff_exp) as u64;
+                            let tmp_off = (t * c.n_used * ne) as u64;
+                            rec.qmv_id_batch(vd.ty, &vd.buf, &gp.top_ids, slot_base, n_used, ba, a_off, c.n_ff_exp as u32, &gp.moe_tmp, tmp_off, vd.k, vd.m, vd.slice_bytes);
+                        }
+                    }
+                    rec.barrier();
+                    rec.add_scaled_id_tokens(&gp.block_out, 0, &gp.moe_tmp, 0, &gp.top_w, ne as u32, 0, n_used, false, batch);
+                    rec.barrier();
+                }
+            }
+            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
+            rec.barrier();
+            cur_a = !cur_a;
+        }
+
+        let st_final = if cur_a { &gp.streams_a } else { &gp.streams_b };
+        if out.logits || out.hidden {
+            rec.hc_mix_batch(st_final, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 2, batch);
+            rec.barrier();
+            let last_off = ((bs - 1) * ne) as u64;
+            rec.rms_norm(&gp.inp, last_off, &gp.out_norm, 0, &gp.hidden_buf, 0, ne as u32, c.eps);
+            rec.barrier();
+        }
+        if out.logits {
+            rec.qmv(vout.ty, &vout.buf, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, vout.k, vout.m);
+            rec.barrier();
+        }
+        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+        if out.hidden {
+            c_vk.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        if out.logits {
+            c_vk.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl XingExec {
+    /// Single-token forward; with `argmax` (GPU pipeline only) returns the greedy token instead
+    /// of reading back logits.
+    fn forward_inner(&mut self, token: u32, pos: usize, out: Out, argmax: bool) -> Result<Option<u32>, EngineError> {
+        let _ = argmax;
         if pos >= self.max_ctx {
             return Err(EngineError::Context(format!("pos {pos} >= max_ctx {}", self.max_ctx)));
         }
@@ -945,14 +1266,23 @@ impl Executor for XingExec {
                 rec.qmv(vout.ty, &vout.buf, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, vout.k, vout.m);
                 rec.barrier();
             }
-            rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
+            if argmax {
+                rec.argmax(&gp.logits_buf, 0, &gp.argmax_buf, c.n_vocab as u32);
+                rec.barrier();
+                let mut idx = [0u32; 1];
+                rec.finish_and_read(&mut [(&gp.argmax_buf, 0, bytemuck::cast_slice_mut(&mut idx))]).map_err(|e| EngineError::Backend(e.to_string()))?;
+                return Ok(Some(idx[0]));
+            }
+            // Read back inside the same submit (no separate download submits).
+            let mut reads: Vec<(&Buffer, u64, &mut [u8])> = Vec::with_capacity(2);
             if out.hidden {
-                c_vk.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                reads.push((&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)));
             }
             if out.logits {
-                c_vk.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+                reads.push((&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)));
             }
-            return Ok(());
+            rec.finish_and_read(&mut reads).map_err(|e| EngineError::Backend(e.to_string()))?;
+            return Ok(None);
         }
 
         let mut normed = vec![0f32; ne];
@@ -1318,301 +1648,7 @@ impl Executor for XingExec {
             self.mv_cpu(&self.output, 0, &h, &mut lg);
             self.logits = lg;
         }
-        Ok(())
-    }
-
-    fn logits(&self) -> &[f32] { &self.logits }
-    fn hidden(&self) -> &[f32] { &self.hidden }
-
-    fn forward_batch(&mut self, tokens: &[u32], pos0: usize, page_table: &[u32], out: Out) -> Result<(), EngineError> {
-        if tokens.len() <= 1 {
-            if let Some(&tok) = tokens.first() {
-                return self.forward(tok, pos0, page_table, out);
-            }
-            return Ok(());
-        }
-        #[cfg(feature = "vulkan")]
-        if self.gpu_pipe.is_some() && self.vk.is_some() && self.vk_output.is_some() {
-            if pos0 + tokens.len() > self.max_ctx {
-                return Err(EngineError::Context(format!(
-                    "pos {} >= max_ctx {}",
-                    pos0 + tokens.len() - 1,
-                    self.max_ctx
-                )));
-            }
-            let mut off = 0usize;
-            while off < tokens.len() {
-                let chunk = &tokens[off..(off + XING_PREFILL_BATCH).min(tokens.len())];
-                let is_last = off + chunk.len() == tokens.len();
-                self.forward_batch_gpu_chunk(
-                    chunk,
-                    pos0 + off,
-                    Out { logits: is_last && out.logits, hidden: is_last && out.hidden },
-                )?;
-                off += chunk.len();
-            }
-            return Ok(());
-        }
-        for (i, &tok) in tokens.iter().enumerate() {
-            let is_last = i + 1 == tokens.len();
-            self.forward(tok, pos0 + i, page_table, Out { logits: is_last && out.logits, hidden: is_last && out.hidden })?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "vulkan")]
-fn qmmt_ok(ty: ocak_vk::WType) -> bool {
-    ocak_vk::has_tiled_qmm(ty)
-}
-
-#[cfg(feature = "vulkan")]
-impl XingExec {
-    fn forward_batch_gpu_chunk(&mut self, chunk: &[u32], pos0: usize, out: Out) -> Result<(), EngineError> {
-        let c = self.cfg.clone();
-        let (ne, nh, latent, n_rot, nope, vdim) = (c.n_embd, c.n_head, c.kv_rank, c.n_rot, c.key_dim - c.n_rot, c.value_dim);
-        let hd = latent + n_rot;
-        let bs = chunk.len();
-        let batch = bs as u32;
-        let yarn = c.rope_factor > 1.0;
-        // Same as `forward`: yarn_log_mul is already the true multiplier (see the config load).
-        let mscale = if yarn { 1.0 + 0.1 * c.yarn_log_mul * c.rope_factor.ln() } else { 1.0 };
-        let kq_scale = mscale * mscale / (c.key_dim as f32).sqrt();
-
-        let rb = self.embd.row_bytes();
-        let emb_raw = self.g.tensor_data(&self.embd);
-        let mut streams = vec![0f32; bs * 4 * ne];
-        let mut emb = vec![0f32; ne];
-        for (t, &tok) in chunk.iter().enumerate() {
-            let r = tok as usize;
-            dequantize_row(self.embd.ty, &emb_raw[r * rb..(r + 1) * rb], &mut emb, ne);
-            for h in 0..4 {
-                let dst = (t * 4 + h) * ne;
-                streams[dst..dst + ne].copy_from_slice(&emb);
-            }
-        }
-
-        let (Some(c_vk), Some(gp), Some(bg), Some(bu), Some(ba), Some(vout)) = (
-            &self.vk, &self.gpu_pipe, &self.vk_g, &self.vk_u, &self.vk_a, &self.vk_output,
-        ) else {
-            return Err(EngineError::Backend("xing gpu_pipe unavailable".into()));
-        };
-
-        c_vk.upload(&gp.streams_a, 0, bytemuck::cast_slice(&streams)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let corr_dim = |n_r: f32| -> f32 {
-            (n_rot as f32 * (c.rope_orig_ctx as f32 / (n_r * 2.0 * std::f32::consts::PI)).ln())
-                / (2.0 * c.rope_base.ln())
-        };
-        let low = corr_dim(c.yarn_beta_fast).floor().max(0.0);
-        let high = corr_dim(c.yarn_beta_slow).ceil().min((n_rot - 1) as f32);
-        let attn_factor = if yarn { 1.0 / (1.0 + 0.1 * c.rope_factor.ln()) } else { 1.0 };
-        let rope_mscale = if yarn { (1.0 + 0.1 * c.rope_factor.ln()) * attn_factor } else { 1.0 };
-
-        let mut rec = c_vk.begin();
-        rec.set_defer_barriers(true);
-        let mut cur_a = true;
-        for li in 0..c.n_layer {
-            if li > 0 && li % XING_LAYERS_PER_SUBMIT == 0 {
-                rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
-                rec = c_vk.begin();
-                rec.set_defer_barriers(true);
-            }
-            let l = &self.layers[li];
-            let gl = &gp.layers[li];
-            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
-
-            // 1. HC pre (attn)
-            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
-            rec.barrier();
-            rec.qmm(gl.hc_attn_fn.ty, &gl.hc_attn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_attn_fn.k, gl.hc_attn_fn.m, batch);
-            rec.barrier();
-            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_attn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
-            rec.barrier();
-            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
-            rec.barrier();
-
-            // 2. MLA Attention (batched projections + causal batched attention)
-            rec.rms_norm_batch(&gp.inp, 0, &gl.attn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
-            rec.barrier();
-            let va = l.vk_wq_a.as_ref().unwrap();
-            let vkva = l.vk_wkv_a.as_ref().unwrap();
-            let vqb = l.vk_wq_b.as_ref().unwrap();
-            let vkb = l.vk_wk_b.as_ref().unwrap();
-            let vvb = l.vk_wv_b.as_ref().unwrap();
-            let vwo = l.vk_wo.as_ref().unwrap();
-            rec.qmm(va.ty, &va.buf, 0, &gp.normed, 0, &gp.q_a, 0, va.k, va.m, batch);
-            rec.qmm(vkva.ty, &vkva.buf, 0, &gp.normed, 0, &gp.kv_raw, 0, vkva.k, vkva.m, batch);
-            rec.barrier();
-            rec.rms_norm_batch(&gp.q_a, 0, &gl.q_a_norm, 0, &gp.q_an, 0, c.q_rank as u32, c.eps, batch);
-            rec.rms_norm_batch_strided(&gp.kv_raw, 0, &gl.kv_a_norm, 0, &gp.kv_raw, 0, latent as u32, hd as u32, c.eps, batch);
-            rec.barrier();
-            rec.qmm(vqb.ty, &vqb.buf, 0, &gp.q_an, 0, &gp.q_full, 0, vqb.k, vqb.m, batch);
-            rec.barrier();
-            let kv_layer_off = (li * self.max_ctx * (hd / 2)) as u32;
-            rec.rope_yarn_mla_batch(
-                &gp.q_full, &gp.kv_raw, &gp.kv_cache,
-                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
-                pos0 as u32, kv_layer_off, c.rope_base, c.rope_factor, low, high, rope_mscale, batch,
-            );
-            rec.barrier();
-            // Per-head absorbed K projection: one grouped matmul (group = head, entry = t*nh + h).
-            if !rec.qmm_grouped(vkb.ty, &vkb.buf, 0, vkb.slice_bytes, &gp.q_full, 0, c.key_dim as u32, 1, batch * nh as u32, &gp.q_lat, 0, vkb.k, vkb.m, nh as u32, None, batch) {
-                for t in 0..bs {
-                    for h in 0..nh {
-                        rec.qmv(
-                            vkb.ty, &vkb.buf, h as u64 * vkb.slice_bytes,
-                            &gp.q_full, ((t * nh + h) * c.key_dim) as u64,
-                            &gp.q_lat, ((t * nh + h) * latent) as u64,
-                            vkb.k, vkb.m,
-                        );
-                    }
-                }
-            }
-            rec.barrier();
-            rec.mla_attn_batch(
-                &gp.q_lat, &gp.q_full, &gp.kv_cache, &gp.attn_lat,
-                nh as u32, c.key_dim as u32, nope as u32, n_rot as u32, latent as u32,
-                pos0 as u32, kv_layer_off, kq_scale, batch,
-            );
-            rec.barrier();
-            if !rec.qmm_grouped(vvb.ty, &vvb.buf, 0, vvb.slice_bytes, &gp.attn_lat, 0, latent as u32, 1, batch * nh as u32, &gp.val_all, 0, vvb.k, vvb.m, nh as u32, None, batch) {
-                for t in 0..bs {
-                    for h in 0..nh {
-                        rec.qmv(
-                            vvb.ty, &vvb.buf, h as u64 * vvb.slice_bytes,
-                            &gp.attn_lat, ((t * nh + h) * latent) as u64,
-                            &gp.val_all, ((t * nh + h) * vdim) as u64,
-                            vvb.k, vvb.m,
-                        );
-                    }
-                }
-            }
-            rec.barrier();
-            rec.qmm(vwo.ty, &vwo.buf, 0, &gp.val_all, 0, &gp.block_out, 0, vwo.k, vwo.m, batch);
-            rec.barrier();
-            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
-            rec.barrier();
-            cur_a = !cur_a;
-
-            // 3. HC pre (FFN)
-            let (st_cur, st_nxt) = if cur_a { (&gp.streams_a, &gp.streams_b) } else { (&gp.streams_b, &gp.streams_a) };
-            rec.rms_norm_batch(st_cur, 0, &gp.ones, 0, &gp.streams_norm, 0, (4 * ne) as u32, c.eps, batch);
-            rec.barrier();
-            rec.qmm(gl.hc_ffn_fn.ty, &gl.hc_ffn_fn.buf, 0, &gp.streams_norm, 0, &gp.hc_mixes, 0, gl.hc_ffn_fn.k, gl.hc_ffn_fn.m, batch);
-            rec.barrier();
-            rec.hc_sinkhorn_batch(&gp.hc_mixes, &gl.hc_ffn_params, &gp.hc_out, c.hc_iters as u32, c.hc_eps, batch);
-            rec.barrier();
-            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 0, batch);
-            rec.barrier();
-            rec.rms_norm_batch(&gp.inp, 0, &gl.ffn_norm, 0, &gp.normed, 0, ne as u32, c.eps, batch);
-            rec.barrier();
-
-            // 4. Dense or MoE FFN
-            match &l.ffn {
-                XingFfn::Dense { vk_gate, vk_up, vk_down, .. } => {
-                    let (vg, vu, vd) = (vk_gate.as_ref().unwrap(), vk_up.as_ref().unwrap(), vk_down.as_ref().unwrap());
-                    rec.qmm(vg.ty, &vg.buf, 0, &gp.normed, 0, bg, 0, vg.k, vg.m, batch);
-                    rec.qmm(vu.ty, &vu.buf, 0, &gp.normed, 0, bu, 0, vu.k, vu.m, batch);
-                    rec.barrier();
-                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * c.n_ff_dense as u32);
-                    rec.barrier();
-                    rec.qmm(vd.ty, &vd.buf, 0, ba, 0, &gp.block_out, 0, vd.k, vd.m, batch);
-                    rec.barrier();
-                }
-                XingFfn::Moe { vk_gate_exps, vk_up_exps, vk_down_exps, vk_gate_sh, vk_up_sh, vk_down_sh, .. } => {
-                    let vgi = gl.gate_inp.as_ref().unwrap();
-                    let (vgs, vus, vds) = (vk_gate_sh.as_ref().unwrap(), vk_up_sh.as_ref().unwrap(), vk_down_sh.as_ref().unwrap());
-                    let sh_off = (bs * c.n_used * c.n_ff_exp) as u64;
-                    rec.qmm(vgi.ty, &vgi.buf, 0, &gp.normed, 0, &gp.router_logits, 0, vgi.k, vgi.m, batch);
-                    rec.qmm(vgs.ty, &vgs.buf, 0, &gp.normed, 0, bg, sh_off, vgs.k, vgs.m, batch);
-                    rec.qmm(vus.ty, &vus.buf, 0, &gp.normed, 0, bu, sh_off, vus.k, vus.m, batch);
-                    rec.barrier();
-                    let (bias_buf, has_bias) = match &gl.exp_probs_b {
-                        Some(b) => (b, true),
-                        None => (&gp.dummy_bias, false),
-                    };
-                    let n_used = c.n_used as u32;
-                    rec.moe_topk_batch(&gp.router_logits, bias_buf, &gp.top_ids, &gp.top_w, c.n_expert as u32, n_used, has_bias, c.exp_weights_norm, c.exp_weights_scale, batch);
-                    rec.swiglu(bg, sh_off, bu, sh_off, ba, sh_off, batch * c.n_ff_exp as u32);
-                    rec.barrier();
-                    let (vg, vu, vd) = (vk_gate_exps.as_ref().unwrap(), vk_up_exps.as_ref().unwrap(), vk_down_exps.as_ref().unwrap());
-                    // Shared down (batched qmm) + all B tokens' routed gate/up in parallel!
-                    rec.qmm(vds.ty, &vds.buf, 0, ba, sh_off, &gp.block_out, 0, vds.k, vds.m, batch);
-                    // Routed experts: bucket the bs*n_used (token, slot) entries by expert, then one
-                    // grouped tiled matmul per projection (each expert's weights read once per tile).
-                    let grouped = qmmt_ok(vg.ty) && qmmt_ok(vu.ty) && qmmt_ok(vd.ty) && c.n_expert <= 256;
-                    let n_exp = c.n_expert as u32;
-                    // GTT-resident experts: one DMA copy per tensor into VRAM staging.
-                    let staged: Option<[&Buffer; 3]> = match &self.moe_stage {
-                        Some(st) if grouped && vg.in_gtt => {
-                            for (src, dst) in [(vg, &st[0]), (vu, &st[1]), (vd, &st[2])] {
-                                rec.copy_buf_bytes(&src.buf, dst, src.slice_bytes * c.n_expert as u64);
-                            }
-                            Some([&st[0], &st[1], &st[2]])
-                        }
-                        _ => None,
-                    };
-                    let (wg_buf, wu_buf, wd_buf) = match staged {
-                        Some([a, b, d]) => (a, b, d),
-                        None => (&vg.buf, &vu.buf, &vd.buf),
-                    };
-                    if grouped {
-                        rec.barrier();
-                        rec.moe_group(&gp.top_ids, &gp.moe_list, batch * n_used, n_exp, batch);
-                        rec.barrier();
-                        rec.qmm_grouped(vg.ty, wg_buf, 0, vg.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bg, 0, vg.k, vg.m, n_exp, Some(&gp.moe_list), batch);
-                        rec.qmm_grouped(vu.ty, wu_buf, 0, vu.slice_bytes, &gp.normed, 0, ne as u32, n_used, batch, bu, 0, vu.k, vu.m, n_exp, Some(&gp.moe_list), batch);
-                    } else {
-                        for t in 0..bs {
-                            let slot_base = (t * c.n_used) as u32;
-                            let y_off = (t * c.n_used * c.n_ff_exp) as u64;
-                            rec.qmv_id_batch(vg.ty, &vg.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bg, y_off, vg.k, vg.m, vg.slice_bytes);
-                            rec.qmv_id_batch(vu.ty, &vu.buf, &gp.top_ids, slot_base, n_used, &gp.normed, (t * ne) as u64, 0, bu, y_off, vu.k, vu.m, vu.slice_bytes);
-                        }
-                    }
-                    rec.barrier();
-                    rec.swiglu(bg, 0, bu, 0, ba, 0, batch * n_used * c.n_ff_exp as u32);
-                    rec.barrier();
-                    if grouped {
-                        rec.qmm_grouped(vd.ty, wd_buf, 0, vd.slice_bytes, ba, 0, c.n_ff_exp as u32, 1, batch * n_used, &gp.moe_tmp, 0, vd.k, vd.m, n_exp, Some(&gp.moe_list), batch);
-                    } else {
-                        for t in 0..bs {
-                            let slot_base = (t * c.n_used) as u32;
-                            let a_off = (t * c.n_used * c.n_ff_exp) as u64;
-                            let tmp_off = (t * c.n_used * ne) as u64;
-                            rec.qmv_id_batch(vd.ty, &vd.buf, &gp.top_ids, slot_base, n_used, ba, a_off, c.n_ff_exp as u32, &gp.moe_tmp, tmp_off, vd.k, vd.m, vd.slice_bytes);
-                        }
-                    }
-                    rec.barrier();
-                    rec.add_scaled_id_tokens(&gp.block_out, 0, &gp.moe_tmp, 0, &gp.top_w, ne as u32, 0, n_used, false, batch);
-                    rec.barrier();
-                }
-            }
-            rec.hc_mix_batch(st_cur, &gp.block_out, &gp.hc_out, st_nxt, ne as u32, 1, batch);
-            rec.barrier();
-            cur_a = !cur_a;
-        }
-
-        let st_final = if cur_a { &gp.streams_a } else { &gp.streams_b };
-        if out.logits || out.hidden {
-            rec.hc_mix_batch(st_final, &gp.block_out, &gp.hc_out, &gp.inp, ne as u32, 2, batch);
-            rec.barrier();
-            let last_off = ((bs - 1) * ne) as u64;
-            rec.rms_norm(&gp.inp, last_off, &gp.out_norm, 0, &gp.hidden_buf, 0, ne as u32, c.eps);
-            rec.barrier();
-        }
-        if out.logits {
-            rec.qmv(vout.ty, &vout.buf, 0, &gp.hidden_buf, 0, &gp.logits_buf, 0, vout.k, vout.m);
-            rec.barrier();
-        }
-        rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
-        if out.hidden {
-            c_vk.download(&gp.hidden_buf, 0, bytemuck::cast_slice_mut(&mut self.hidden)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        }
-        if out.logits {
-            c_vk.download(&gp.logits_buf, 0, bytemuck::cast_slice_mut(&mut self.logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
-        }
-        Ok(())
+        Ok(None)
     }
 }
 

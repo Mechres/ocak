@@ -162,10 +162,7 @@ struct Pipelines {
     rope_yarn_mla: PipelineBundle,
     mla_attn: PipelineBundle,
     moe_topk: PipelineBundle,
-    qmv_iq3_xxs_id: PipelineBundle,
-    qmv_iq3_s_id: PipelineBundle,
     qmv_nvfp4_id: PipelineBundle,
-    qmv_q8_0_id: PipelineBundle,
     qmv_q4_k_id: PipelineBundle,
     situ_id: PipelineBundle,
     add_scaled_id: PipelineBundle,
@@ -185,10 +182,6 @@ struct Pipelines {
     qmm_iq2_xs: PipelineBundle,
     qmm_iq3_xxs: PipelineBundle,
     qmm_iq3_s: PipelineBundle,
-    qmm2_iq2_xs: PipelineBundle,
-    qmm2_q4_k: PipelineBundle,
-    qmm2_q5_k: PipelineBundle,
-    qmm2_iq3_s: PipelineBundle,
     /// Tiled prefill matmul, indexed by `qmmt_index`.
     qmmt: Vec<PipelineBundle>,
     /// Grouped (MoE expert / per-head) variant of `qmmt`, same indexing.
@@ -275,6 +268,12 @@ fn qmmq_index(ty: WType) -> Option<usize> {
 }
 
 /// Integer-dot prefill matmuls are on unless OCAK_MMQ=0.
+/// `OCAK_INKLING_ATTN_OLD=1`: the pre-split-K Inkling decode attention kernel (read once).
+fn inkling_attn_old() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("OCAK_INKLING_ATTN_OLD").is_ok())
+}
+
 fn mmq_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("OCAK_MMQ").map_or(true, |v| v != "0"))
@@ -340,12 +339,12 @@ impl Pipelines {
             &self.qmv_iq2_xxs, &self.qmv_iq2_xs, &self.qmv_iq2_s, &self.qmv_iq3_xxs, &self.qmv_iq3_s,
             &self.qmv_iq1_s, &self.qmv_iq1_m, &self.qmv_iq4_nl, &self.qmv_iq4_xs, &self.qmv_nvfp4,
             &self.hc_sinkhorn, &self.hc_mix, &self.rope_yarn_mla, &self.mla_attn, &self.moe_topk,
-            &self.qmv_iq3_xxs_id, &self.qmv_iq3_s_id, &self.qmv_nvfp4_id, &self.qmv_q8_0_id, &self.qmv_q4_k_id, &self.situ_id,
+            &self.qmv_nvfp4_id, &self.qmv_q4_k_id, &self.situ_id,
             &self.add_scaled_id, &self.add_scaled_exp_id,
             &self.inkling_mix, &self.inkling_ctrl, &self.inkling_conv, &self.inkling_attn,
             &self.qmm_q4_k, &self.qmm_q6_k, &self.qmm_q5_k, &self.qmm_q4_0, &self.qmm_q8_0,
             &self.qmm_f16, &self.qmm_f32, &self.qmm_iq2_s, &self.qmm_iq2_xs, &self.qmm_iq3_xxs, &self.qmm_iq3_s,
-            &self.qmm2_iq2_xs, &self.qmm2_q4_k, &self.qmm2_q5_k, &self.qmm2_iq3_s,
+            
             &self.argmax,
         ]
         .into_iter()
@@ -721,10 +720,7 @@ impl VkContext {
                 rope_yarn_mla: bp(include_bytes!(concat!(env!("OUT_DIR"), "/rope_yarn_mla.spv")), "rope_yarn_mla", 3, 48)?,
                 mla_attn: bp(include_bytes!(concat!(env!("OUT_DIR"), "/mla_attn.spv")), "mla_attn", 5, 36)?,
                 moe_topk: bp(include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv")), "moe_topk", 4, 20)?,
-                qmv_iq3_xxs_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_xxs_id.spv")), "qmv_iq3_xxs_id", 5, 32)?,
-                qmv_iq3_s_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_iq3_s_id.spv")), "qmv_iq3_s_id", 5, 32)?,
                 qmv_nvfp4_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_nvfp4_id.spv")), "qmv_nvfp4_id", 4, 32)?,
-                qmv_q8_0_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q8_0_id.spv")), "qmv_q8_0_id", 4, 32)?,
                 qmv_q4_k_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmv_q4_k_id.spv")), "qmv_q4_k_id", 4, 32)?,
                 situ_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/situ_id.spv")), "situ_id", 4, 16)?,
                 add_scaled_id: bp(include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv")), "add_scaled_id", 3, 24)?,
@@ -744,10 +740,6 @@ impl VkContext {
                 qmm_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq2_xs.spv")), "qmm_iq2_xs", 4, 28)?,
                 qmm_iq3_xxs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_xxs.spv")), "qmm_iq3_xxs", 4, 28)?,
                 qmm_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm_iq3_s.spv")), "qmm_iq3_s", 4, 28)?,
-                qmm2_iq2_xs: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq2_xs.spv")), "qmm2_iq2_xs", 4, 28)?,
-                qmm2_q4_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q4_k.spv")), "qmm2_q4_k", 3, 28)?,
-                qmm2_q5_k: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_q5_k.spv")), "qmm2_q5_k", 3, 28)?,
-                qmm2_iq3_s: bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmm2_iq3_s.spv")), "qmm2_iq3_s", 4, 28)?,
                 qmmt: vec![
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q4_k.spv")), "qmmt_q4_k", 4, 36)?,
                     bp(include_bytes!(concat!(env!("OUT_DIR"), "/qmmt_q5_k.spv")), "qmmt_q5_k", 4, 36)?,
@@ -939,12 +931,14 @@ impl VkContext {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )?[0];
+            // With push descriptors the pool is never used: keep a minimal one.
+            let n_sets = if use_push_desc { 1 } else { MAX_DESC_SETS };
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(MAX_DESC_SETS * 12)];
+                .descriptor_count(n_sets * 12)];
             let desc_pool = device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(MAX_DESC_SETS)
+                    .max_sets(n_sets)
                     .pool_sizes(&pool_sizes),
                 None,
             )?;
@@ -1083,22 +1077,6 @@ impl VkContext {
         }
     }
 
-    pub fn create_host_buffer(self: &Arc<Self>, bytes: u64) -> Result<HostBuffer, VkError> {
-        let size = bytes.max(16);
-        unsafe {
-            let (buf, mem) = alloc_raw_buffer(
-                &self.device,
-                &self.mem_props,
-                size,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
-            let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
-            Ok(HostBuffer { ctx: Arc::clone(self), buf, mem, ptr, size })
-        }
-    }
 
     /// Wait for pipelined uploads still in flight (they use the staging buffer).
     fn drain_async(&self, exec: &mut ExecState) {
@@ -1417,36 +1395,6 @@ impl Drop for Buffer {
     }
 }
 
-pub struct HostBuffer {
-    ctx: Arc<VkContext>,
-    buf: vk::Buffer,
-    mem: vk::DeviceMemory,
-    ptr: *mut u8,
-    size: u64,
-}
-
-unsafe impl Send for HostBuffer {}
-unsafe impl Sync for HostBuffer {}
-
-impl HostBuffer {
-    pub fn size(&self) -> u64 { self.size }
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.size as usize) }
-    }
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size as usize) }
-    }
-}
-
-impl Drop for HostBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            self.ctx.device.unmap_memory(self.mem);
-            self.ctx.device.destroy_buffer(self.buf, None);
-            self.ctx.device.free_memory(self.mem, None);
-        }
-    }
-}
 
 pub struct Recorder<'a> {
     ctx: &'a VkContext,
@@ -1484,6 +1432,14 @@ impl<'a> Recorder<'a> {
     /// serialize them.
     pub fn set_attn_split(&mut self, enable: bool) {
         self.attn_split = enable;
+    }
+
+    /// Barrier for a dependency right after a `dispatch_raw`, which already placed one unless
+    /// barriers are deferred (or profiling serializes dispatches): avoids back-to-back barriers.
+    fn dep_barrier(&mut self) {
+        if self.defer_barriers && self.exec.qpool == vk::QueryPool::null() {
+            self.barrier();
+        }
     }
 
     pub fn barrier(&mut self) {
@@ -1739,7 +1695,7 @@ impl<'a> Recorder<'a> {
             let scratch = self.ctx.attn_scratch;
             let pcs = [off_u32(w_off), off_u32(q_off / 16), off_u32((q_off + n) / 16), off_u32(s_off / 4), k, m, ty.row_bytes(k), batch, kbchunk, batch * m];
             self.dispatch_raw(pipe, &[w.buf, q8, q8, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
-            self.barrier();
+            self.dep_barrier();
             let nn = batch * m;
             let pcr = [off_u32(s_off / 4), off_u32(y_off), nn, splits];
             self.dispatch_raw(&self.ctx.pipelines.sum_splits, &[scratch, y.buf], bytemuck::cast_slice(&pcr), nn.div_ceil(256), 1, 1);
@@ -1780,29 +1736,10 @@ impl<'a> Recorder<'a> {
             return;
         }
         if batch == 2 {
-            match ty {
-                WType::IQ2XS => {
-                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq2_xs, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), m.div_ceil(16), 1, 1);
-                    return;
-                }
-                WType::Q4K => {
-                    self.dispatch_raw(&self.ctx.pipelines.qmm2_q4_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
-                    return;
-                }
-                WType::Q5K => {
-                    self.dispatch_raw(&self.ctx.pipelines.qmm2_q5_k, &[w.buf, x.buf, y.buf], bytemuck::cast_slice(&pc), gx, 1, 1);
-                    return;
-                }
-                WType::IQ3S => {
-                    self.dispatch_raw(&self.ctx.pipelines.qmm2_iq3_s, &[w.buf, x.buf, y.buf, self.ctx.iq_buf], bytemuck::cast_slice(&pc), gx, 1, 1);
-                    return;
-                }
-                _ => {
-                    self.qmv(ty, w, w_off, x, x_off, y, y_off, k, m);
-                    self.qmv(ty, w, w_off, x, x_off + k as u64, y, y_off + m as u64, k, m);
-                    return;
-                }
-            }
+            // Only reached when k is not a multiple of 32 (no block-quantized format).
+            self.qmv(ty, w, w_off, x, x_off, y, y_off, k, m);
+            self.qmv(ty, w, w_off, x, x_off + k as u64, y, y_off + m as u64, k, m);
+            return;
         }
         if batch >= qmmt_min_batch() && k.is_multiple_of(32) {
             if self.qmm_int8(ty, w, w_off, x, x_off, y, y_off, k, m, batch) {
@@ -1827,7 +1764,7 @@ impl<'a> Recorder<'a> {
                 let scratch = self.ctx.attn_scratch;
                 let pcs = [off_u32(w_off), off_u32(x_off), off_u32(s_off / 4), k, m, ty.row_bytes(k), batch, kchunk, batch * m];
                 self.dispatch_raw(p, &[w.buf, x.buf, scratch, self.ctx.iq_buf], bytemuck::cast_slice(&pcs), gx, gy, splits);
-                self.barrier();
+                self.dep_barrier();
                 let n = batch * m;
                 let pcr = [off_u32(s_off / 4), off_u32(y_off), n, splits];
                 self.dispatch_raw(&self.ctx.pipelines.sum_splits, &[scratch, y.buf], bytemuck::cast_slice(&pcr), n.div_ceil(256), 1, 1);
@@ -1908,7 +1845,7 @@ impl<'a> Recorder<'a> {
         let scratch = self.ctx.attn_scratch;
         let pc0 = [off_u32(x_off), n, 0, p_off, parts, out_idx];
         self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc0), parts, 1, 1);
-        self.barrier();
+        self.dep_barrier();
         let pc1 = [off_u32(x_off), n, 1, p_off, parts, out_idx];
         self.dispatch_raw(&self.ctx.pipelines.argmax, &[x.buf, out.buf, scratch], bytemuck::cast_slice(&pc1), 1, 1, 1);
     }
@@ -2152,7 +2089,7 @@ impl<'a> Recorder<'a> {
         self.scratch_cursor += bytes;
         let pc = [key_dim, nope, n_rot, latent, pos, kv_layer_off, kq_scale.to_bits(), chunk, scratch_off];
         self.dispatch_raw(&self.ctx.pipelines.mla_attn, &[q_lat.buf, q_full.buf, kv_cache.buf, out.buf, scratch], bytemuck::cast_slice(&pc), gx, batch, n_splits);
-        self.barrier();
+        self.dep_barrier();
         assert!(n_splits <= 1024, "attention_merge supports <= 1024 splits");
         let pc2 = [scratch_off, 0, latent, n_splits];
         self.dispatch_raw(&self.ctx.pipelines.attention_merge, &[scratch, out.buf], bytemuck::cast_slice(&pc2), nh * batch, latent.div_ceil(128), 1);
@@ -2178,18 +2115,15 @@ impl<'a> Recorder<'a> {
     pub fn qmv_id_batch(&mut self, ty: WType, w: &Buffer, ids: &Buffer, slot_base: u32, count: u32, x: &Buffer, x_off: u64, x_stride: u32, y: &Buffer, y_off: u64, k: u32, m: u32, slice_bytes: u64) {
         let pc = [slot_base, off_u32(x_off), off_u32(y_off), k, m, ty.row_bytes(k), off_u32(slice_bytes), x_stride];
         let gx = m.div_ceil(4);
-        let classic = matches!(ty, WType::IQ3XXS | WType::IQ3S | WType::NVFP4 | WType::Q8_0 | WType::Q4K);
-        // Generic kernel for formats without a hand-written id shader, and where it is faster.
+        // Hand-written id shaders exist for Q4_K and NVFP4, where they beat the generic kernel.
+        let classic = matches!(ty, WType::NVFP4 | WType::Q4K);
         if !classic || qmvm_beats_qmv(ty) {
             let p = &self.ctx.pipelines.qmvi[qmmt_index(ty)];
             self.dispatch_raw(p, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1);
             return;
         }
         match ty {
-            WType::IQ3XXS => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_xxs_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
-            WType::IQ3S => self.dispatch_raw(&self.ctx.pipelines.qmv_iq3_s_id, &[w.buf, x.buf, y.buf, self.ctx.iq_buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             WType::NVFP4 => self.dispatch_raw(&self.ctx.pipelines.qmv_nvfp4_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
-            WType::Q8_0 => self.dispatch_raw(&self.ctx.pipelines.qmv_q8_0_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             WType::Q4K => self.dispatch_raw(&self.ctx.pipelines.qmv_q4_k_id, &[w.buf, x.buf, y.buf, ids.buf], bytemuck::cast_slice(&pc), gx, count, 1),
             _ => panic!("qmv_id: unsupported type {ty:?}"),
         }
@@ -2370,7 +2304,7 @@ impl<'a> Recorder<'a> {
         // for all query heads of the group, merge with sink + gate. The single-kernel version
         // below runs one workgroup per head over the whole context (decode halved at 5.7k tokens).
         let group = n_head / n_head_kv.max(1);
-        if hd == 128 && n_rel <= 16 && n_head.is_multiple_of(n_head_kv) && (1..=4).contains(&group) && std::env::var("OCAK_INKLING_ATTN_OLD").is_err() {
+        if hd == 128 && n_rel <= 16 && n_head.is_multiple_of(n_head_kv) && (1..=4).contains(&group) && !inkling_attn_old() {
             let t_start = if is_swa && pos + 1 > n_swa { pos + 1 - n_swa } else { 0 };
             let t_len = pos + 1 - t_start;
             let splits = t_len.div_ceil(256).clamp(1, 32);
@@ -2387,7 +2321,7 @@ impl<'a> Recorder<'a> {
                 self.scratch_cursor += bytes;
                 let scratch = self.ctx.attn_scratch;
                 self.inkling_kv_store(k_cur, 0, v_cur, 0, k_cache, v_cache, n_head_kv * hd, n_head_kv, hd, is_swa, cap, pos, kv_slot_off, qk_clip, eps, 1);
-                self.barrier();
+                self.dep_barrier();
                 let pc = [
                     q_off, r_off, s_off, n_head, n_head_kv, n_rel, n_extent, is_swa as u32, cap, pos, kv_slot_off,
                     qk_clip.to_bits(), rel_clip.to_bits(), tau.to_bits(), t_start, chunk, part_off,
@@ -2397,7 +2331,7 @@ impl<'a> Recorder<'a> {
                     &[q.buf, r.buf, sinks.buf, q_clip.buf, r_clip.buf, r_bias.buf, k_cache.buf, v_cache.buf, scratch],
                     bytemuck::cast_slice(&pc), n_head_kv, splits, 1,
                 );
-                self.barrier();
+                self.dep_barrier();
                 let pcm = [g_off, n_head, splits, part_off];
                 self.dispatch_raw(&self.ctx.pipelines.inkling_attn_merge, &[scratch, gate.buf, out.buf], bytemuck::cast_slice(&pcm), n_head, 1, 1);
                 return;
@@ -2481,7 +2415,7 @@ impl<'a> Recorder<'a> {
         let scratch = self.ctx.attn_scratch;
         let pc1 = [off_u32(q_off), off_u32(layer_kv_off), off_u32(pt_off), scratch_off, n_heads, n_kv_heads, head_dim, pos, t_start, ATTN_SPLIT_CHUNK];
         self.dispatch_raw(&self.ctx.pipelines.attention_split, &[q.buf, kv.buf, page_table.buf, scratch], bytemuck::cast_slice(&pc1), n_heads, n_splits, 1);
-        self.barrier();
+        self.dep_barrier();
         assert!(n_splits <= 1024, "attention_merge supports <= 1024 splits");
         let pc2 = [scratch_off, off_u32(out_off), head_dim, n_splits];
         self.dispatch_raw(&self.ctx.pipelines.attention_merge, &[scratch, out.buf], bytemuck::cast_slice(&pc2), n_heads, head_dim.div_ceil(128), 1);
@@ -3815,7 +3749,7 @@ mod tests {
                     y_qmv[i]
                 );
             }
-            // Also verify batch=2 (qmm2_* fast path)
+            // Also verify batch=2 (small-batch matvec path)
             let mut rec2 = c.begin();
             rec2.set_mmq(false);
             rec2.qmm(wt, &bw, 0, &bx, 0, &by_qmm, 0, k as u32, m as u32, 2);
