@@ -168,6 +168,52 @@ void ssm_conv_silu_f32(
     for (u32 t = 0u; t < MAXD; t++) if (t < d_conv) st[sb + t] = h[t];
 }
 
+// 2b. Snapshot-capable conv + SiLU for speculative verify (saves state after tokens 0..n_snaps).
+extern "C" __global__ __launch_bounds__(256)
+void ssm_conv_silu_snap_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ cw,
+    float* __restrict__ st,
+    float* __restrict__ o,
+    float* __restrict__ snap,
+    u32 channels,
+    u32 k_conv,
+    u32 batch,
+    u32 n_snaps
+) {
+    u32 ch = blockIdx.x * 256u + threadIdx.x;
+    if (ch >= channels) return;
+    u32 d_conv = k_conv - 1u;
+    u32 sb = ch * d_conv;
+    u32 wb = ch * k_conv;
+    u64 st_elems = (u64)channels * d_conv;
+    float h[MAXD];
+    float w[MAXD + 1u];
+    #pragma unroll
+    for (u32 t = 0u; t < MAXD; t++) h[t] = (t < d_conv) ? st[sb + t] : 0.0f;
+    #pragma unroll
+    for (u32 t = 0u; t <= MAXD; t++) w[t] = (t <= d_conv) ? cw[wb + t] : 0.0f;
+
+    for (u32 ti = 0u; ti < batch; ti++) {
+        float xv = x[(u64)ti * channels + ch];
+        float acc = xv * w[d_conv];
+        #pragma unroll
+        for (u32 t = 0u; t < MAXD; t++) if (t < d_conv) acc = __fmaf_rn(h[t], w[t], acc);
+        #pragma unroll
+        for (u32 t = 0u; t + 1u < MAXD; t++) if (t + 1u < d_conv) h[t] = h[t + 1u];
+        #pragma unroll
+        for (u32 t = 0u; t < MAXD; t++) if (t == d_conv - 1u) h[t] = xv;
+        o[(u64)ti * channels + ch] = acc / (1.0f + __expf(-acc));
+        if (ti < n_snaps) {
+            u64 snap_off = (u64)ti * st_elems + sb;
+            #pragma unroll
+            for (u32 t = 0u; t < MAXD; t++) if (t < d_conv) snap[snap_off + t] = h[t];
+        }
+    }
+    #pragma unroll
+    for (u32 t = 0u; t < MAXD; t++) if (t < d_conv) st[sb + t] = h[t];
+}
+
 // ---------------------------------------------------------------------------
 // 3. Qwen3.5 Gated DeltaNet recurrence (matches ocak-vk deltanet_step.comp)
 //    8-lane cluster per state row, 32 rows/WG, TC=16 tokens staged in LDS.
@@ -383,6 +429,111 @@ void deltanet_step_tok_f32(
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) sq += __shfl_xor(sq, off, 32);
         if (lane == 0u) o[(u64)t * v_total + (u64)h * hd + j] = sq * qs;
+    }
+    #pragma unroll
+    for (u32 r = 0u; r < 4u; r++) {
+        u32 i = lane + 32u * r;
+        if (i < hd) st[s_base + i] = s[r];
+    }
+}
+
+// 3c. Snapshot-capable small-batch DeltaNet for speculative verify (saves state after tokens 0..n_snaps).
+extern "C" __global__ __launch_bounds__(256)
+void deltanet_step_tok_snap_f32(
+    const float* __restrict__ qkv,
+    const float* __restrict__ alpha,
+    const float* __restrict__ beta,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ st,
+    float* __restrict__ o,
+    float* __restrict__ snap,
+    u32 n_k_heads,
+    u32 n_v_heads,
+    u32 head_dim,
+    float eps,
+    u32 batch,
+    u32 n_snaps
+) {
+    u32 lane = threadIdx.x & 31u;
+    u32 row = blockIdx.x * 8u + (threadIdx.x >> 5);
+    u32 hd = head_dim;
+    u32 h = row / hd;
+    u32 j = row % hd;
+    if (h >= n_v_heads) return;
+    u32 kh = h % n_k_heads;
+    u32 k_total = n_k_heads * hd;
+    u32 v_total = n_v_heads * hd;
+    u32 conv_ch = 2u * k_total + v_total;
+    u64 st_elems = (u64)n_v_heads * hd * hd;
+
+    u64 s_base = ((u64)h * hd + j) * hd;
+    float s[4];
+    #pragma unroll
+    for (u32 r = 0u; r < 4u; r++) {
+        u32 i = lane + 32u * r;
+        s[r] = (i < hd) ? st[s_base + i] : 0.0f;
+    }
+    float dt_b = dt_bias[h];
+    float sa_h = ssm_a[h];
+    float inv_sqrt_hd = rsqrtf((float)hd);
+
+    for (u32 t = 0u; t < batch; t++) {
+        u64 qo = (u64)t * conv_ch + (u64)kh * hd;
+        u64 ko = qo + k_total;
+        float q[4], k[4];
+        float qq = 0.0f, kk = 0.0f;
+        #pragma unroll
+        for (u32 r = 0u; r < 4u; r++) {
+            u32 i = lane + 32u * r;
+            q[r] = (i < hd) ? qkv[qo + i] : 0.0f;
+            k[r] = (i < hd) ? qkv[ko + i] : 0.0f;
+            qq = __fmaf_rn(q[r], q[r], qq);
+            kk = __fmaf_rn(k[r], k[r], kk);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            qq += __shfl_xor(qq, off, 32);
+            kk += __shfl_xor(kk, off, 32);
+        }
+        float qs = rsqrtf(qq + eps) * inv_sqrt_hd;
+        float ks = rsqrtf(kk + eps);
+
+        float ab = alpha[(u64)t * n_v_heads + h] + dt_b;
+        float sp = (ab > 20.0f) ? ab : logf(1.0f + expf(ab));
+        float g = expf(sp * sa_h);
+        float b = 1.0f / (1.0f + expf(-beta[(u64)t * n_v_heads + h]));
+
+        float sk = 0.0f;
+        #pragma unroll
+        for (u32 r = 0u; r < 4u; r++) {
+            s[r] *= g;
+            sk = __fmaf_rn(s[r], k[r], sk);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sk += __shfl_xor(sk, off, 32);
+        sk *= ks;
+
+        float vj = qkv[(u64)t * conv_ch + 2u * k_total + (u64)h * hd + j];
+        float dj = (vj - sk) * b;
+        float kd = ks * dj;
+        float sq = 0.0f;
+        #pragma unroll
+        for (u32 r = 0u; r < 4u; r++) {
+            s[r] = __fmaf_rn(k[r], kd, s[r]);
+            sq = __fmaf_rn(s[r], q[r], sq);
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sq += __shfl_xor(sq, off, 32);
+        if (lane == 0u) o[(u64)t * v_total + (u64)h * hd + j] = sq * qs;
+        if (t < n_snaps) {
+            u64 snap_base = (u64)t * st_elems + s_base;
+            #pragma unroll
+            for (u32 r = 0u; r < 4u; r++) {
+                u32 i = lane + 32u * r;
+                if (i < hd) snap[snap_base + i] = s[r];
+            }
+        }
     }
     #pragma unroll
     for (u32 r = 0u; r < 4u; r++) {
@@ -628,13 +779,15 @@ void rope_ext_f32(
     u32 head_dim,
     u32 n_rot,
     u32 pos0,
+    const u32* __restrict__ step_meta,
     u32 mode,
     float freq_base,
     u32 use_factors
 ) {
     u32 wg = blockIdx.x;
     u32 tok = blockIdx.y;
-    u32 pos = pos0 + tok;
+    u32 p0 = step_meta ? step_meta[1] : pos0;
+    u32 pos = p0 + tok;
     u32 half_rot = n_rot >> 1;
     for (u32 i = threadIdx.x; i < half_rot; i += 64u) {
         float inv_f = (use_factors != 0u) ? (1.0f / factors[i]) : 1.0f;
@@ -733,8 +886,10 @@ pub struct HipHybridOps {
     shortconv_step_f32: HipFunction,
     shortconv_step_q8_f32: HipFunction,
     ssm_conv_silu_f32: HipFunction,
+    ssm_conv_silu_snap_f32: HipFunction,
     deltanet_step_f32: HipFunction,
     deltanet_step_tok_f32: HipFunction,
+    deltanet_step_tok_snap_f32: HipFunction,
     gated_rms_norm_f32: HipFunction,
     gated_rms_norm_q8_f32: HipFunction,
     split_qg_f32: HipFunction,
@@ -754,8 +909,10 @@ impl HipHybridOps {
             shortconv_step_f32: module.function("shortconv_step_f32")?,
             shortconv_step_q8_f32: module.function("shortconv_step_q8_f32")?,
             ssm_conv_silu_f32: module.function("ssm_conv_silu_f32")?,
+            ssm_conv_silu_snap_f32: module.function("ssm_conv_silu_snap_f32")?,
             deltanet_step_f32: module.function("deltanet_step_f32")?,
             deltanet_step_tok_f32: module.function("deltanet_step_tok_f32")?,
+            deltanet_step_tok_snap_f32: module.function("deltanet_step_tok_snap_f32")?,
             gated_rms_norm_f32: module.function("gated_rms_norm_f32")?,
             gated_rms_norm_q8_f32: module.function("gated_rms_norm_q8_f32")?,
             split_qg_f32: module.function("split_qg_f32")?,
@@ -861,6 +1018,94 @@ impl HipHybridOps {
             &mut b as *mut _ as *mut c_void,
         ];
         unsafe { self.ssm_conv_silu_f32.launch(stream, (channels.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn ssm_conv_silu_snap(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        cw: &HipBuffer,
+        st: &HipBuffer,
+        o: &HipBuffer,
+        snap: &HipBuffer,
+        channels: u32,
+        k_conv: u32,
+        batch: u32,
+        n_snaps: u32,
+    ) -> Result<(), HipError> {
+        let mut xp = x.as_device_ptr();
+        let mut wp = cw.as_device_ptr();
+        let mut sp = st.as_device_ptr();
+        let mut op = o.as_device_ptr();
+        let mut snp = snap.as_device_ptr();
+        let mut ch = channels;
+        let mut kc = k_conv;
+        let mut b = batch;
+        let mut ns = n_snaps;
+        let mut params: [*mut c_void; 9] = [
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut snp as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        unsafe { self.ssm_conv_silu_snap_f32.launch(stream, (channels.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn deltanet_step_snap(
+        &self,
+        stream: &HipStream,
+        qkv: &HipBuffer,
+        alpha: &HipBuffer,
+        beta: &HipBuffer,
+        dt_bias: &HipBuffer,
+        ssm_a: &HipBuffer,
+        st: &HipBuffer,
+        o: &HipBuffer,
+        snap: &HipBuffer,
+        n_k_heads: u32,
+        n_v_heads: u32,
+        head_dim: u32,
+        eps: f32,
+        batch: u32,
+        n_snaps: u32,
+    ) -> Result<(), HipError> {
+        let mut qp = qkv.as_device_ptr();
+        let mut ap = alpha.as_device_ptr();
+        let mut bp = beta.as_device_ptr();
+        let mut dp = dt_bias.as_device_ptr();
+        let mut sap = ssm_a.as_device_ptr();
+        let mut stp = st.as_device_ptr();
+        let mut op = o.as_device_ptr();
+        let mut snp = snap.as_device_ptr();
+        let mut nkh = n_k_heads;
+        let mut nvh = n_v_heads;
+        let mut hd = head_dim;
+        let mut eps = eps;
+        let mut b = batch;
+        let mut ns = n_snaps;
+        let mut params: [*mut c_void; 14] = [
+            &mut qp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut sap as *mut _ as *mut c_void,
+            &mut stp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut snp as *mut _ as *mut c_void,
+            &mut nkh as *mut _ as *mut c_void,
+            &mut nvh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        let gx = (n_v_heads * head_dim).div_ceil(8);
+        unsafe { self.deltanet_step_tok_snap_f32.launch(stream, (gx, 1, 1), (256, 1, 1), 0, &mut params) }
     }
 
     pub fn deltanet_step(
@@ -1152,6 +1397,26 @@ impl HipHybridOps {
         use_factors: bool,
         batch: u32,
     ) -> Result<(), HipError> {
+        self.rope_ext_or_meta(stream, q, k, factors, n_heads, n_kv_heads, head_dim, n_rot, pos0, None, mode, freq_base, use_factors, batch)
+    }
+
+    pub fn rope_ext_or_meta(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        k: &HipBuffer,
+        factors: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        pos0: u32,
+        step_meta: Option<&HipBuffer>,
+        mode: u32,
+        freq_base: f32,
+        use_factors: bool,
+        batch: u32,
+    ) -> Result<(), HipError> {
         let mut qp = q.as_device_ptr();
         let mut kp = k.as_device_ptr();
         let mut fp = factors.as_device_ptr();
@@ -1160,10 +1425,11 @@ impl HipHybridOps {
         let mut hd = head_dim;
         let mut nr = n_rot;
         let mut p0 = pos0;
+        let mut mp = step_meta.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut md = mode;
         let mut fb = freq_base;
         let mut uf = u32::from(use_factors);
-        let mut params: [*mut c_void; 11] = [
+        let mut params: [*mut c_void; 12] = [
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
             &mut fp as *mut _ as *mut c_void,
@@ -1172,6 +1438,7 @@ impl HipHybridOps {
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
             &mut p0 as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
             &mut md as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
             &mut uf as *mut _ as *mut c_void,

@@ -553,6 +553,7 @@ void rope_f32(
     u32 head_dim,
     u32 n_rot,
     u32 pos0,
+    const u32* __restrict__ step_meta,
     float rope_base,
     u32 mode,
     u32 batch
@@ -563,9 +564,10 @@ void rope_f32(
     u32 t = blockIdx.y;
     if (idx >= total_per_tok || t >= batch) return;
 
+    u32 p0 = step_meta ? step_meta[1] : pos0;
     u32 h = idx / half_rot;
     u32 j = idx % half_rot;
-    float pos = (float)(pos0 + t);
+    float pos = (float)(p0 + t);
     float freq = powf(rope_base, -(2.0f * (float)j) / (float)n_rot);
     float ang = pos * freq;
     float c, s;
@@ -623,6 +625,7 @@ void kv_write_f16(
     u32* __restrict__ kv_layer,
     const u32* __restrict__ page_table,
     u32 pos0,
+    const u32* __restrict__ step_meta,
     u32 kv_dim,
     u32 batch
 ) {
@@ -631,7 +634,8 @@ void kv_write_f16(
     u32 t = blockIdx.y;
     if (i >= half_kv || t >= batch) return;
 
-    u32 pos = pos0 + t;
+    u32 p0 = step_meta ? step_meta[1] : pos0;
+    u32 pos = p0 + t;
     u32 page = page_table[pos >> 4];
     u32 slot = pos & 15u;
     u64 k_off = ((u64)page * 32u + slot) * half_kv + i;
@@ -908,6 +912,7 @@ void attention_prefill_f16(
     u32 n_kv_heads,
     u32 head_dim,
     u32 pos0,
+    const u32* __restrict__ step_meta,
     u32 sliding_window,
     u32 batch
 ) {
@@ -915,6 +920,7 @@ void attention_prefill_f16(
     __shared__ u32 sk[16 * 128];
     __shared__ u32 sv[16 * 128];
 
+    if (step_meta) pos0 = step_meta[1];
     u32 h = blockIdx.x;
     u32 t0 = blockIdx.y * 8u;
     u32 lid = threadIdx.x;
@@ -1516,20 +1522,38 @@ impl HipDenseOps {
         mode: u32,
         batch: u32,
     ) -> Result<(), HipError> {
+        self.rope_or_meta(stream, x, n_heads, head_dim, n_rot, pos0, None, rope_base, mode, batch)
+    }
+
+    pub fn rope_or_meta(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        n_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        pos0: u32,
+        step_meta: Option<&HipBuffer>,
+        rope_base: f32,
+        mode: u32,
+        batch: u32,
+    ) -> Result<(), HipError> {
         let mut xp = x.as_device_ptr();
         let mut nh = n_heads;
         let mut hd = head_dim;
         let mut nr = n_rot;
         let mut p0 = pos0;
+        let mut mp = step_meta.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut rb = rope_base;
         let mut md = mode;
         let mut b = batch;
-        let mut params: [*mut c_void; 8] = [
+        let mut params: [*mut c_void; 9] = [
             &mut xp as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
             &mut p0 as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
             &mut rb as *mut _ as *mut c_void,
             &mut md as *mut _ as *mut c_void,
             &mut b as *mut _ as *mut c_void,
@@ -1550,19 +1574,37 @@ impl HipDenseOps {
         kv_dim: u32,
         batch: u32,
     ) -> Result<(), HipError> {
+        self.kv_write_or_meta(stream, k, v, kv, kv_byte_offset, page_table, pos0, None, kv_dim, batch)
+    }
+
+    pub fn kv_write_or_meta(
+        &self,
+        stream: &HipStream,
+        k: &HipBuffer,
+        v: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        pos0: u32,
+        step_meta: Option<&HipBuffer>,
+        kv_dim: u32,
+        batch: u32,
+    ) -> Result<(), HipError> {
         let mut kp = k.as_device_ptr();
         let mut vp = v.as_device_ptr();
         let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
         let mut ptp = page_table.as_device_ptr();
         let mut p0 = pos0;
+        let mut mp = step_meta.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut kd = kv_dim;
         let mut b = batch;
-        let mut params: [*mut c_void; 7] = [
+        let mut params: [*mut c_void; 8] = [
             &mut kp as *mut _ as *mut c_void,
             &mut vp as *mut _ as *mut c_void,
             &mut kvp as *mut _ as *mut c_void,
             &mut ptp as *mut _ as *mut c_void,
             &mut p0 as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
             &mut kd as *mut _ as *mut c_void,
             &mut b as *mut _ as *mut c_void,
         ];
@@ -1955,6 +1997,25 @@ impl HipDenseOps {
         sliding_window: u32,
         batch: u32,
     ) -> Result<(), HipError> {
+        self.attention_prefill_or_meta(stream, q, kv, kv_byte_offset, page_table, out, n_heads, n_kv_heads, head_dim, pos0, None, sliding_window, batch)
+    }
+
+    pub fn attention_prefill_or_meta(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        out: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        pos0: u32,
+        step_meta: Option<&HipBuffer>,
+        sliding_window: u32,
+        batch: u32,
+    ) -> Result<(), HipError> {
         let mut qp = q.as_device_ptr();
         let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
         let mut ptp = page_table.as_device_ptr();
@@ -1963,9 +2024,10 @@ impl HipDenseOps {
         let mut nkv = n_kv_heads;
         let mut hd = head_dim;
         let mut p0 = pos0;
+        let mut mp = step_meta.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut sw = sliding_window;
         let mut b = batch;
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 11] = [
             &mut qp as *mut _ as *mut c_void,
             &mut kvp as *mut _ as *mut c_void,
             &mut ptp as *mut _ as *mut c_void,
@@ -1974,6 +2036,7 @@ impl HipDenseOps {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut p0 as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
             &mut sw as *mut _ as *mut c_void,
             &mut b as *mut _ as *mut c_void,
         ];
@@ -1992,8 +2055,22 @@ impl HipDenseOps {
         out_idx: &HipBuffer,
         n: u32,
     ) -> Result<(), HipError> {
+        self.argmax_at(stream, x, 0, part_v, part_i, out_idx, 0, n)
+    }
+
+    pub fn argmax_at(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        x_byte_off: usize,
+        part_v: &HipBuffer,
+        part_i: &HipBuffer,
+        out_idx: &HipBuffer,
+        out_byte_off: usize,
+        n: u32,
+    ) -> Result<(), HipError> {
         let n_parts = n.div_ceil(1024).clamp(1, 256);
-        let mut xp = x.as_device_ptr();
+        let mut xp = x.device_ptr_at(x_byte_off)?;
         let mut pvp = part_v.as_device_ptr();
         let mut pip = part_i.as_device_ptr();
         let mut n_mut = n;
@@ -2007,7 +2084,7 @@ impl HipDenseOps {
 
         let mut pvp2 = part_v.as_device_ptr();
         let mut pip2 = part_i.as_device_ptr();
-        let mut op = out_idx.as_device_ptr();
+        let mut op = out_idx.device_ptr_at(out_byte_off)?;
         let mut np = n_parts;
         let mut p2: [*mut c_void; 4] = [
             &mut pvp2 as *mut _ as *mut c_void,

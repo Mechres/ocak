@@ -1729,9 +1729,24 @@ impl HipKernels {
         rows: u32,
         eps: f32,
     ) -> Result<(), HipError> {
-        let mut xp = x.as_device_ptr();
+        self.rms_norm_at(stream, x, 0, w, y, 0, n, rows, eps)
+    }
+
+    pub fn rms_norm_at(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        x_byte_off: usize,
+        w: &HipBuffer,
+        y: &HipBuffer,
+        y_byte_off: usize,
+        n: u32,
+        rows: u32,
+        eps: f32,
+    ) -> Result<(), HipError> {
+        let mut xp = x.device_ptr_at(x_byte_off)?;
         let mut wp = w.as_device_ptr();
-        let mut yp = y.as_device_ptr();
+        let mut yp = y.device_ptr_at(y_byte_off)?;
         let mut n = n;
         let mut eps = eps;
         let mut params: [*mut c_void; 5] = [

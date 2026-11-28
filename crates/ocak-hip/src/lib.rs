@@ -603,6 +603,8 @@ mod tests {
         // Matches ocak-vk::tests::vk_small_batch_bench (k=5120, m=17408, rotating 6 weight copies).
         let ctx = HipContext::new(0).expect("HIP init");
         let kernels = HipKernels::compile(&ctx).unwrap();
+        let iq_kernels = HipIqKernels::compile(&ctx).unwrap();
+        let iq_tbl = ctx.buffer_from_slice(&ocak_gguf::iq_tables::packed_gpu_table()).unwrap();
         let stream = ctx.create_stream().unwrap();
         let (k, m) = (5120usize, 17408usize);
         let x: Vec<f32> = (0..8 * k).map(|i| ((i % 31) as f32 - 15.0) * 0.01).collect();
@@ -613,7 +615,15 @@ mod tests {
         let ev0 = ctx.create_event(true).unwrap();
         let ev1 = ctx.create_event(true).unwrap();
 
-        for (label, ty, is_q4k) in [("Q8_0", GgmlType::Q8_0, false), ("Q4K", GgmlType::Q4K, true)] {
+        for (label, ty, hty) in [
+            ("Q8_0", GgmlType::Q8_0, HipWType::Q8_0),
+            ("Q4K", GgmlType::Q4K, HipWType::Q4K),
+            ("Q2K", GgmlType::Q2K, HipWType::Q2K),
+            ("IQ2S", GgmlType::IQ2S, HipWType::IQ2S),
+            ("IQ2XS", GgmlType::IQ2XS, HipWType::IQ2XS),
+            ("IQ1S", GgmlType::IQ1S, HipWType::IQ1S),
+            ("IQ3S", GgmlType::IQ3S, HipWType::IQ3S),
+        ] {
             let (be, bb) = ty.block().unwrap();
             let rb = (k / be) * bb;
             let raw: Vec<u8> = (0..m * rb).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 0x3F).collect();
@@ -624,10 +634,10 @@ mod tests {
                 let run = |n: usize| {
                     for i in 0..n {
                         kernels.quant_q8(&stream, &bx, &bxq, &bxsc, nb).unwrap();
-                        if is_q4k {
-                            kernels.qmv_q4_k(&stream, &bws[i % 6], &bxq, &bxsc, &by, k as u32, m as u32, batch).unwrap();
+                        if hty.is_iq() {
+                            iq_kernels.qmv(hty, &stream, &bws[i % 6], &bxq, &bxsc, &by, &iq_tbl, k as u32, m as u32, batch).unwrap();
                         } else {
-                            kernels.qmv_q8_0(&stream, &bws[i % 6], &bxq, &bxsc, &by, k as u32, m as u32, batch).unwrap();
+                            kernels.qmv(hty, &stream, &bws[i % 6], &bx, &bxq, &bxsc, &by, k as u32, m as u32, batch).unwrap();
                         }
                     }
                 };

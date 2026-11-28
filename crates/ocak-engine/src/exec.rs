@@ -26,6 +26,20 @@ pub struct SlotStep<'a> {
     pub page_table: &'a [u32],
 }
 
+#[cfg(feature = "hip")]
+pub struct HipMtpShared {
+    pub ctx: std::sync::Arc<ocak_hip::HipContext>,
+    pub kernels: std::sync::Arc<ocak_hip::HipKernels>,
+    pub iq_kernels: Option<std::sync::Arc<ocak_hip::HipIqKernels>>,
+    pub iq_tbl: Option<std::sync::Arc<ocak_hip::HipBuffer>>,
+    pub ops: std::sync::Arc<ocak_hip::HipDenseOps>,
+    pub hops: std::sync::Arc<ocak_hip::HipHybridOps>,
+    pub head_buf: std::sync::Arc<ocak_hip::HipBuffer>,
+    pub head_ty: ocak_hip::HipWType,
+    pub head_k: u32,
+    pub head_m: u32,
+}
+
 /// One-token-at-a-time transformer/hybrid forward pass with paged KV + recurrent states.
 pub trait Executor: Send {
     fn name(&self) -> String;
@@ -129,6 +143,11 @@ pub trait Executor: Send {
     /// Optional shared Vulkan context + lm_head weight for GPU-accelerated MTP drafting.
     #[cfg(feature = "vulkan")]
     fn mtp_gpu_shared(&self) -> Option<(std::sync::Arc<ocak_vk::VkContext>, std::sync::Arc<ocak_vk::Buffer>, ocak_vk::WType, u32, u32)> {
+        None
+    }
+    /// Optional shared HIP context, compiled kernels, and lm_head weight for HIP-accelerated MTP drafting.
+    #[cfg(feature = "hip")]
+    fn mtp_hip_shared(&self) -> Option<HipMtpShared> {
         None
     }
     /// Processes a precomputed input embedding vector (`[n_embd]`) at position `pos` (for multimodal audio/vision).

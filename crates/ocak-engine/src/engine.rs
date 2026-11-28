@@ -139,14 +139,14 @@ impl NativeEngine {
             BackendKind::CpuAvx2 => Box::new(CpuExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
         } };
         let backend_name = exec.name();
-        let mut mtp = if opts.backend == BackendKind::Vulkan {
+        let mut mtp = if matches!(opts.backend, BackendKind::Vulkan | BackendKind::Hip) {
             crate::mtp::MtpDrafter::try_load(Arc::clone(&g), cfg.clone(), max_ctx).ok().flatten()
         } else {
             None
         };
         // Experimental: borrow the NextN MTP head from another GGUF of the same base model when
         // this file has none (e.g. a quant whose converter dropped blk.{n_layer}).
-        if mtp.is_none() && opts.backend == BackendKind::Vulkan {
+        if mtp.is_none() && matches!(opts.backend, BackendKind::Vulkan | BackendKind::Hip) {
             if let Ok(path) = std::env::var("OCAK_MTP_FROM") {
                 match load_foreign_mtp(&path, &cfg, max_ctx) {
                     Ok(m) => {
@@ -160,6 +160,10 @@ impl NativeEngine {
         #[cfg(feature = "vulkan")]
         if let (Some(m), Some((ctx, hb, hty, hk, hm))) = (mtp.as_mut(), exec.mtp_gpu_shared()) {
             let _ = m.attach_gpu(ctx, hb, hty, hk, hm);
+        }
+        #[cfg(feature = "hip")]
+        if let (Some(m), Some(shared)) = (mtp.as_mut(), exec.mtp_hip_shared()) {
+            let _ = m.attach_hip(shared);
         }
         Ok(Self {
             cfg,

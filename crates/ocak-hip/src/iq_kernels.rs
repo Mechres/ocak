@@ -354,21 +354,27 @@ void NAME( \
         for (u32 blk = tid; blk < kblocks; blk += 32u) { \
             u32 q[8]; float d; \
             UNPACK(w32, stab, rb, blk, q, d); \
-            for (u32 t = 0; t < batch; t++) { \
-                u32 xb = t * kblocks + blk; \
-                u32x4 xa = xq4[xb * 2u]; \
-                u32x4 xc = xq4[xb * 2u + 1u]; \
-                i32 s = sdot4_zero(q[0], xa.x); \
-                s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s); \
-                s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s); \
-                acc[t] = __fmaf_rn(d * xsc[xb].x, (float)s, acc[t]); \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < MAXB; t++) { \
+                if (t < batch) { \
+                    u32 xb = t * kblocks + blk; \
+                    u32x4 xa = xq4[xb * 2u]; \
+                    u32x4 xc = xq4[xb * 2u + 1u]; \
+                    i32 s = sdot4_zero(q[0], xa.x); \
+                    s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s); \
+                    s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s); \
+                    acc[t] = __fmaf_rn(d * xsc[xb].x, (float)s, acc[t]); \
+                } \
             } \
         } \
     } \
-    for (u32 t = 0; t < batch; t++) { \
-        float v = acc[t]; \
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
-        if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < MAXB; t++) { \
+        if (t < batch) { \
+            float v = acc[t]; \
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
+            if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+        } \
     } \
 }
 
@@ -426,22 +432,28 @@ void NAME( \
         for (u32 blk = tid; blk < kblocks; blk += 32u) { \
             u32 q[8]; float d0, d1; \
             UNPACK(w32, stab, rb, blk, q, d0, d1); \
-            for (u32 t = 0; t < batch; t++) { \
-                u32 xb = t * kblocks + blk; \
-                u32x4 xa = xq4[xb * 2u]; \
-                u32x4 xc = xq4[xb * 2u + 1u]; \
-                i32 i0 = sdot4_zero(q[0], xa.x); \
-                i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0); \
-                i32 i1 = sdot4_zero(q[4], xc.x); \
-                i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1); \
-                acc[t] = __fmaf_rn(xsc[xb].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc[t]); \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < MAXB; t++) { \
+                if (t < batch) { \
+                    u32 xb = t * kblocks + blk; \
+                    u32x4 xa = xq4[xb * 2u]; \
+                    u32x4 xc = xq4[xb * 2u + 1u]; \
+                    i32 i0 = sdot4_zero(q[0], xa.x); \
+                    i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0); \
+                    i32 i1 = sdot4_zero(q[4], xc.x); \
+                    i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1); \
+                    acc[t] = __fmaf_rn(xsc[xb].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc[t]); \
+                } \
             } \
         } \
     } \
-    for (u32 t = 0; t < batch; t++) { \
-        float v = acc[t]; \
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
-        if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < MAXB; t++) { \
+        if (t < batch) { \
+            float v = acc[t]; \
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
+            if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+        } \
     } \
 }
 
@@ -503,7 +515,97 @@ void NAME( \
         for (u32 blk = tid; blk < kblocks; blk += 32u) { \
             u32 q[8]; float d0, d1; \
             UNPACK(w32, stab, smask, rb, blk, q, d0, d1); \
-            for (u32 t = 0; t < batch; t++) { \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < MAXB; t++) { \
+                if (t < batch) { \
+                    u32 xb = t * kblocks + blk; \
+                    u32x4 xa = xq4[xb * 2u]; \
+                    u32x4 xc = xq4[xb * 2u + 1u]; \
+                    i32 i0 = sdot4_zero(q[0], xa.x); \
+                    i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0); \
+                    i32 i1 = sdot4_zero(q[4], xc.x); \
+                    i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1); \
+                    acc[t] = __fmaf_rn(xsc[xb].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc[t]); \
+                } \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < MAXB; t++) { \
+        if (t < batch) { \
+            float v = acc[t]; \
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
+            if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+        } \
+    } \
+}
+
+#define DEFINE_IQ_QMVB_S32(NAME, UNPACK, TBL_LO, TBL_N, NB) \
+extern "C" __global__ __launch_bounds__(512) \
+void NAME( \
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, \
+    const f32x4* __restrict__ xsc, float* __restrict__ y, \
+    const u32* __restrict__ tbl, u32 k, u32 m, u32 row_bytes \
+) { \
+    __shared__ u32 stab[TBL_N]; \
+    u32 tid = threadIdx.x; \
+    u32 lid = threadIdx.y * 32u + tid; \
+    for (u32 i = lid; i < (TBL_N); i += 32u * RPW) stab[i] = tbl[(TBL_LO) + i]; \
+    lds_barrier(); \
+    u32 row = blockIdx.x * RPW + threadIdx.y; \
+    float acc[NB]; \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) acc[t] = 0.0f; \
+    if (row < m) { \
+        u32 rb = row * row_bytes; \
+        u32 kblocks = k >> 5; \
+        for (u32 blk = tid; blk < kblocks; blk += 32u) { \
+            u32 q[8]; float d; \
+            UNPACK(w32, stab, rb, blk, q, d); \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < (NB); t++) { \
+                u32 xb = t * kblocks + blk; \
+                u32x4 xa = xq4[xb * 2u]; \
+                u32x4 xc = xq4[xb * 2u + 1u]; \
+                i32 s = sdot4_zero(q[0], xa.x); \
+                s = sdot4(q[1], xa.y, s); s = sdot4(q[2], xa.z, s); s = sdot4(q[3], xa.w, s); \
+                s = sdot4(q[4], xc.x, s); s = sdot4(q[5], xc.y, s); s = sdot4(q[6], xc.z, s); s = sdot4(q[7], xc.w, s); \
+                acc[t] = __fmaf_rn(d * xsc[xb].x, (float)s, acc[t]); \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) { \
+        float v = acc[t]; \
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
+        if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+    } \
+}
+
+#define DEFINE_IQ_QMVB_S16(NAME, UNPACK, TBL_LO, TBL_N, NB) \
+extern "C" __global__ __launch_bounds__(512) \
+void NAME( \
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, \
+    const f32x4* __restrict__ xsc, float* __restrict__ y, \
+    const u32* __restrict__ tbl, u32 k, u32 m, u32 row_bytes \
+) { \
+    __shared__ u32 stab[TBL_N]; \
+    u32 tid = threadIdx.x; \
+    u32 lid = threadIdx.y * 32u + tid; \
+    for (u32 i = lid; i < (TBL_N); i += 32u * RPW) stab[i] = tbl[(TBL_LO) + i]; \
+    lds_barrier(); \
+    u32 row = blockIdx.x * RPW + threadIdx.y; \
+    float acc[NB]; \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) acc[t] = 0.0f; \
+    if (row < m) { \
+        u32 rb = row * row_bytes; \
+        u32 kblocks = k >> 5; \
+        for (u32 blk = tid; blk < kblocks; blk += 32u) { \
+            u32 q[8]; float d0, d1; \
+            UNPACK(w32, stab, rb, blk, q, d0, d1); \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < (NB); t++) { \
                 u32 xb = t * kblocks + blk; \
                 u32x4 xa = xq4[xb * 2u]; \
                 u32x4 xc = xq4[xb * 2u + 1u]; \
@@ -515,7 +617,53 @@ void NAME( \
             } \
         } \
     } \
-    for (u32 t = 0; t < batch; t++) { \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) { \
+        float v = acc[t]; \
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
+        if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
+    } \
+}
+
+#define DEFINE_IQ_QMVB_S16_SM(NAME, UNPACK, TBL_LO, TBL_N, SM_LO, SM_N, NB) \
+extern "C" __global__ __launch_bounds__(512) \
+void NAME( \
+    const u32* __restrict__ w32, const u32x4* __restrict__ xq4, \
+    const f32x4* __restrict__ xsc, float* __restrict__ y, \
+    const u32* __restrict__ tbl, u32 k, u32 m, u32 row_bytes \
+) { \
+    __shared__ u32 stab[TBL_N]; \
+    __shared__ u32 smask[SM_N]; \
+    u32 tid = threadIdx.x; \
+    u32 lid = threadIdx.y * 32u + tid; \
+    for (u32 i = lid; i < (TBL_N); i += 32u * RPW) stab[i] = tbl[(TBL_LO) + i]; \
+    for (u32 i = lid; i < (SM_N); i += 32u * RPW) smask[i] = tbl[(SM_LO) + i]; \
+    lds_barrier(); \
+    u32 row = blockIdx.x * RPW + threadIdx.y; \
+    float acc[NB]; \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) acc[t] = 0.0f; \
+    if (row < m) { \
+        u32 rb = row * row_bytes; \
+        u32 kblocks = k >> 5; \
+        for (u32 blk = tid; blk < kblocks; blk += 32u) { \
+            u32 q[8]; float d0, d1; \
+            UNPACK(w32, stab, smask, rb, blk, q, d0, d1); \
+            _Pragma("unroll") \
+            for (u32 t = 0u; t < (NB); t++) { \
+                u32 xb = t * kblocks + blk; \
+                u32x4 xa = xq4[xb * 2u]; \
+                u32x4 xc = xq4[xb * 2u + 1u]; \
+                i32 i0 = sdot4_zero(q[0], xa.x); \
+                i0 = sdot4(q[1], xa.y, i0); i0 = sdot4(q[2], xa.z, i0); i0 = sdot4(q[3], xa.w, i0); \
+                i32 i1 = sdot4_zero(q[4], xc.x); \
+                i1 = sdot4(q[5], xc.y, i1); i1 = sdot4(q[6], xc.z, i1); i1 = sdot4(q[7], xc.w, i1); \
+                acc[t] = __fmaf_rn(xsc[xb].x, __fmaf_rn(d0, (float)i0, d1 * (float)i1), acc[t]); \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (u32 t = 0u; t < (NB); t++) { \
         float v = acc[t]; \
         for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32); \
         if (tid == 0u && row < m) y[(u64)t * m + row] = v; \
@@ -523,22 +671,40 @@ void NAME( \
 }
 
 DEFINE_IQ_QMV1_S32(qmv1_iq1_s,   dqi32_iq1_s,   8592u, 4096u)
+DEFINE_IQ_QMVB_S32(qmv2_iq1_s,   dqi32_iq1_s,   8592u, 4096u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq1_s,   dqi32_iq1_s,   8592u, 4096u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq1_s,     dqi32_iq1_s,   8592u, 4096u)
 DEFINE_IQ_QMV1_S16(qmv1_iq1_m,   dqi32_iq1_m,   8592u, 4096u)
+DEFINE_IQ_QMVB_S16(qmv2_iq1_m,   dqi32_iq1_m,   8592u, 4096u, 2u)
+DEFINE_IQ_QMVB_S16(qmv3_iq1_m,   dqi32_iq1_m,   8592u, 4096u, 3u)
 DEFINE_IQ_QMV_S16(qmv_iq1_m,     dqi32_iq1_m,   8592u, 4096u)
 DEFINE_IQ_QMV1_S32(qmv1_iq2_xxs, dqi32_iq2_xxs, 1792u, 656u)
+DEFINE_IQ_QMVB_S32(qmv2_iq2_xxs, dqi32_iq2_xxs, 1792u, 656u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq2_xxs, dqi32_iq2_xxs, 1792u, 656u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq2_xxs,   dqi32_iq2_xxs, 1792u, 656u)
 DEFINE_IQ_QMV1_S16_SM(qmv1_iq2_xs, dqi32_iq2_xs, 0u,    1024u, 12688u, 256u)
+DEFINE_IQ_QMVB_S16_SM(qmv2_iq2_xs, dqi32_iq2_xs, 0u,    1024u, 12688u, 256u, 2u)
+DEFINE_IQ_QMVB_S16_SM(qmv3_iq2_xs, dqi32_iq2_xs, 0u,    1024u, 12688u, 256u, 3u)
 DEFINE_IQ_QMV_S16_SM(qmv_iq2_xs,   dqi32_iq2_xs, 0u,    1024u, 12688u, 256u)
 DEFINE_IQ_QMV1_S16_SM(qmv1_iq2_s,  dqi32_iq2_s,  2448u, 2048u, 12944u, 512u)
+DEFINE_IQ_QMVB_S16_SM(qmv2_iq2_s,  dqi32_iq2_s,  2448u, 2048u, 12944u, 512u, 2u)
+DEFINE_IQ_QMVB_S16_SM(qmv3_iq2_s,  dqi32_iq2_s,  2448u, 2048u, 12944u, 512u, 3u)
 DEFINE_IQ_QMV_S16_SM(qmv_iq2_s,    dqi32_iq2_s,  2448u, 2048u, 12944u, 512u)
 DEFINE_IQ_QMV1_S32(qmv1_iq3_xxs, dqi32_iq3_xxs, 1024u, 896u)
+DEFINE_IQ_QMVB_S32(qmv2_iq3_xxs, dqi32_iq3_xxs, 1024u, 896u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq3_xxs, dqi32_iq3_xxs, 1024u, 896u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq3_xxs,   dqi32_iq3_xxs, 1024u, 896u)
 DEFINE_IQ_QMV1_S32(qmv1_iq3_s,   dqi32_iq3_s,   1280u, 512u)
+DEFINE_IQ_QMVB_S32(qmv2_iq3_s,   dqi32_iq3_s,   1280u, 512u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq3_s,   dqi32_iq3_s,   1280u, 512u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq3_s,     dqi32_iq3_s,   1280u, 512u)
 DEFINE_IQ_QMV1_S32(qmv1_iq4_nl,  dqi32_iq4_nl,  1920u, 16u)
+DEFINE_IQ_QMVB_S32(qmv2_iq4_nl,  dqi32_iq4_nl,  1920u, 16u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq4_nl,  dqi32_iq4_nl,  1920u, 16u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq4_nl,    dqi32_iq4_nl,  1920u, 16u)
 DEFINE_IQ_QMV1_S32(qmv1_iq4_xs,  dqi32_iq4_xs,  1920u, 16u)
+DEFINE_IQ_QMVB_S32(qmv2_iq4_xs,  dqi32_iq4_xs,  1920u, 16u, 2u)
+DEFINE_IQ_QMVB_S32(qmv3_iq4_xs,  dqi32_iq4_xs,  1920u, 16u, 3u)
 DEFINE_IQ_QMV_S32(qmv_iq4_xs,    dqi32_iq4_xs,  1920u, 16u)
 
 // ---------------------------------------------------------------------------
@@ -920,6 +1086,24 @@ pub struct HipIqKernels {
     qmv1_iq3_s: HipFunction,
     qmv1_iq4_nl: HipFunction,
     qmv1_iq4_xs: HipFunction,
+    qmv2_iq1_s: HipFunction,
+    qmv2_iq1_m: HipFunction,
+    qmv2_iq2_xxs: HipFunction,
+    qmv2_iq2_xs: HipFunction,
+    qmv2_iq2_s: HipFunction,
+    qmv2_iq3_xxs: HipFunction,
+    qmv2_iq3_s: HipFunction,
+    qmv2_iq4_nl: HipFunction,
+    qmv2_iq4_xs: HipFunction,
+    qmv3_iq1_s: HipFunction,
+    qmv3_iq1_m: HipFunction,
+    qmv3_iq2_xxs: HipFunction,
+    qmv3_iq2_xs: HipFunction,
+    qmv3_iq2_s: HipFunction,
+    qmv3_iq3_xxs: HipFunction,
+    qmv3_iq3_s: HipFunction,
+    qmv3_iq4_nl: HipFunction,
+    qmv3_iq4_xs: HipFunction,
     qmv_iq1_s: HipFunction,
     qmv_iq1_m: HipFunction,
     qmv_iq2_xxs: HipFunction,
@@ -955,6 +1139,24 @@ impl HipIqKernels {
             qmv1_iq3_s: get("qmv1_iq3_s")?,
             qmv1_iq4_nl: get("qmv1_iq4_nl")?,
             qmv1_iq4_xs: get("qmv1_iq4_xs")?,
+            qmv2_iq1_s: get("qmv2_iq1_s")?,
+            qmv2_iq1_m: get("qmv2_iq1_m")?,
+            qmv2_iq2_xxs: get("qmv2_iq2_xxs")?,
+            qmv2_iq2_xs: get("qmv2_iq2_xs")?,
+            qmv2_iq2_s: get("qmv2_iq2_s")?,
+            qmv2_iq3_xxs: get("qmv2_iq3_xxs")?,
+            qmv2_iq3_s: get("qmv2_iq3_s")?,
+            qmv2_iq4_nl: get("qmv2_iq4_nl")?,
+            qmv2_iq4_xs: get("qmv2_iq4_xs")?,
+            qmv3_iq1_s: get("qmv3_iq1_s")?,
+            qmv3_iq1_m: get("qmv3_iq1_m")?,
+            qmv3_iq2_xxs: get("qmv3_iq2_xxs")?,
+            qmv3_iq2_xs: get("qmv3_iq2_xs")?,
+            qmv3_iq2_s: get("qmv3_iq2_s")?,
+            qmv3_iq3_xxs: get("qmv3_iq3_xxs")?,
+            qmv3_iq3_s: get("qmv3_iq3_s")?,
+            qmv3_iq4_nl: get("qmv3_iq4_nl")?,
+            qmv3_iq4_xs: get("qmv3_iq4_xs")?,
             qmv_iq1_s: get("qmv_iq1_s")?,
             qmv_iq1_m: get("qmv_iq1_m")?,
             qmv_iq2_xxs: get("qmv_iq2_xxs")?,
@@ -992,17 +1194,35 @@ impl HipIqKernels {
         batch: u32,
     ) -> Result<(), HipError> {
         let rb = ty.row_bytes(k);
-        if batch == 1 {
-            let func = match ty {
-                HipWType::IQ1S => &self.qmv1_iq1_s,
-                HipWType::IQ1M => &self.qmv1_iq1_m,
-                HipWType::IQ2XXS => &self.qmv1_iq2_xxs,
-                HipWType::IQ2XS => &self.qmv1_iq2_xs,
-                HipWType::IQ2S => &self.qmv1_iq2_s,
-                HipWType::IQ3XXS => &self.qmv1_iq3_xxs,
-                HipWType::IQ3S => &self.qmv1_iq3_s,
-                HipWType::IQ4NL => &self.qmv1_iq4_nl,
-                HipWType::IQ4XS => &self.qmv1_iq4_xs,
+        if batch == 1 || batch == 2 || batch == 3 {
+            let func = match (batch, ty) {
+                (1, HipWType::IQ1S) => &self.qmv1_iq1_s,
+                (1, HipWType::IQ1M) => &self.qmv1_iq1_m,
+                (1, HipWType::IQ2XXS) => &self.qmv1_iq2_xxs,
+                (1, HipWType::IQ2XS) => &self.qmv1_iq2_xs,
+                (1, HipWType::IQ2S) => &self.qmv1_iq2_s,
+                (1, HipWType::IQ3XXS) => &self.qmv1_iq3_xxs,
+                (1, HipWType::IQ3S) => &self.qmv1_iq3_s,
+                (1, HipWType::IQ4NL) => &self.qmv1_iq4_nl,
+                (1, HipWType::IQ4XS) => &self.qmv1_iq4_xs,
+                (2, HipWType::IQ1S) => &self.qmv2_iq1_s,
+                (2, HipWType::IQ1M) => &self.qmv2_iq1_m,
+                (2, HipWType::IQ2XXS) => &self.qmv2_iq2_xxs,
+                (2, HipWType::IQ2XS) => &self.qmv2_iq2_xs,
+                (2, HipWType::IQ2S) => &self.qmv2_iq2_s,
+                (2, HipWType::IQ3XXS) => &self.qmv2_iq3_xxs,
+                (2, HipWType::IQ3S) => &self.qmv2_iq3_s,
+                (2, HipWType::IQ4NL) => &self.qmv2_iq4_nl,
+                (2, HipWType::IQ4XS) => &self.qmv2_iq4_xs,
+                (3, HipWType::IQ1S) => &self.qmv3_iq1_s,
+                (3, HipWType::IQ1M) => &self.qmv3_iq1_m,
+                (3, HipWType::IQ2XXS) => &self.qmv3_iq2_xxs,
+                (3, HipWType::IQ2XS) => &self.qmv3_iq2_xs,
+                (3, HipWType::IQ2S) => &self.qmv3_iq2_s,
+                (3, HipWType::IQ3XXS) => &self.qmv3_iq3_xxs,
+                (3, HipWType::IQ3S) => &self.qmv3_iq3_s,
+                (3, HipWType::IQ4NL) => &self.qmv3_iq4_nl,
+                (3, HipWType::IQ4XS) => &self.qmv3_iq4_xs,
                 _ => return Err(HipError::InvalidArg(format!("non-IQ type {ty:?} passed to HipIqKernels::qmv"))),
             };
             return self.launch_qmv1(func, stream, w, xq, xsc, y, tbl, k, m, rb);

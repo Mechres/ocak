@@ -1,9 +1,13 @@
 //! Native Qwen3.5 / RVN NextN Multi-Token Prediction (MTP) self-speculative draft head (`blk.{n_layer}.*`).
 use crate::config::ModelConfig;
 use crate::exec::EngineError;
+#[cfg(feature = "hip")]
+use crate::exec::HipMtpShared;
 use ocak_cpu::{gemv, ops};
 use ocak_gguf::quant::dequantize_row;
 use ocak_gguf::{GgufFile, TensorInfo};
+#[cfg(feature = "hip")]
+use ocak_hip::{HipBuffer, HipIqKernels, HipStream, HipWType};
 #[cfg(feature = "vulkan")]
 use ocak_vk::{Buffer, VkContext, WType};
 use std::sync::Arc;
@@ -78,6 +82,109 @@ struct MtpGpu {
     warm: Option<WarmBufs>,
 }
 
+#[cfg(feature = "hip")]
+struct MtpHipMat {
+    buf: HipBuffer,
+    ty: HipWType,
+    k: u32,
+    m: u32,
+}
+
+#[cfg(feature = "hip")]
+struct MtpHip {
+    shared: HipMtpShared,
+    stream: HipStream,
+    eh_proj: MtpHipMat,
+    wq: MtpHipMat,
+    wk: MtpHipMat,
+    wv: MtpHipMat,
+    wo: MtpHipMat,
+    ffn_gate: MtpHipMat,
+    ffn_up: MtpHipMat,
+    ffn_down: MtpHipMat,
+    enorm: HipBuffer,
+    hnorm: HipBuffer,
+    attn_norm: HipBuffer,
+    post_attn_norm: HipBuffer,
+    q_norm: HipBuffer,
+    k_norm: HipBuffer,
+    head_norm: HipBuffer,
+    kv: HipBuffer,
+    pt_buf: HipBuffer,
+    tok_e: HipBuffer,
+    h_in: HipBuffer,
+    concat: HipBuffer,
+    x: HipBuffer,
+    xn: HipBuffer,
+    qg: HipBuffer,
+    q: HipBuffer,
+    q_gate: HipBuffer,
+    k: HipBuffer,
+    v: HipBuffer,
+    attn: HipBuffer,
+    o: HipBuffer,
+    gf: HipBuffer,
+    uf: HipBuffer,
+    af: HipBuffer,
+    h_out: HipBuffer,
+    logits: HipBuffer,
+    argmax_pv: HipBuffer,
+    argmax_pi: HipBuffer,
+    argmax_out: HipBuffer,
+    xq: HipBuffer,
+    xsc: HipBuffer,
+}
+
+#[cfg(feature = "hip")]
+impl MtpHip {
+    fn qmv_buf(
+        &self,
+        buf: &HipBuffer,
+        ty: HipWType,
+        k: u32,
+        m: u32,
+        x_f32: &HipBuffer,
+        y: &HipBuffer,
+        quantize: bool,
+    ) -> Result<(), EngineError> {
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        if quantize && ty.uses_q8_act() {
+            self.shared
+                .kernels
+                .quant_q8(&self.stream, x_f32, &self.xq, &self.xsc, k / 32)
+                .map_err(map_e)?;
+        }
+        if ty.is_iq() {
+            self.shared
+                .iq_kernels
+                .as_ref()
+                .unwrap()
+                .qmv(
+                    ty,
+                    &self.stream,
+                    buf,
+                    &self.xq,
+                    &self.xsc,
+                    y,
+                    self.shared.iq_tbl.as_ref().unwrap(),
+                    k,
+                    m,
+                    1,
+                )
+                .map_err(map_e)
+        } else {
+            self.shared
+                .kernels
+                .qmv(ty, &self.stream, buf, x_f32, &self.xq, &self.xsc, y, k, m, 1)
+                .map_err(map_e)
+        }
+    }
+
+    fn qmv(&self, mat: &MtpHipMat, x_f32: &HipBuffer, y: &HipBuffer, quantize: bool) -> Result<(), EngineError> {
+        self.qmv_buf(&mat.buf, mat.ty, mat.k, mat.m, x_f32, y, quantize)
+    }
+}
+
 pub struct MtpDrafter {
     g: Arc<GgufFile>,
     cfg: ModelConfig,
@@ -102,6 +209,8 @@ pub struct MtpDrafter {
     max_ctx: usize,
     #[cfg(feature = "vulkan")]
     gpu: Option<MtpGpu>,
+    #[cfg(feature = "hip")]
+    hip: Option<MtpHip>,
 }
 
 fn req(g: &GgufFile, name: &str) -> Result<TensorInfo, EngineError> {
@@ -164,6 +273,8 @@ impl MtpDrafter {
             g,
             #[cfg(feature = "vulkan")]
             gpu: None,
+            #[cfg(feature = "hip")]
+            hip: None,
         }))
     }
 
@@ -255,11 +366,119 @@ impl MtpDrafter {
         Ok(())
     }
 
+    /// Attaches a shared HIP context + compiled kernels + `lm_head` weight so MTP drafting runs on HIP.
+    #[cfg(feature = "hip")]
+    pub fn attach_hip(&mut self, mut shared: HipMtpShared) -> Result<(), EngineError> {
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let up_mat = |ti: &TensorInfo| -> Result<MtpHipMat, EngineError> {
+            let ty = crate::hip_exec::hip_wtype(ti.ty)?;
+            let buf = shared.ctx.buffer_from_slice(self.g.tensor_data(ti)).map_err(map_e)?;
+            Ok(MtpHipMat { buf, ty, k: ti.n_cols() as u32, m: ti.n_rows() as u32 })
+        };
+        let up_f32 = |v: &[f32]| -> Result<HipBuffer, EngineError> {
+            shared.ctx.buffer_from_slice(v).map_err(map_e)
+        };
+        let mk = |elems: usize| -> Result<HipBuffer, EngineError> {
+            shared.ctx.alloc_buffer(elems.max(4) * 4).map_err(map_e)
+        };
+        let eh_proj = up_mat(&self.eh_proj)?;
+        let wq = up_mat(&self.wq)?;
+        let wk = up_mat(&self.wk)?;
+        let wv = up_mat(&self.wv)?;
+        let wo = up_mat(&self.wo)?;
+        let ffn_gate = up_mat(&self.ffn_gate)?;
+        let ffn_up = up_mat(&self.ffn_up)?;
+        let ffn_down = up_mat(&self.ffn_down)?;
+        let need_iq = eh_proj.ty.is_iq()
+            || wq.ty.is_iq()
+            || wk.ty.is_iq()
+            || wv.ty.is_iq()
+            || wo.ty.is_iq()
+            || ffn_gate.ty.is_iq()
+            || ffn_up.ty.is_iq()
+            || ffn_down.ty.is_iq()
+            || shared.head_ty.is_iq();
+        if need_iq && shared.iq_kernels.is_none() {
+            let tbl = Arc::new(
+                shared
+                    .ctx
+                    .buffer_from_slice(&ocak_gguf::iq_tables::packed_gpu_table())
+                    .map_err(map_e)?,
+            );
+            let iqk = Arc::new(HipIqKernels::compile(&shared.ctx).map_err(map_e)?);
+            shared.iq_tbl = Some(tbl);
+            shared.iq_kernels = Some(iqk);
+        }
+
+        let c = &self.cfg;
+        let qd = c.n_head * c.head_dim;
+        let kv_dim = c.n_head_kv * c.head_dim;
+        let n_pages = self.max_ctx.div_ceil(16) + 1;
+        let pt: Vec<u32> = (0..n_pages as u32).collect();
+        let pt_buf = shared.ctx.buffer_from_slice(&pt).map_err(map_e)?;
+        let kv = shared.ctx.alloc_buffer(n_pages * 2 * 16 * kv_dim * 2).map_err(map_e)?;
+        let max_k = (2 * c.n_embd).max(c.n_ff).max(qd);
+        let xq = shared.ctx.alloc_buffer(max_k).map_err(map_e)?;
+        let xsc = shared.ctx.alloc_buffer((max_k / 32).max(1) * 16).map_err(map_e)?;
+        let stream = shared.ctx.create_stream().map_err(map_e)?;
+
+        self.hip = Some(MtpHip {
+            enorm: up_f32(&self.enorm)?,
+            hnorm: up_f32(&self.hnorm)?,
+            attn_norm: up_f32(&self.attn_norm)?,
+            post_attn_norm: up_f32(&self.post_attn_norm)?,
+            q_norm: up_f32(&self.q_norm)?,
+            k_norm: up_f32(&self.k_norm)?,
+            head_norm: up_f32(&self.head_norm)?,
+            eh_proj,
+            wq,
+            wk,
+            wv,
+            wo,
+            ffn_gate,
+            ffn_up,
+            ffn_down,
+            kv,
+            pt_buf,
+            tok_e: mk(c.n_embd)?,
+            h_in: mk(c.n_embd)?,
+            concat: mk(2 * c.n_embd)?,
+            x: mk(c.n_embd)?,
+            xn: mk(c.n_embd)?,
+            qg: mk(2 * qd)?,
+            q: mk(qd)?,
+            q_gate: mk(qd)?,
+            k: mk(kv_dim)?,
+            v: mk(kv_dim)?,
+            attn: mk(qd)?,
+            o: mk(c.n_embd)?,
+            gf: mk(c.n_ff)?,
+            uf: mk(c.n_ff)?,
+            af: mk(c.n_ff)?,
+            h_out: mk(c.n_embd)?,
+            logits: mk(c.n_vocab)?,
+            argmax_pv: mk(256)?,
+            argmax_pi: mk(256)?,
+            argmax_out: mk(1)?,
+            xq,
+            xsc,
+            stream,
+            shared,
+        });
+        self.kv = Vec::new();
+        Ok(())
+    }
+
     pub fn has_gpu(&self) -> bool {
         #[cfg(feature = "vulkan")]
-        { self.gpu.is_some() }
-        #[cfg(not(feature = "vulkan"))]
-        { false }
+        if self.gpu.is_some() {
+            return true;
+        }
+        #[cfg(feature = "hip")]
+        if self.hip.is_some() {
+            return true;
+        }
+        false
     }
 
     pub fn reset(&mut self) {
@@ -310,6 +529,25 @@ impl MtpDrafter {
             return Ok(());
         }
 
+        #[cfg(feature = "hip")]
+        if let Some(hp) = &self.hip {
+            let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+            let s = &hp.stream;
+            hp.tok_e.upload(bytemuck::cast_slice(&tok_e)).map_err(map_e)?;
+            hp.h_in.upload(bytemuck::cast_slice(h_main)).map_err(map_e)?;
+            hp.shared.kernels.rms_norm_at(s, &hp.tok_e, 0, &hp.enorm, &hp.concat, 0, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.shared.kernels.rms_norm_at(s, &hp.h_in, 0, &hp.hnorm, &hp.concat, ne * 4, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv(&hp.eh_proj, &hp.concat, &hp.x, true)?;
+            hp.shared.kernels.rms_norm(s, &hp.x, &hp.attn_norm, &hp.xn, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv(&hp.wk, &hp.xn, &hp.k, true)?;
+            hp.qmv(&hp.wv, &hp.xn, &hp.v, false)?;
+            hp.shared.ops.rms_norm_heads(s, &hp.k, &hp.k_norm, hd as u32, nkv as u32, c.eps).map_err(map_e)?;
+            hp.shared.ops.rope(s, &hp.k, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1, 1).map_err(map_e)?;
+            hp.shared.ops.kv_write(s, &hp.k, &hp.v, &hp.kv, 0, &hp.pt_buf, pos as u32, kv_dim as u32, 1).map_err(map_e)?;
+            s.synchronize().map_err(map_e)?;
+            return Ok(());
+        }
+
         let mut e_norm = vec![0f32; ne];
         let mut h_norm = vec![0f32; ne];
         ops::rms_norm(&tok_e, &self.enorm, &mut e_norm, c.eps);
@@ -341,7 +579,7 @@ impl MtpDrafter {
     pub fn warmup_kv_batch(&mut self, hs: &[Vec<f32>], tokens: &[u32], pos0: usize) -> Result<usize, EngineError> {
         let n_all = hs.len().min(tokens.len()).min(self.max_ctx.saturating_sub(pos0));
         #[cfg(feature = "vulkan")]
-        if self.has_gpu() {
+        if self.gpu.is_some() {
             let c = self.cfg.clone();
             let (ne, nkv, hd) = (c.n_embd, c.n_head_kv, c.head_dim);
             let kv_dim = nkv * hd;
@@ -489,6 +727,62 @@ impl MtpDrafter {
             rec.finish_and_read(&mut [(&gp.argmax_out, 0, bytemuck::cast_slice_mut(&mut best))]).map_err(|e| EngineError::Backend(e.to_string()))?;
             return Ok(best[0]);
         }
+        #[cfg(feature = "hip")]
+        if let Some(hp) = &self.hip {
+            if pos >= self.max_ctx {
+                return Err(EngineError::Context("MTP pos >= max_ctx".into()));
+            }
+            let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+            let c = &self.cfg;
+            let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_head_kv, c.head_dim);
+            let kv_dim = nkv * hd;
+            let mut tok_e = vec![0f32; ne];
+            let rb = self.embd.row_bytes();
+            let r = token as usize;
+            dequantize_row(self.embd.ty, &self.g.tensor_data(&self.embd)[r * rb..(r + 1) * rb], &mut tok_e, ne);
+            let s = &hp.stream;
+            hp.tok_e.upload(bytemuck::cast_slice(&tok_e)).map_err(map_e)?;
+            if let Some(h) = h_main {
+                hp.h_in.upload(bytemuck::cast_slice(h)).map_err(map_e)?;
+            } else {
+                hp.h_in.copy_from_at_async(0, &hp.h_out, 0, ne * 4, s).map_err(map_e)?;
+            }
+            hp.shared.kernels.rms_norm_at(s, &hp.tok_e, 0, &hp.enorm, &hp.concat, 0, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.shared.kernels.rms_norm_at(s, &hp.h_in, 0, &hp.hnorm, &hp.concat, ne * 4, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv(&hp.eh_proj, &hp.concat, &hp.x, true)?;
+            hp.shared.kernels.rms_norm(s, &hp.x, &hp.attn_norm, &hp.xn, ne as u32, 1, c.eps).map_err(map_e)?;
+            let quant_qkv = hp.wq.ty.uses_q8_act() || hp.wk.ty.uses_q8_act() || hp.wv.ty.uses_q8_act();
+            if quant_qkv {
+                hp.shared.kernels.quant_q8(s, &hp.xn, &hp.xq, &hp.xsc, (ne / 32) as u32).map_err(map_e)?;
+            }
+            hp.qmv(&hp.wq, &hp.xn, &hp.qg, false)?;
+            hp.qmv(&hp.wk, &hp.xn, &hp.k, false)?;
+            hp.qmv(&hp.wv, &hp.xn, &hp.v, false)?;
+            hp.shared.hops.split_qg(s, &hp.qg, &hp.q, &hp.q_gate, nh as u32, hd as u32, 1).map_err(map_e)?;
+            hp.shared.ops.rms_norm_heads(s, &hp.q, &hp.q_norm, hd as u32, nh as u32, c.eps).map_err(map_e)?;
+            hp.shared.ops.rms_norm_heads(s, &hp.k, &hp.k_norm, hd as u32, nkv as u32, c.eps).map_err(map_e)?;
+            hp.shared.ops.rope(s, &hp.q, nh as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1, 1).map_err(map_e)?;
+            hp.shared.ops.rope(s, &hp.k, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1, 1).map_err(map_e)?;
+            hp.shared.ops.kv_write(s, &hp.k, &hp.v, &hp.kv, 0, &hp.pt_buf, pos as u32, kv_dim as u32, 1).map_err(map_e)?;
+            hp.shared.ops.attention_prefill(s, &hp.q, &hp.kv, 0, &hp.pt_buf, &hp.attn, nh as u32, nkv as u32, hd as u32, pos as u32, 0, 1).map_err(map_e)?;
+            hp.shared.hops.mul_sigmoid(s, &hp.attn, &hp.q_gate, (nh * hd) as u32).map_err(map_e)?;
+            hp.qmv(&hp.wo, &hp.attn, &hp.o, true)?;
+            hp.shared.ops.add_rms_norm(s, &hp.x, &hp.o, &hp.post_attn_norm, &hp.xn, ne as u32, 1, c.eps).map_err(map_e)?;
+            if hp.ffn_gate.ty.uses_q8_act() || hp.ffn_up.ty.uses_q8_act() {
+                hp.shared.kernels.quant_q8(s, &hp.xn, &hp.xq, &hp.xsc, (ne / 32) as u32).map_err(map_e)?;
+            }
+            hp.qmv(&hp.ffn_gate, &hp.xn, &hp.gf, false)?;
+            hp.qmv(&hp.ffn_up, &hp.xn, &hp.uf, false)?;
+            hp.shared.ops.swiglu(s, &hp.gf, &hp.uf, &hp.af, c.n_ff as u32).map_err(map_e)?;
+            hp.qmv(&hp.ffn_down, &hp.af, &hp.o, true)?;
+            hp.shared.ops.add_rms_norm(s, &hp.x, &hp.o, &hp.head_norm, &hp.h_out, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv_buf(&hp.shared.head_buf, hp.shared.head_ty, hp.shared.head_k, hp.shared.head_m, &hp.h_out, &hp.logits, true)?;
+            hp.shared.ops.argmax(s, &hp.logits, &hp.argmax_pv, &hp.argmax_pi, &hp.argmax_out, c.n_vocab as u32).map_err(map_e)?;
+            s.synchronize().map_err(map_e)?;
+            let mut best = [0u32; 1];
+            hp.argmax_out.download(bytemuck::cast_slice_mut(&mut best)).map_err(map_e)?;
+            return Ok(best[0]);
+        }
         let Some(h_main) = h_main else {
             return Err(EngineError::Unsupported("chained MTP drafts need the GPU drafter".into()));
         };
@@ -567,6 +861,47 @@ impl MtpDrafter {
             rec.finish_and_wait().map_err(|e| EngineError::Backend(e.to_string()))?;
             let mut logits = vec![0f32; c.n_vocab];
             gp.ctx.download(&gp.logits, 0, bytemuck::cast_slice_mut(&mut logits)).map_err(|e| EngineError::Backend(e.to_string()))?;
+            return Ok(logits);
+        }
+
+        #[cfg(feature = "hip")]
+        if let Some(hp) = &self.hip {
+            let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+            let s = &hp.stream;
+            hp.tok_e.upload(bytemuck::cast_slice(&tok_e)).map_err(map_e)?;
+            hp.h_in.upload(bytemuck::cast_slice(h_main)).map_err(map_e)?;
+            hp.shared.kernels.rms_norm_at(s, &hp.tok_e, 0, &hp.enorm, &hp.concat, 0, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.shared.kernels.rms_norm_at(s, &hp.h_in, 0, &hp.hnorm, &hp.concat, ne * 4, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv(&hp.eh_proj, &hp.concat, &hp.x, true)?;
+            hp.shared.kernels.rms_norm(s, &hp.x, &hp.attn_norm, &hp.xn, ne as u32, 1, c.eps).map_err(map_e)?;
+            if hp.wq.ty.uses_q8_act() || hp.wk.ty.uses_q8_act() || hp.wv.ty.uses_q8_act() {
+                hp.shared.kernels.quant_q8(s, &hp.xn, &hp.xq, &hp.xsc, (ne / 32) as u32).map_err(map_e)?;
+            }
+            hp.qmv(&hp.wq, &hp.xn, &hp.qg, false)?;
+            hp.qmv(&hp.wk, &hp.xn, &hp.k, false)?;
+            hp.qmv(&hp.wv, &hp.xn, &hp.v, false)?;
+            hp.shared.hops.split_qg(s, &hp.qg, &hp.q, &hp.q_gate, nh as u32, hd as u32, 1).map_err(map_e)?;
+            hp.shared.ops.rms_norm_heads(s, &hp.q, &hp.q_norm, hd as u32, nh as u32, c.eps).map_err(map_e)?;
+            hp.shared.ops.rms_norm_heads(s, &hp.k, &hp.k_norm, hd as u32, nkv as u32, c.eps).map_err(map_e)?;
+            hp.shared.ops.rope(s, &hp.q, nh as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1, 1).map_err(map_e)?;
+            hp.shared.ops.rope(s, &hp.k, nkv as u32, hd as u32, c.n_rot as u32, pos as u32, c.rope_base, 1, 1).map_err(map_e)?;
+            hp.shared.ops.kv_write(s, &hp.k, &hp.v, &hp.kv, 0, &hp.pt_buf, pos as u32, kv_dim as u32, 1).map_err(map_e)?;
+            hp.shared.ops.attention_prefill(s, &hp.q, &hp.kv, 0, &hp.pt_buf, &hp.attn, nh as u32, nkv as u32, hd as u32, pos as u32, 0, 1).map_err(map_e)?;
+            hp.shared.hops.mul_sigmoid(s, &hp.attn, &hp.q_gate, (nh * hd) as u32).map_err(map_e)?;
+            hp.qmv(&hp.wo, &hp.attn, &hp.o, true)?;
+            hp.shared.ops.add_rms_norm(s, &hp.x, &hp.o, &hp.post_attn_norm, &hp.xn, ne as u32, 1, c.eps).map_err(map_e)?;
+            if hp.ffn_gate.ty.uses_q8_act() || hp.ffn_up.ty.uses_q8_act() {
+                hp.shared.kernels.quant_q8(s, &hp.xn, &hp.xq, &hp.xsc, (ne / 32) as u32).map_err(map_e)?;
+            }
+            hp.qmv(&hp.ffn_gate, &hp.xn, &hp.gf, false)?;
+            hp.qmv(&hp.ffn_up, &hp.xn, &hp.uf, false)?;
+            hp.shared.ops.swiglu(s, &hp.gf, &hp.uf, &hp.af, c.n_ff as u32).map_err(map_e)?;
+            hp.qmv(&hp.ffn_down, &hp.af, &hp.o, true)?;
+            hp.shared.ops.add_rms_norm(s, &hp.x, &hp.o, &hp.head_norm, &hp.h_out, ne as u32, 1, c.eps).map_err(map_e)?;
+            hp.qmv_buf(&hp.shared.head_buf, hp.shared.head_ty, hp.shared.head_k, hp.shared.head_m, &hp.h_out, &hp.logits, true)?;
+            s.synchronize().map_err(map_e)?;
+            let mut logits = vec![0f32; c.n_vocab];
+            hp.logits.download(bytemuck::cast_slice_mut(&mut logits)).map_err(map_e)?;
             return Ok(logits);
         }
 

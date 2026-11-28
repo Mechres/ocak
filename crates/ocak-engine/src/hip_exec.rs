@@ -4,7 +4,7 @@
 //! GQA-grouped Split-K decode attention, 4-byte GPU argmax) and batched prefill (256-token chunks,
 //! paged flash attention, Split-K `qmm`).
 use crate::config::{LayerKind, ModelConfig};
-use crate::exec::{EngineError, Executor, Out};
+use crate::exec::{EngineError, Executor, HipMtpShared, Out};
 use ocak_gguf::{GgmlType, GgufFile, TensorInfo};
 use ocak_hip::{
     HipBuffer, HipContext, HipDenseOps, HipEvent, HipGraphExec, HipHybridOps, HipIqKernels,
@@ -13,10 +13,11 @@ use ocak_hip::{
 use std::sync::Arc;
 
 const PREFILL_BATCH: usize = 256;
+const MAX_VERIFY: usize = 4;
 const DECODE_ATTN_SPLITS: u32 = 8;
 
 struct HipWeight {
-    buf: HipBuffer,
+    buf: Arc<HipBuffer>,
     ty: HipWType,
     k: u32,
     m: u32,
@@ -87,11 +88,11 @@ pub struct HipExec {
     ev_fork: HipEvent,
     ev_join_b: HipEvent,
     ev_join_c: HipEvent,
-    kernels: HipKernels,
-    iq_kernels: Option<HipIqKernels>,
-    iq_tbl: Option<HipBuffer>,
-    ops: HipDenseOps,
-    hops: HipHybridOps,
+    kernels: Arc<HipKernels>,
+    iq_kernels: Option<Arc<HipIqKernels>>,
+    iq_tbl: Option<Arc<HipBuffer>>,
+    ops: Arc<HipDenseOps>,
+    hops: Arc<HipHybridOps>,
     cfg: ModelConfig,
     layers: Vec<HipLayer>,
     embd: HipWeight,
@@ -133,21 +134,26 @@ pub struct HipExec {
     split_buf: HipBuffer,
     attn_part_out: HipBuffer,
     attn_part_ml: HipBuffer,
-    // Device-resident [token, pos] metadata for static HIP Graph decode
+    // Device-resident [token, pos] metadata for static HIP Graph decode & verify
     step_meta: HipBuffer,
     graph_argmax: Option<HipGraphExec>,
     graph_logits: Option<HipGraphExec>,
+    graph_verify_argmax: [Option<HipGraphExec>; 3],
     // Output buffers
     hidden_buf: HipBuffer,
     logits_buf: HipBuffer,
     argmax_pv: HipBuffer,
     argmax_pi: HipBuffer,
     argmax_out: HipBuffer,
+    // Speculative verify scratch & recurrent state rollback snapshots (allocated lazily on first verify)
+    rec_snaps: Option<Vec<(HipBuffer, Option<HipBuffer>)>>,
+    verify_logits: Option<HipBuffer>,
+    verify_argmax: Option<HipBuffer>,
     logits: Vec<f32>,
     hidden: Vec<f32>,
 }
 
-fn hip_wtype(ty: GgmlType) -> Result<HipWType, EngineError> {
+pub(crate) fn hip_wtype(ty: GgmlType) -> Result<HipWType, EngineError> {
     match ty {
         GgmlType::F32 => Ok(HipWType::F32),
         GgmlType::F16 => Ok(HipWType::F16),
@@ -189,9 +195,10 @@ fn upload_weight(
 ) -> Result<HipWeight, EngineError> {
     let ty = hip_wtype(ti.ty)?;
     let raw = g.tensor_data(ti);
-    let buf = ctx
-        .buffer_from_slice(raw)
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
+    let buf = Arc::new(
+        ctx.buffer_from_slice(raw)
+            .map_err(|e| EngineError::Backend(e.to_string()))?,
+    );
     Ok(HipWeight {
         buf,
         ty,
@@ -234,9 +241,9 @@ impl HipExec {
         let ev_join_c = ctx
             .create_event(false)
             .map_err(|e| EngineError::Backend(e.to_string()))?;
-        let kernels = HipKernels::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let ops = HipDenseOps::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?;
-        let hops = HipHybridOps::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?;
+        let kernels = Arc::new(HipKernels::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?);
+        let ops = Arc::new(HipDenseOps::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?);
+        let hops = Arc::new(HipHybridOps::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?);
 
         let mk_f32 = |elems: usize| -> Result<HipBuffer, EngineError> {
             ctx.alloc_buffer(elems.max(4) * 4)
@@ -405,10 +412,13 @@ impl HipExec {
             });
         let (iq_kernels, iq_tbl) = if has_iq {
             let tbl_data = ocak_gguf::iq_tables::packed_gpu_table();
-            let tbl = ctx
-                .buffer_from_slice(&tbl_data)
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
-            let iqk = HipIqKernels::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?;
+            let tbl = Arc::new(
+                ctx.buffer_from_slice(&tbl_data)
+                    .map_err(|e| EngineError::Backend(e.to_string()))?,
+            );
+            let iqk = Arc::new(
+                HipIqKernels::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?,
+            );
             (Some(iqk), Some(tbl))
         } else {
             (None, None)
@@ -490,11 +500,15 @@ impl HipExec {
                 .map_err(|e| EngineError::Backend(e.to_string()))?,
             graph_argmax: None,
             graph_logits: None,
+            graph_verify_argmax: [None, None, None],
             hidden_buf: mk_f32(cfg.n_embd)?,
             logits_buf: mk_f32(cfg.n_vocab)?,
             argmax_pv: mk_f32(256)?,
             argmax_pi: mk_f32(256)?,
             argmax_out: mk_f32(1)?,
+            rec_snaps: None,
+            verify_logits: None,
+            verify_argmax: None,
             logits: vec![0f32; cfg.n_vocab],
             hidden: vec![0f32; cfg.n_embd],
             cfg,
@@ -595,7 +609,7 @@ impl HipExec {
             s,
             &self.embd.buf,
             self.embd.ty,
-            self.iq_tbl.as_ref(),
+            self.iq_tbl.as_deref(),
             &self.step_meta,
             &self.x,
             ne,
@@ -749,8 +763,57 @@ impl HipExec {
         Ok(())
     }
 
-    /// Runs all transformer layers for a prefill batch (`2..=PREFILL_BATCH`) starting at `pos0`.
-    fn run_layers_prefill(&self, pos0: usize, batch: usize) -> Result<(), EngineError> {
+    fn ensure_rec_snaps(&mut self) -> Result<(), EngineError> {
+        if self.rec_snaps.is_some() {
+            return Ok(());
+        }
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let mut snaps = Vec::new();
+        for l in &self.layers {
+            match &l.mixer {
+                HipMixer::ShortConv { state, .. } => {
+                    snaps.push((self.ctx.alloc_buffer(state.size()).map_err(map_e)?, None));
+                }
+                HipMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                    let n_slots = MAX_VERIFY - 1;
+                    let cs = self.ctx.alloc_buffer(conv_state.size() * n_slots).map_err(map_e)?;
+                    let ss = self.ctx.alloc_buffer(ssm_state.size() * n_slots).map_err(map_e)?;
+                    snaps.push((cs, Some(ss)));
+                }
+                HipMixer::FullAttn { .. } => {}
+            }
+        }
+        self.rec_snaps = Some(snaps);
+        Ok(())
+    }
+
+    fn ensure_verify_bufs(&mut self) -> Result<(), EngineError> {
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        if self.verify_logits.is_none() {
+            self.verify_logits = Some(
+                self.ctx
+                    .alloc_buffer(MAX_VERIFY * self.cfg.n_vocab * 4)
+                    .map_err(map_e)?,
+            );
+        }
+        if self.verify_argmax.is_none() {
+            self.verify_argmax = Some(self.ctx.alloc_buffer(MAX_VERIFY * 4).map_err(map_e)?);
+        }
+        Ok(())
+    }
+
+    /// Runs all transformer layers for a prefill/verify batch (`2..=PREFILL_BATCH`) starting at `pos0`.
+    /// When `use_meta` is true, reads `pos0` from `self.step_meta[1]` so the pass can be captured in a HIP Graph.
+    /// When `snap_after` is true (speculative verify, `batch <= MAX_VERIFY`), saves post-token
+    /// recurrent state snapshots for tokens `0..batch - 1` into `self.rec_snaps`.
+    fn run_layers_prefill(
+        &self,
+        s: &HipStream,
+        pos0: usize,
+        use_meta: bool,
+        batch: usize,
+        snap_after: bool,
+    ) -> Result<(), ocak_hip::HipError> {
         let b = batch as u32;
         let ne = self.cfg.n_embd as u32;
         let nh = self.cfg.n_head as u32;
@@ -758,12 +821,11 @@ impl HipExec {
         let nr = self.cfg.n_rot as u32;
         let eps = self.cfg.eps;
         let mode = self.cfg.rope_mode;
-        let s = &self.stream;
-        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let meta = if use_meta { Some(&self.step_meta) } else { None };
+        let mut rec_snap_idx = 0usize;
 
         self.kernels
-            .rms_norm(s, &self.x, &self.layers[0].attn_norm, &self.xn, ne, b, eps)
-            .map_err(map_e)?;
+            .rms_norm(s, &self.x, &self.layers[0].attn_norm, &self.xn, ne, b, eps)?;
 
         for (li, l) in self.layers.iter().enumerate() {
             match &l.mixer {
@@ -775,115 +837,131 @@ impl HipExec {
                         || head_gate_w.as_ref().is_some_and(|w| w.ty.uses_q8_act())
                     {
                         self.kernels
-                            .quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)
-                            .map_err(map_e)?;
+                            .quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)?;
                     }
                     let q_dst = if *gated_q { &self.qg } else { &self.q };
-                    self.qmm(wq, s, &self.xn, q_dst, b).map_err(map_e)?;
-                    self.qmm(wk, s, &self.xn, &self.k, b).map_err(map_e)?;
-                    self.qmm(wv, s, &self.xn, &self.v, b).map_err(map_e)?;
+                    self.qmm(wq, s, &self.xn, q_dst, b)?;
+                    self.qmm(wk, s, &self.xn, &self.k, b)?;
+                    self.qmm(wv, s, &self.xn, &self.v, b)?;
                     if let Some(hgw) = head_gate_w {
-                        self.qmm(hgw, s, &self.xn, &self.head_gate_buf, b).map_err(map_e)?;
+                        self.qmm(hgw, s, &self.xn, &self.head_gate_buf, b)?;
                     }
 
                     if *gated_q {
-                        self.hops.split_qg(s, &self.qg, &self.q, &self.q_gate, nh, hd, b).map_err(map_e)?;
+                        self.hops.split_qg(s, &self.qg, &self.q, &self.q_gate, nh, hd, b)?;
                     }
-                    if let Some(bq) = bq { self.ops.add_bias(s, &self.q, bq, nh * hd, b).map_err(map_e)?; }
-                    if let Some(bk) = bk { self.ops.add_bias(s, &self.k, bk, *n_head_kv * hd, b).map_err(map_e)?; }
-                    if let Some(bv) = bv { self.ops.add_bias(s, &self.v, bv, *n_head_kv * hd, b).map_err(map_e)?; }
-                    if let Some(qn) = q_norm { self.ops.rms_norm_heads(s, &self.q, qn, hd, nh * b, eps).map_err(map_e)?; }
-                    if let Some(kn) = k_norm { self.ops.rms_norm_heads(s, &self.k, kn, hd, *n_head_kv * b, eps).map_err(map_e)?; }
+                    if let Some(bq) = bq { self.ops.add_bias(s, &self.q, bq, nh * hd, b)?; }
+                    if let Some(bk) = bk { self.ops.add_bias(s, &self.k, bk, *n_head_kv * hd, b)?; }
+                    if let Some(bv) = bv { self.ops.add_bias(s, &self.v, bv, *n_head_kv * hd, b)?; }
+                    if let Some(qn) = q_norm { self.ops.rms_norm_heads(s, &self.q, qn, hd, nh * b, eps)?; }
+                    if let Some(kn) = k_norm { self.ops.rms_norm_heads(s, &self.k, kn, hd, *n_head_kv * b, eps)?; }
 
                     if *use_rope_factors {
-                        self.hops.rope_ext(s, &self.q, &self.k, &self.rope_factors, nh, *n_head_kv, hd, nr, pos0 as u32, mode, *rope_base, true, b).map_err(map_e)?;
+                        self.hops.rope_ext_or_meta(s, &self.q, &self.k, &self.rope_factors, nh, *n_head_kv, hd, nr, pos0 as u32, meta, mode, *rope_base, true, b)?;
                     } else {
-                        self.ops.rope(s, &self.q, nh, hd, nr, pos0 as u32, *rope_base, mode, b).map_err(map_e)?;
-                        self.ops.rope(s, &self.k, *n_head_kv, hd, nr, pos0 as u32, *rope_base, mode, b).map_err(map_e)?;
+                        self.ops.rope_or_meta(s, &self.q, nh, hd, nr, pos0 as u32, meta, *rope_base, mode, b)?;
+                        self.ops.rope_or_meta(s, &self.k, *n_head_kv, hd, nr, pos0 as u32, meta, *rope_base, mode, b)?;
                     }
 
                     let kv_off = *kv_layer_idx * self.layer_stride_bytes;
                     let kv_dim = *n_head_kv * hd;
-                    self.ops.kv_write(s, &self.k, &self.v, &self.kv, kv_off, &self.pt_buf, pos0 as u32, kv_dim, b).map_err(map_e)?;
-                    self.ops.attention_prefill(
+                    self.ops.kv_write_or_meta(s, &self.k, &self.v, &self.kv, kv_off, &self.pt_buf, pos0 as u32, meta, kv_dim, b)?;
+                    self.ops.attention_prefill_or_meta(
                         s, &self.q, &self.kv, kv_off, &self.pt_buf, &self.attn,
-                        nh, *n_head_kv, hd, pos0 as u32, *sliding_window, b,
-                    ).map_err(map_e)?;
+                        nh, *n_head_kv, hd, pos0 as u32, meta, *sliding_window, b,
+                    )?;
 
                     if *gated_q {
-                        self.hops.mul_sigmoid(s, &self.attn, &self.q_gate, b * nh * hd).map_err(map_e)?;
+                        self.hops.mul_sigmoid(s, &self.attn, &self.q_gate, b * nh * hd)?;
                     }
                     if head_gate_w.is_some() {
-                        self.hops.mul_head_sigmoid(s, &self.attn, &self.head_gate_buf, nh, hd, b).map_err(map_e)?;
+                        self.hops.mul_head_sigmoid(s, &self.attn, &self.head_gate_buf, nh, hd, b)?;
                     }
                     if wo.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.attn, &self.xq, &self.xsc, (batch * wo.k as usize / 32) as u32).map_err(map_e)?;
+                        self.kernels.quant_q8(s, &self.attn, &self.xq, &self.xsc, (batch * wo.k as usize / 32) as u32)?;
                     }
-                    self.qmm(wo, s, &self.attn, &self.o, b).map_err(map_e)?;
+                    self.qmm(wo, s, &self.attn, &self.o, b)?;
                 }
                 HipMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
                     if in_proj.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
+                        self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)?;
                     }
-                    self.qmm(in_proj, s, &self.xn, &self.bcx, b).map_err(map_e)?;
-                    self.hops.shortconv_step(s, &self.bcx, conv_w, state, &self.gate, ne, *l_cache, b).map_err(map_e)?;
+                    self.qmm(in_proj, s, &self.xn, &self.bcx, b)?;
+                    self.hops.shortconv_step(s, &self.bcx, conv_w, state, &self.gate, ne, *l_cache, b)?;
+                    rec_snap_idx += 1;
                     if out_proj.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.gate, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
+                        self.kernels.quant_q8(s, &self.gate, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)?;
                     }
-                    self.qmm(out_proj, s, &self.gate, &self.o, b).map_err(map_e)?;
+                    self.qmm(out_proj, s, &self.gate, &self.o, b)?;
                 }
                 HipMixer::DeltaNet {
                     wqkv, wgate, walpha, wbeta, wout, conv_w, dt_bias, ssm_a, ssm_norm,
                     conv_state, ssm_state, n_k_heads, n_v_heads, state_dim, k_conv, conv_ch,
                 } => {
                     if wqkv.ty.uses_q8_act() || wgate.ty.uses_q8_act() || walpha.ty.uses_q8_act() || wbeta.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
+                        self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)?;
                     }
-                    self.qmm(wqkv, s, &self.xn, &self.qkv_raw, b).map_err(map_e)?;
-                    self.qmm(wgate, s, &self.xn, &self.z_buf, b).map_err(map_e)?;
-                    self.qmm(walpha, s, &self.xn, &self.alpha_buf, b).map_err(map_e)?;
-                    self.qmm(wbeta, s, &self.xn, &self.beta_buf, b).map_err(map_e)?;
+                    self.qmm(wqkv, s, &self.xn, &self.qkv_raw, b)?;
+                    self.qmm(wgate, s, &self.xn, &self.z_buf, b)?;
+                    self.qmm(walpha, s, &self.xn, &self.alpha_buf, b)?;
+                    self.qmm(wbeta, s, &self.xn, &self.beta_buf, b)?;
 
-                    self.hops.ssm_conv_silu(s, &self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, b).map_err(map_e)?;
-                    self.hops.deltanet_step(
-                        s, &self.qkv_conv, &self.alpha_buf, &self.beta_buf,
-                        dt_bias, ssm_a, ssm_state, &self.dn_out,
-                        *n_k_heads, *n_v_heads, *state_dim, eps, b,
-                    ).map_err(map_e)?;
-                    self.hops.gated_rms_norm(s, &self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, eps, b).map_err(map_e)?;
-                    if wout.ty.uses_q8_act() {
-                        self.kernels.quant_q8(s, &self.dn_norm, &self.xq, &self.xsc, (batch * wout.k as usize / 32) as u32).map_err(map_e)?;
+                    if snap_after && (2..=MAX_VERIFY as u32).contains(&b) {
+                        let snaps = self.rec_snaps.as_ref().unwrap();
+                        let n_snaps = b - 1;
+                        self.hops.ssm_conv_silu_snap(
+                            s, &self.qkv_raw, conv_w, conv_state, &self.qkv_conv,
+                            &snaps[rec_snap_idx].0, *conv_ch, *k_conv, b, n_snaps,
+                        )?;
+                        self.hops.deltanet_step_snap(
+                            s, &self.qkv_conv, &self.alpha_buf, &self.beta_buf,
+                            dt_bias, ssm_a, ssm_state, &self.dn_out,
+                            snaps[rec_snap_idx].1.as_ref().unwrap(),
+                            *n_k_heads, *n_v_heads, *state_dim, eps, b, n_snaps,
+                        )?;
+                    } else {
+                        self.hops.ssm_conv_silu(s, &self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, b)?;
+                        self.hops.deltanet_step(
+                            s, &self.qkv_conv, &self.alpha_buf, &self.beta_buf,
+                            dt_bias, ssm_a, ssm_state, &self.dn_out,
+                            *n_k_heads, *n_v_heads, *state_dim, eps, b,
+                        )?;
                     }
-                    self.qmm(wout, s, &self.dn_norm, &self.o, b).map_err(map_e)?;
+                    rec_snap_idx += 1;
+                    self.hops.gated_rms_norm(s, &self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, *n_v_heads, *state_dim, eps, b)?;
+                    if wout.ty.uses_q8_act() {
+                        self.kernels.quant_q8(s, &self.dn_norm, &self.xq, &self.xsc, (batch * wout.k as usize / 32) as u32)?;
+                    }
+                    self.qmm(wout, s, &self.dn_norm, &self.o, b)?;
                 }
             }
 
             if let Some(pan) = &l.post_attn_norm {
-                self.kernels.rms_norm(s, &self.o, pan, &self.o, ne, b, eps).map_err(map_e)?;
+                self.kernels.rms_norm(s, &self.o, pan, &self.o, ne, b, eps)?;
             }
-            self.ops.add_rms_norm(s, &self.x, &self.o, &l.ffn_norm, &self.xn, ne, b, eps).map_err(map_e)?;
+            self.ops.add_rms_norm(s, &self.x, &self.o, &l.ffn_norm, &self.xn, ne, b, eps)?;
 
             if l.gate.ty.uses_q8_act() || l.up.ty.uses_q8_act() {
-                self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
+                self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32)?;
             }
-            self.qmm(&l.gate, s, &self.xn, &self.gate, b).map_err(map_e)?;
-            self.qmm(&l.up, s, &self.xn, &self.up, b).map_err(map_e)?;
-            self.ops.swiglu(s, &self.gate, &self.up, &self.act, (batch * self.cfg.n_ff) as u32).map_err(map_e)?;
+            self.qmm(&l.gate, s, &self.xn, &self.gate, b)?;
+            self.qmm(&l.up, s, &self.xn, &self.up, b)?;
+            self.ops.swiglu(s, &self.gate, &self.up, &self.act, (batch * self.cfg.n_ff) as u32)?;
 
             if l.down.ty.uses_q8_act() {
-                self.kernels.quant_q8(s, &self.act, &self.xq, &self.xsc, (batch * self.cfg.n_ff / 32) as u32).map_err(map_e)?;
+                self.kernels.quant_q8(s, &self.act, &self.xq, &self.xsc, (batch * self.cfg.n_ff / 32) as u32)?;
             }
-            self.qmm(&l.down, s, &self.act, &self.o, b).map_err(map_e)?;
+            self.qmm(&l.down, s, &self.act, &self.o, b)?;
 
             if let Some(pfn) = &l.post_ffw_norm {
-                self.kernels.rms_norm(s, &self.o, pfn, &self.o, ne, b, eps).map_err(map_e)?;
+                self.kernels.rms_norm(s, &self.o, pfn, &self.o, ne, b, eps)?;
             }
             let next_norm = if li + 1 < self.layers.len() {
                 &self.layers[li + 1].attn_norm
             } else {
                 &self.out_norm
             };
-            self.ops.add_rms_norm(s, &self.x, &self.o, next_norm, &self.xn, ne, b, eps).map_err(map_e)?;
+            self.ops.add_rms_norm(s, &self.x, &self.o, next_norm, &self.xn, ne, b, eps)?;
         }
         Ok(())
     }
@@ -1041,14 +1119,15 @@ impl Executor for HipExec {
                     &self.stream,
                     &self.embd.buf,
                     self.embd.ty,
-                    self.iq_tbl.as_ref(),
+                    self.iq_tbl.as_deref(),
                     &self.toks_buf,
                     &self.x,
                     self.cfg.n_embd as u32,
                     chunk.len() as u32,
                 )
                 .map_err(map_e)?;
-            self.run_layers_prefill(pos0 + offset, chunk.len())?;
+            self.run_layers_prefill(&self.stream, pos0 + offset, false, chunk.len(), false)
+                .map_err(map_e)?;
 
             if is_last && (out.logits || out.hidden) {
                 let last_off = (chunk.len() - 1) * self.cfg.n_embd * 4;
@@ -1074,6 +1153,352 @@ impl Executor for HipExec {
             offset += chunk.len();
         }
         Ok(())
+    }
+
+    fn forward_batch_collect_hiddens(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+        out: Out,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if tokens.len() == 1 {
+            self.forward(tokens[0], pos0, page_table, Out { logits: out.logits, hidden: true })?;
+            return Ok(vec![self.hidden.clone()]);
+        }
+        for &tok in tokens {
+            if tok as usize >= self.cfg.n_vocab {
+                return Err(EngineError::Context(format!(
+                    "token id {tok} out of range (n_vocab={})",
+                    self.cfg.n_vocab
+                )));
+            }
+        }
+        self.sync_page_table(page_table)?;
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let ne = self.cfg.n_embd;
+        let mut hiddens = Vec::with_capacity(tokens.len());
+
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let chunk = &tokens[offset..(offset + PREFILL_BATCH).min(tokens.len())];
+            let is_last = offset + chunk.len() == tokens.len();
+            self.toks_buf
+                .upload_at(0, bytemuck::cast_slice(chunk))
+                .map_err(map_e)?;
+            self.ops
+                .embed_tokens_batch(
+                    &self.stream,
+                    &self.embd.buf,
+                    self.embd.ty,
+                    self.iq_tbl.as_deref(),
+                    &self.toks_buf,
+                    &self.x,
+                    ne as u32,
+                    chunk.len() as u32,
+                )
+                .map_err(map_e)?;
+            self.run_layers_prefill(&self.stream, pos0 + offset, false, chunk.len(), false)
+                .map_err(map_e)?;
+
+            if is_last && out.logits {
+                let last_off = (chunk.len() - 1) * ne * 4;
+                self.hidden_buf
+                    .copy_from_at_async(0, &self.xn, last_off, ne * 4, &self.stream)
+                    .map_err(map_e)?;
+                self.run_lm_head(&self.hidden_buf)?;
+            }
+            self.stream.synchronize().map_err(map_e)?;
+
+            let mut h_chunk = vec![0f32; chunk.len() * ne];
+            self.xn
+                .download_at(0, bytemuck::cast_slice_mut(&mut h_chunk))
+                .map_err(map_e)?;
+            for h in h_chunk.chunks_exact(ne) {
+                hiddens.push(h.to_vec());
+            }
+            if is_last {
+                self.hidden.copy_from_slice(hiddens.last().unwrap());
+                if out.logits {
+                    self.logits_buf
+                        .download(bytemuck::cast_slice_mut(&mut self.logits))
+                        .map_err(map_e)?;
+                }
+            }
+            offset += chunk.len();
+        }
+        Ok(hiddens)
+    }
+
+    fn forward_verify2(
+        &mut self,
+        tokens: [u32; 2],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<([Vec<f32>; 2], [Vec<f32>; 2])>, EngineError> {
+        let Some((mut ls, mut hs)) = self.forward_verify_logits(&tokens, pos0, page_table)? else {
+            return Ok(None);
+        };
+        let l1 = ls.pop().unwrap();
+        let l0 = ls.pop().unwrap();
+        let h1 = hs.pop().unwrap();
+        let h0 = hs.pop().unwrap();
+        Ok(Some(([l0, l1], [h0, h1])))
+    }
+
+    fn forward_verify2_argmax(
+        &mut self,
+        tokens: [u32; 2],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<([u32; 2], [Vec<f32>; 2])>, EngineError> {
+        let Some((idx, mut hs)) = self.forward_verify_argmax(&tokens, pos0, page_table)? else {
+            return Ok(None);
+        };
+        let h1 = hs.pop().unwrap();
+        let h0 = hs.pop().unwrap();
+        Ok(Some(([idx[0], idx[1]], [h0, h1])))
+    }
+
+    fn forward_verify_logits(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>, EngineError> {
+        let n = tokens.len();
+        if !(2..=MAX_VERIFY).contains(&n) {
+            return Ok(None);
+        }
+        self.ensure_rec_snaps()?;
+        self.ensure_verify_bufs()?;
+        self.sync_page_table(page_table)?;
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let ne = self.cfg.n_embd;
+        let nv = self.cfg.n_vocab;
+
+        self.toks_buf
+            .upload_at(0, bytemuck::cast_slice(tokens))
+            .map_err(map_e)?;
+        self.ops
+            .embed_tokens_batch(
+                &self.stream,
+                &self.embd.buf,
+                self.embd.ty,
+                self.iq_tbl.as_deref(),
+                &self.toks_buf,
+                &self.x,
+                ne as u32,
+                n as u32,
+            )
+            .map_err(map_e)?;
+        self.run_layers_prefill(&self.stream, pos0, false, n, true)
+            .map_err(map_e)?;
+
+        let head = self.output.as_ref().unwrap_or(&self.embd);
+        if head.ty.uses_q8_act() {
+            self.kernels
+                .quant_q8(&self.stream, &self.xn, &self.xq, &self.xsc, (n * ne / 32) as u32)
+                .map_err(map_e)?;
+        }
+        let v_logits = self.verify_logits.as_ref().unwrap();
+        self.qmm(head, &self.stream, &self.xn, v_logits, n as u32)
+            .map_err(map_e)?;
+        self.stream.synchronize().map_err(map_e)?;
+
+        let mut l_all = vec![0f32; n * nv];
+        let mut h_all = vec![0f32; n * ne];
+        v_logits
+            .download_at(0, bytemuck::cast_slice_mut(&mut l_all))
+            .map_err(map_e)?;
+        self.xn
+            .download_at(0, bytemuck::cast_slice_mut(&mut h_all))
+            .map_err(map_e)?;
+        let ls: Vec<Vec<f32>> = l_all.chunks_exact(nv).map(|c| c.to_vec()).collect();
+        let hs: Vec<Vec<f32>> = h_all.chunks_exact(ne).map(|c| c.to_vec()).collect();
+        self.hidden.copy_from_slice(&hs[n - 1]);
+        self.logits.copy_from_slice(&ls[n - 1]);
+        Ok(Some((ls, hs)))
+    }
+
+    fn forward_verify_argmax(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        page_table: &[u32],
+    ) -> Result<Option<(Vec<u32>, Vec<Vec<f32>>)>, EngineError> {
+        let n = tokens.len();
+        if !(2..=MAX_VERIFY).contains(&n) {
+            return Ok(None);
+        }
+        self.ensure_rec_snaps()?;
+        self.ensure_verify_bufs()?;
+        self.sync_page_table(page_table)?;
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let ne = self.cfg.n_embd;
+        let nv = self.cfg.n_vocab;
+
+        self.toks_buf
+            .upload_at(0, bytemuck::cast_slice(tokens))
+            .map_err(map_e)?;
+        let meta = [0u32, pos0 as u32];
+        self.step_meta
+            .upload(bytemuck::cast_slice(&meta))
+            .map_err(map_e)?;
+
+        if self.graph_verify_argmax[n - 2].is_none() {
+            let g = self
+                .stream
+                .capture_graph(|s| {
+                    self.ops.embed_tokens_batch(
+                        s,
+                        &self.embd.buf,
+                        self.embd.ty,
+                        self.iq_tbl.as_deref(),
+                        &self.toks_buf,
+                        &self.x,
+                        ne as u32,
+                        n as u32,
+                    )?;
+                    self.run_layers_prefill(s, 0, true, n, true)?;
+                    let head = self.output.as_ref().unwrap_or(&self.embd);
+                    if head.ty.uses_q8_act() {
+                        self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (n * ne / 32) as u32)?;
+                    }
+                    let v_logits = self.verify_logits.as_ref().unwrap();
+                    let v_argmax = self.verify_argmax.as_ref().unwrap();
+                    self.qmm(head, s, &self.xn, v_logits, n as u32)?;
+                    for t in 0..n {
+                        self.ops.argmax_at(
+                            s,
+                            v_logits,
+                            t * nv * 4,
+                            &self.argmax_pv,
+                            &self.argmax_pi,
+                            v_argmax,
+                            t * 4,
+                            nv as u32,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .map_err(map_e)?;
+            self.graph_verify_argmax[n - 2] = Some(g);
+        }
+        self.graph_verify_argmax[n - 2]
+            .as_ref()
+            .unwrap()
+            .launch(&self.stream)
+            .map_err(map_e)?;
+        self.stream.synchronize().map_err(map_e)?;
+
+        let v_argmax = self.verify_argmax.as_ref().unwrap();
+        let mut idx = vec![0u32; n];
+        let mut h_all = vec![0f32; n * ne];
+        v_argmax
+            .download_at(0, bytemuck::cast_slice_mut(&mut idx))
+            .map_err(map_e)?;
+        self.xn
+            .download_at(0, bytemuck::cast_slice_mut(&mut h_all))
+            .map_err(map_e)?;
+        let hs: Vec<Vec<f32>> = h_all.chunks_exact(ne).map(|c| c.to_vec()).collect();
+        self.hidden.copy_from_slice(&hs[n - 1]);
+        Ok(Some((idx, hs)))
+    }
+
+    fn snapshot_recurrent(&mut self) -> Result<(), EngineError> {
+        self.ensure_rec_snaps()?;
+        let snaps = self.rec_snaps.as_ref().unwrap();
+        if snaps.is_empty() {
+            return Ok(());
+        }
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let mut idx = 0usize;
+        for l in &self.layers {
+            match &l.mixer {
+                HipMixer::ShortConv { state, .. } => {
+                    snaps[idx]
+                        .0
+                        .copy_from_at_async(0, state, 0, state.size(), &self.stream)
+                        .map_err(map_e)?;
+                    idx += 1;
+                }
+                HipMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                    snaps[idx]
+                        .0
+                        .copy_from_at_async(0, conv_state, 0, conv_state.size(), &self.stream)
+                        .map_err(map_e)?;
+                    snaps[idx]
+                        .1
+                        .as_ref()
+                        .unwrap()
+                        .copy_from_at_async(0, ssm_state, 0, ssm_state.size(), &self.stream)
+                        .map_err(map_e)?;
+                    idx += 1;
+                }
+                HipMixer::FullAttn { .. } => {}
+            }
+        }
+        self.stream.synchronize().map_err(map_e)
+    }
+
+    fn restore_recurrent(&mut self) -> Result<(), EngineError> {
+        self.restore_recurrent_to(0)
+    }
+
+    fn restore_recurrent_to(&mut self, k: usize) -> Result<(), EngineError> {
+        let Some(snaps) = self.rec_snaps.as_ref() else {
+            return Ok(());
+        };
+        if snaps.is_empty() {
+            return Ok(());
+        }
+        let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
+        let mut idx = 0usize;
+        for l in &self.layers {
+            match &l.mixer {
+                HipMixer::ShortConv { state, .. } => {
+                    if k != 0 {
+                        return Err(EngineError::Unsupported("short-conv rollback beyond token 0".into()));
+                    }
+                    state
+                        .copy_from_at_async(0, &snaps[idx].0, 0, state.size(), &self.stream)
+                        .map_err(map_e)?;
+                    idx += 1;
+                }
+                HipMixer::DeltaNet { conv_state, ssm_state, .. } => {
+                    let (cs, ss) = (conv_state.size(), ssm_state.size());
+                    conv_state
+                        .copy_from_at_async(0, &snaps[idx].0, k * cs, cs, &self.stream)
+                        .map_err(map_e)?;
+                    ssm_state
+                        .copy_from_at_async(0, snaps[idx].1.as_ref().unwrap(), k * ss, ss, &self.stream)
+                        .map_err(map_e)?;
+                    idx += 1;
+                }
+                HipMixer::FullAttn { .. } => {}
+            }
+        }
+        self.stream.synchronize().map_err(map_e)
+    }
+
+    fn mtp_hip_shared(&self) -> Option<HipMtpShared> {
+        let head = self.output.as_ref().unwrap_or(&self.embd);
+        Some(HipMtpShared {
+            ctx: Arc::clone(&self.ctx),
+            kernels: Arc::clone(&self.kernels),
+            iq_kernels: self.iq_kernels.as_ref().map(Arc::clone),
+            iq_tbl: self.iq_tbl.as_ref().map(Arc::clone),
+            ops: Arc::clone(&self.ops),
+            hops: Arc::clone(&self.hops),
+            head_buf: Arc::clone(&head.buf),
+            head_ty: head.ty,
+            head_k: head.k,
+            head_m: head.m,
+        })
     }
 
     fn logits(&self) -> &[f32] {
