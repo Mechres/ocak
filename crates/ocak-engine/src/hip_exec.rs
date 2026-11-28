@@ -1485,6 +1485,20 @@ impl Executor for HipExec {
         self.stream.synchronize().map_err(map_e)
     }
 
+    fn mtp_hip_verify_bytes(&self) -> u64 {
+        // Mirrors ensure_rec_snaps + ensure_verify_bufs.
+        let snaps: usize = self
+            .layers
+            .iter()
+            .map(|l| match &l.mixer {
+                HipMixer::ShortConv { state, .. } => state.size(),
+                HipMixer::DeltaNet { conv_state, ssm_state, .. } => (conv_state.size() + ssm_state.size()) * (MAX_VERIFY - 1),
+                HipMixer::FullAttn { .. } => 0,
+            })
+            .sum();
+        (snaps + MAX_VERIFY * self.cfg.n_vocab * 4 + MAX_VERIFY * 4) as u64
+    }
+
     fn mtp_hip_shared(&self) -> Option<HipMtpShared> {
         let head = self.output.as_ref().unwrap_or(&self.embd);
         Some(HipMtpShared {

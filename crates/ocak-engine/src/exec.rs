@@ -150,6 +150,11 @@ pub trait Executor: Send {
     fn mtp_hip_shared(&self) -> Option<HipMtpShared> {
         None
     }
+    /// VRAM the executor allocates lazily on the first MTP verify (state snapshots, logits).
+    #[cfg(feature = "hip")]
+    fn mtp_hip_verify_bytes(&self) -> u64 {
+        0
+    }
     /// Processes a precomputed input embedding vector (`[n_embd]`) at position `pos` (for multimodal audio/vision).
     fn forward_embd(&mut self, _embd: &[f32], _pos: usize, _page_table: &[u32], _out: Out) -> Result<(), EngineError> {
         Err(EngineError::Unsupported("forward_embd not implemented for this executor".into()))

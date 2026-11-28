@@ -33,6 +33,9 @@ jobs:
       - name: Long-context counting test
         run: cargo run --release --bin ocak -- count-test
 
+      - name: Long-context counting test (HIP)
+        run: cargo run --release --bin ocak -- count-test --backend hip
+
       - name: Benchmark
         run: |
           set -o pipefail   # a crashed `ocak bench` must fail the step, not vanish behind tee
@@ -56,11 +59,32 @@ jobs:
           cat report.md >> "$GITHUB_STEP_SUMMARY"
           python3 ci/bench_check.py ci/bench-baseline.md $runs
 
+      - name: Benchmark (HIP)
+        run: |
+          set -o pipefail
+          bench() { cargo run --release --bin ocak -- bench --prompt-tokens 512 --decode-tokens 64 --backend hip; }
+          bench | tee bench-hip.md
+          runs="bench-hip.md"
+          if ! python3 ci/bench_check.py ci/bench-baseline-hip.md bench-hip.md > /dev/null; then
+            echo "regression or error detected; repeating the HIP benchmark once"
+            bench | tee bench-hip2.md
+            runs="bench-hip.md bench-hip2.md"
+          fi
+          {
+            echo "## HIP benchmark (prompt 512, decode 64)"
+            cat bench-hip.md
+            echo
+            echo "## vs. baseline (ci/bench-baseline-hip.md), best of: $runs"
+            python3 ci/bench_check.py ci/bench-baseline-hip.md $runs
+          } > report-hip.md || true
+          cat report-hip.md >> "$GITHUB_STEP_SUMMARY"
+          python3 ci/bench_check.py ci/bench-baseline-hip.md $runs
+
       - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: bench
           path: |
             bench*.md
-            report.md
+            report*.md
           if-no-files-found: ignore

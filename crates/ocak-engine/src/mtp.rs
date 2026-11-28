@@ -366,6 +366,19 @@ impl MtpDrafter {
         Ok(())
     }
 
+    /// Device bytes `attach_hip` allocates (weights, KV, scratch), used to check it fits in VRAM.
+    #[cfg(feature = "hip")]
+    pub fn hip_bytes(&self) -> u64 {
+        let w: usize = [&self.eh_proj, &self.wq, &self.wk, &self.wv, &self.wo, &self.ffn_gate, &self.ffn_up, &self.ffn_down]
+            .iter()
+            .map(|t| self.g.tensor_data(t).len())
+            .sum();
+        let c = &self.cfg;
+        let kv = (self.max_ctx.div_ceil(16) + 1) * 2 * 16 * c.n_head_kv * c.head_dim * 2;
+        // Activation scratch, logits and argmax buffers are small next to the weights.
+        (w + kv) as u64 + 64 * 1024 * 1024
+    }
+
     /// Attaches a shared HIP context + compiled kernels + `lm_head` weight so MTP drafting runs on HIP.
     #[cfg(feature = "hip")]
     pub fn attach_hip(&mut self, mut shared: HipMtpShared) -> Result<(), EngineError> {

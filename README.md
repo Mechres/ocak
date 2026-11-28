@@ -144,7 +144,7 @@ cargo test --release --workspace
 | `crates/ocak-tok` | SentencePiece & byte-level BPE tokenizers, chat templates (ChatML/Llama2/3/Zephyr/Xing/Inkling), `<think>` budget, JSON grammar |
 | `crates/ocak-cpu` | x86-64 CPU quantized GEMV (compiled with AVX2/FMA target flags) and hybrid transformer ops |
 | `crates/ocak-vk` | Raw `ash` Vulkan 1.3/1.4 compute runtime + 74 GLSL compute shaders (20 GPU weight quant formats) |
-| `crates/ocak-hip` | Experimental standalone `dlopen("libamdhip64.so")` HSACO probe/launcher crate (not wired into engine) |
+| `crates/ocak-hip` | HIP backend (`--backend hip`): `dlopen("libamdhip64.so")` runtime, hiprtc-compiled kernels, HIP Graph decode and MTP verify; dense/hybrid models only (Xing and Inkling run on Vulkan) |
 | `crates/ocak-engine` | Native executors (`VkExec`, `CpuExec`, `XingExec`, `InklingExec`), `MtpDrafter`, sampler & generator |
 | `crates/ocak-federation` | `libllama.so` parity oracle, managed bridge, `mergen` fleet bridge, HIP `dlopen` probe |
 | `crates/ocak-server` | `axum` OpenAI + Anthropic + Embeddings + Audio + Prometheus + embedded `/ui` |

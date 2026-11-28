@@ -118,13 +118,23 @@ impl NativeEngine {
         }
         let kv_bytes = n_pages as u64 * page_bytes;
         let vram_bytes = g.file_len() + kv_bytes + 32 * 1024 * 1024;
+        // Xing and Inkling have no HIP executor: run their GPU path on Vulkan rather than
+        // silently dropping to the CPU.
+        let moe_gpu = match opts.backend {
+            BackendKind::Vulkan => true,
+            BackendKind::Hip if matches!(cfg.arch.as_str(), "xing4_0" | "inkling2_loop") => {
+                eprintln!("ocak: {} has no HIP backend; using Vulkan", cfg.arch);
+                true
+            }
+            _ => false,
+        };
         let exec: Box<dyn Executor> = if cfg.arch == "xing4_0" {
             let n_cpu_moe = if g.file_len() > 11 * (1u64 << 30) { 12 } else { 8 };
-            Box::new(crate::xing_exec::XingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, n_cpu_moe)?)
+            Box::new(crate::xing_exec::XingExec::new(Arc::clone(&g), moe_gpu, max_ctx, n_cpu_moe)?)
         } else if cfg.arch == "inkling2_loop" {
             // 24 physical MoE layers (~14.8 GB NVFP4): keep 12 on RX 6700 XT VRAM (~7.4 GB) + 12 mmap CPU
             #[cfg(feature = "vulkan")]
-            { Box::new(crate::inkling_exec::InklingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, 12)?) }
+            { Box::new(crate::inkling_exec::InklingExec::new(Arc::clone(&g), moe_gpu, max_ctx, 12)?) }
             #[cfg(not(feature = "vulkan"))]
             { return Err(EngineError::Backend("inkling2_loop needs the vulkan feature".into())); }
         } else { match opts.backend {
@@ -159,11 +169,30 @@ impl NativeEngine {
         }
         #[cfg(feature = "vulkan")]
         if let (Some(m), Some((ctx, hb, hty, hk, hm))) = (mtp.as_mut(), exec.mtp_gpu_shared()) {
-            let _ = m.attach_gpu(ctx, hb, hty, hk, hm);
+            if let Err(e) = m.attach_gpu(ctx, hb, hty, hk, hm) {
+                eprintln!("ocak: MTP head could not be placed on the GPU ({e}); drafting on CPU");
+            }
         }
         #[cfg(feature = "hip")]
         if let (Some(m), Some(shared)) = (mtp.as_mut(), exec.mtp_hip_shared()) {
-            let _ = m.attach_hip(shared);
+            // Overcommitting VRAM makes amdgpu evict buffers to GTT and every kernel thrashes
+            // (27B Q2_K: 3 tok/s with MTP vs 28 without), so only attach when the head fits.
+            let need = m.hip_bytes() + exec.mtp_hip_verify_bytes();
+            let free = vram_free_bytes();
+            if std::env::var("OCAK_MTP_PROFILE").is_ok() {
+                eprintln!("[mtp-profile] hip head + verify {} MiB, VRAM free {} MiB", need >> 20, free.unwrap_or(0) >> 20);
+            }
+            if free.is_some_and(|f| f < need + HIP_MTP_MARGIN) {
+                eprintln!(
+                    "ocak: MTP disabled: it needs {} MiB, only {} MiB VRAM free",
+                    need >> 20,
+                    free.unwrap_or(0) >> 20
+                );
+                mtp = None;
+            } else if let Err(e) = m.attach_hip(shared) {
+                eprintln!("ocak: MTP disabled: head could not be placed on the GPU ({e})");
+                mtp = None;
+            }
         }
         Ok(Self {
             cfg,
@@ -1072,6 +1101,16 @@ fn load_foreign_mtp(path: &str, cfg: &ModelConfig, max_ctx: usize) -> Result<cra
     }
     crate::mtp::MtpDrafter::try_load(g, cfg.clone(), max_ctx)?
         .ok_or_else(|| EngineError::Unsupported("no NextN MTP layer in that file".into()))
+}
+
+/// Headroom left free after attaching the HIP MTP head (driver and runtime allocations).
+#[cfg(feature = "hip")]
+const HIP_MTP_MARGIN: u64 = 256 * 1024 * 1024;
+
+#[cfg(feature = "hip")]
+fn vram_free_bytes() -> Option<u64> {
+    let tel = ocak_sysfs::amdgpu::discover_amd_gpu()?.telemetry();
+    (tel.vram_total_bytes > 0).then(|| tel.vram_total_bytes.saturating_sub(tel.vram_used_bytes))
 }
 
 fn vram_kv_budget(weight_bytes: u64) -> Option<u64> {

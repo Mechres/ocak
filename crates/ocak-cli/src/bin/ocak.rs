@@ -87,6 +87,8 @@ enum Cmd {
         models_dir: Option<PathBuf>,
         #[arg(long)]
         model: Option<PathBuf>,
+        #[arg(long, default_value = "vk")]
+        backend: String,
     },
     /// Benchmark prefill and decode throughput across local native GGUF models and emit a Markdown table
     Bench {
@@ -290,8 +292,13 @@ async fn main() -> Result<()> {
             println!("{text}");
             eprintln!("Transcribed {} bytes in {} ms", bytes.len(), t1.elapsed().as_millis());
         }
-        Cmd::CountTest { models_dir, model } => {
+        Cmd::CountTest { models_dir, model, backend } => {
             let models_dir = models_dir.unwrap_or_else(default_models_dir);
+            let bk = match backend.as_str() {
+                "cpu" => BackendKind::CpuAvx2,
+                "hip" => BackendKind::Hip,
+                _ => BackendKind::Vulkan,
+            };
             let targets: Vec<PathBuf> = if let Some(m) = model {
                 vec![m]
             } else {
@@ -306,6 +313,8 @@ async fn main() -> Result<()> {
                     "Inkling-2-Mini-UD-Q4_K_XL.gguf",
                 ]
                 .iter()
+                // Xing and Inkling have no HIP executor (they run on Vulkan).
+                .filter(|f| bk != BackendKind::Hip || !(f.starts_with("Xing") || f.starts_with("Inkling")))
                 .map(|f| models_dir.join(f))
                 .collect()
             };
@@ -323,7 +332,7 @@ async fn main() -> Result<()> {
                 }
                 let mut eng = NativeEngine::load(
                     &path,
-                    EngineOptions { backend: BackendKind::Vulkan, max_ctx: 1024, kv_pages: 128 },
+                    EngineOptions { backend: bk, max_ctx: 1024, kv_pages: 128 },
                 )?;
                 let mut row = Vec::new();
                 for n in [20usize, 120usize] {
@@ -371,6 +380,8 @@ async fn main() -> Result<()> {
                             e.arch.as_str(),
                             "llama" | "qwen2" | "lfm2" | "lfm3" | "qwen35" | "xing4_0" | "inkling2_loop"
                         )
+                        // Xing and Inkling have no HIP executor (they would run on Vulkan).
+                        && !(bk == BackendKind::Hip && matches!(e.arch.as_str(), "xing4_0" | "inkling2_loop"))
                         && filter
                             .as_deref()
                             .is_none_or(|f| e.id.to_lowercase().contains(&f.to_lowercase()))

@@ -121,6 +121,14 @@ Decode matvec bandwidth at Qwen3.8's FFN shape (5120 x 17408, batch 1, from VRAM
 IQ2_S 324, IQ2_XS 330, IQ3_XXS 349, IQ3_S 351, IQ1_S 308, Q2_K 351, Q3_K 347, Q4_K 336, Q6_K 368,
 Q8_0 371 GB/s (RX 6700 XT nominal 384 GB/s). Large matrices are near the limit.
 
+HIP VRAM headroom (Nov 2026): the HIP runtime takes ~140 MiB on the first stream, and a HIP
+process holds ~350 MiB more than Vulkan for the same model. On Qwen3.8-27B Q2_K, the MTP head
+(217 MiB) plus lazily allocated verify state (DeltaNet snapshots, ~450 MiB) pushed the process
+past 12 GB. amdgpu evicted 140 MiB to GTT (`amd-evicted-vram` in `/proc/<pid>/fdinfo`) and
+decode fell to 3 tok/s, against 28 tok/s without MTP. The engine now attaches HIP MTP only when
+head + verify state + 256 MiB fit in free VRAM. Getting that model to Vulkan's 55 tok/s with MTP
+on HIP needs ~250 MiB of HIP overhead cut.
+
 ## Tried and rejected (do not repeat without a new idea)
 
 | Idea | Result | Why (as far as known) |
