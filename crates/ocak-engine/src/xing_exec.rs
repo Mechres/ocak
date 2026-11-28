@@ -1375,12 +1375,8 @@ impl XingExec {
         let bs = chunk.len();
         let batch = bs as u32;
         let yarn = c.rope_factor > 1.0;
-        let raw_log_mul = if yarn {
-            if (c.yarn_log_mul - 0.1).abs() < 1e-4 { 0.1 } else { 0.1 * c.yarn_log_mul }
-        } else {
-            0.0
-        };
-        let mscale = if yarn { 1.0 + raw_log_mul * c.rope_factor.ln() } else { 1.0 };
+        // Same as `forward`: yarn_log_mul is already the true multiplier (see the config load).
+        let mscale = if yarn { 1.0 + 0.1 * c.yarn_log_mul * c.rope_factor.ln() } else { 1.0 };
         let kq_scale = mscale * mscale / (c.key_dim as f32).sqrt();
 
         let rb = self.embd.row_bytes();

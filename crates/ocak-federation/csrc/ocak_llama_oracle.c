@@ -21,6 +21,10 @@ int32_t ocak_oracle_eval(
     }
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
     int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        llama_model_free(model);
+        return -6;
+    }
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t)(n_tokens + 64);
     cparams.n_batch = (uint32_t)n_tokens;

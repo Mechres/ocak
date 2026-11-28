@@ -225,6 +225,9 @@ pub async fn http_request(
         if n == 0 {
             break;
         }
+        if resp.len() + n > MAX_RESPONSE_BYTES {
+            return Err(format!("http read {method} {addr}{path}: response larger than {MAX_RESPONSE_BYTES} bytes"));
+        }
         resp.extend_from_slice(&chunk[..n]);
     }
     let split = resp
@@ -238,12 +241,44 @@ pub async fn http_request(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(500);
-    Ok((status, resp[split + 4..].to_vec()))
+    let body = &resp[split + 4..];
+    let chunked = head.lines().skip(1).any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"))
+    });
+    let body = if chunked { decode_chunked(body)? } else { body.to_vec() };
+    Ok((status, body))
+}
+
+/// Cap on a buffered bridge response (they are JSON replies from a local llama-server).
+const MAX_RESPONSE_BYTES: usize = 256 << 20;
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` body (trailers ignored).
+fn decode_chunked(mut b: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(b.len());
+    loop {
+        let eol = b.windows(2).position(|w| w == b"\r\n").ok_or("malformed chunked body")?;
+        let line = std::str::from_utf8(&b[..eol]).map_err(|_| "malformed chunk size")?;
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).map_err(|_| "malformed chunk size")?;
+        b = &b[eol + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        if b.len() < size + 2 || &b[size..size + 2] != b"\r\n" {
+            return Err("truncated chunked body".into());
+        }
+        out.extend_from_slice(&b[..size]);
+        b = &b[size + 2..];
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chunked_bodies_decode() {
+        assert_eq!(decode_chunked(b"4\r\nWiki\r\n6;ext=1\r\npedia \r\n0\r\n\r\n").unwrap(), b"Wikipedia ");
+        assert!(decode_chunked(b"5\r\nabc").is_err());
+    }
     #[test]
     fn hip_probe_does_not_panic() {
         let p = hip_probe();

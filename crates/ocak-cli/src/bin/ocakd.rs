@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::future::IntoFuture;
 use ocak_engine::BackendKind;
 use ocak_server::{build_router, AppState, ServerConfig};
 use std::net::SocketAddr;
@@ -81,6 +82,47 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, ui = %format!("http://{addr}/ui"), "ocakd listening");
-    axum::serve(listener, build_router(state)).await?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server = tokio::spawn(
+        axum::serve(listener, build_router(state.clone())).with_graceful_shutdown(async {
+            let _ = stop_rx.await;
+        }).into_future(),
+    );
+    let res = tokio::select! {
+        r = &mut server => r,
+        _ = shutdown_signal() => {
+            tracing::info!("ocakd shutting down");
+            let _ = stop_tx.send(());
+            // Long-lived streams (the UI's event stream) never finish on their own.
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+                Ok(r) => r,
+                Err(_) => Ok(Ok(())),
+            }
+        }
+    };
+    state.shutdown().await;
+    res??;
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }

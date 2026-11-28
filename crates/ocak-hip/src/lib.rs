@@ -86,7 +86,9 @@ impl HipRuntime {
         }
     }
 
-    pub fn free(&self, ptr: *mut c_void) -> Result<(), HipError> {
+    /// # Safety
+    /// `ptr` must come from `malloc` on this runtime and not be freed or in use by the device.
+    pub unsafe fn free(&self, ptr: *mut c_void) -> Result<(), HipError> {
         unsafe {
             let f: Symbol<HipFreeFn> = self.lib.get(b"hipFree").map_err(|e| HipError::Symbol(e.to_string()))?;
             let rc = f(ptr);
@@ -95,7 +97,9 @@ impl HipRuntime {
         }
     }
 
-    pub fn memcpy(&self, dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> Result<(), HipError> {
+    /// # Safety
+    /// `dst` and `src` must be valid for `bytes` bytes in the memory spaces `kind` names.
+    pub unsafe fn memcpy(&self, dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> Result<(), HipError> {
         unsafe {
             let f: Symbol<HipMemcpyFn> = self.lib.get(b"hipMemcpy").map_err(|e| HipError::Symbol(e.to_string()))?;
             let rc = f(dst, src, bytes, kind);

@@ -73,7 +73,7 @@ impl Sampler {
                 *counts.entry(t).or_default() += 1;
             }
             for (t, c) in counts {
-                let l = &mut logits[t as usize];
+                let Some(l) = logits.get_mut(t as usize) else { continue };
                 if l.is_finite() {
                     if *l > 0.0 { *l /= p.repeat_penalty } else { *l *= p.repeat_penalty }
                     *l -= c as f32 * p.frequency_penalty + p.presence_penalty;
@@ -117,8 +117,10 @@ impl Sampler {
                 return cand[cand.len() - 1].0;
             }
             let sum_all: f32 = cand.iter().map(|c| ((c.1 - mx) * inv_t).exp()).sum();
-            // Nucleus / min-p: sort only a top-M prefix, growing M until it covers the cut.
+            // Nucleus / min-p: sort only a top-M prefix, growing M until it covers the cut. The
+            // cut is decided here with full-vocabulary probabilities; `keep` is the kept prefix.
             let mut m = 256usize.min(cand.len());
+            let keep;
             loop {
                 if m < cand.len() {
                     cand.select_nth_unstable_by(m - 1, cmp);
@@ -127,25 +129,34 @@ impl Sampler {
                 let w0 = 1.0f32; // exp(0): the top candidate
                 let thr = w0 * p.min_p;
                 let mut cum = 0.0f32;
-                let mut covered = m == cand.len();
-                for c in &cand[..m] {
+                let mut cut = None;
+                for (i, c) in cand[..m].iter().enumerate() {
                     let w = ((c.1 - mx) * inv_t).exp();
                     if p.min_p > 0.0 && w < thr {
-                        covered = true;
+                        cut = Some(i);
                         break;
                     }
                     cum += w / sum_all;
                     if p.top_p < 1.0 && cum >= p.top_p {
-                        covered = true;
+                        cut = Some(i + 1);
                         break;
                     }
                 }
-                if covered {
+                if let Some(k) = cut {
+                    keep = k;
+                    break;
+                }
+                if m == cand.len() {
+                    keep = m;
                     break;
                 }
                 m = (m * 4).min(cand.len());
             }
-            cand.truncate(m);
+            cand.truncate(keep.max(1));
+            // top_p / min_p are already applied: renormalizing over the prefix and cutting again
+            // would shrink the nucleus.
+            let q = SamplerParams { top_p: 1.0, min_p: 0.0, ..p.clone() };
+            return self.sample_sorted(&cand, &q);
         } else {
             cand.select_nth_unstable_by(p.top_k - 1, cmp);
             cand.truncate(p.top_k);

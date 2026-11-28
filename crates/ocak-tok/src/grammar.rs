@@ -79,8 +79,11 @@ enum Frame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     ExpectValue,
-    InString { for_key: bool, escape: bool, hex_rem: u8 },
-    InNumber { need_digit: bool, seen_dot: bool, seen_exp: bool, exp_sign_ok: bool },
+    /// `cont`: UTF-8 continuation bytes still expected, the next one in `lo..=hi` (rejects
+    /// malformed, overlong and surrogate sequences).
+    InString { for_key: bool, escape: bool, hex_rem: u8, cont: u8, lo: u8, hi: u8 },
+    /// `lead_zero`: the integer part is exactly "0" so far (no further digit allowed).
+    InNumber { need_digit: bool, seen_dot: bool, seen_exp: bool, exp_sign_ok: bool, lead_zero: bool },
     InLiteral(&'static [u8], usize),
     AfterValue,
 }
@@ -120,27 +123,34 @@ impl JsonGrammar {
 
     fn step(&mut self, b: u8) -> bool {
         match self.state {
-            State::InString { for_key, escape, hex_rem } => {
+            State::InString { for_key, escape, hex_rem, cont, lo, hi } => {
+                if cont > 0 {
+                    if b < lo || b > hi {
+                        return false;
+                    }
+                    self.state = State::InString { for_key, escape: false, hex_rem: 0, cont: cont - 1, lo: 0x80, hi: 0xBF };
+                    return true;
+                }
                 if hex_rem > 0 {
                     if !b.is_ascii_hexdigit() {
                         return false;
                     }
-                    self.state = State::InString { for_key, escape: false, hex_rem: hex_rem - 1 };
+                    self.state = State::InString { for_key, escape: false, hex_rem: hex_rem - 1, cont: 0, lo: 0x80, hi: 0xBF };
                     return true;
                 }
                 if escape {
                     if b == b'u' {
-                        self.state = State::InString { for_key, escape: false, hex_rem: 4 };
+                        self.state = State::InString { for_key, escape: false, hex_rem: 4, cont: 0, lo: 0x80, hi: 0xBF };
                         return true;
                     }
                     if matches!(b, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
-                        self.state = State::InString { for_key, escape: false, hex_rem: 0 };
+                        self.state = State::InString { for_key, escape: false, hex_rem: 0, cont: 0, lo: 0x80, hi: 0xBF };
                         return true;
                     }
                     return false;
                 }
                 if b == b'\\' {
-                    self.state = State::InString { for_key, escape: true, hex_rem: 0 };
+                    self.state = State::InString { for_key, escape: true, hex_rem: 0, cont: 0, lo: 0x80, hi: 0xBF };
                     return true;
                 }
                 if b == b'"' {
@@ -152,7 +162,22 @@ impl JsonGrammar {
                     }
                     return true;
                 }
-                b >= 0x20
+                if b < 0x80 {
+                    return b >= 0x20;
+                }
+                // UTF-8 lead byte: number of continuation bytes and the range of the first one.
+                let (n, lo, hi) = match b {
+                    0xC2..=0xDF => (1, 0x80, 0xBF),
+                    0xE0 => (2, 0xA0, 0xBF),
+                    0xED => (2, 0x80, 0x9F),
+                    0xE1..=0xEF => (2, 0x80, 0xBF),
+                    0xF0 => (3, 0x90, 0xBF),
+                    0xF1..=0xF3 => (3, 0x80, 0xBF),
+                    0xF4 => (3, 0x80, 0x8F),
+                    _ => return false,
+                };
+                self.state = State::InString { for_key, escape: false, hex_rem: 0, cont: n, lo, hi };
+                true
             }
             State::InLiteral(lit, idx) => {
                 if b != lit[idx] {
@@ -165,21 +190,26 @@ impl JsonGrammar {
                 }
                 true
             }
-            State::InNumber { need_digit, seen_dot, seen_exp, exp_sign_ok } => {
+            State::InNumber { need_digit, seen_dot, seen_exp, exp_sign_ok, lead_zero } => {
                 if b.is_ascii_digit() {
-                    self.state = State::InNumber { need_digit: false, seen_dot, seen_exp, exp_sign_ok: false };
+                    if lead_zero {
+                        return false; // no leading zeros ("01")
+                    }
+                    // First integer digit (after '-'): a '0' must stand alone.
+                    let first_int = need_digit && !seen_dot && !seen_exp;
+                    self.state = State::InNumber { need_digit: false, seen_dot, seen_exp, exp_sign_ok: false, lead_zero: first_int && b == b'0' };
                     return true;
                 }
                 if !need_digit && !seen_dot && !seen_exp && b == b'.' {
-                    self.state = State::InNumber { need_digit: true, seen_dot: true, seen_exp: false, exp_sign_ok: false };
+                    self.state = State::InNumber { need_digit: true, seen_dot: true, seen_exp: false, exp_sign_ok: false, lead_zero: false };
                     return true;
                 }
                 if !need_digit && !seen_exp && (b == b'e' || b == b'E') {
-                    self.state = State::InNumber { need_digit: true, seen_dot, seen_exp: true, exp_sign_ok: true };
+                    self.state = State::InNumber { need_digit: true, seen_dot, seen_exp: true, exp_sign_ok: true, lead_zero: false };
                     return true;
                 }
                 if exp_sign_ok && (b == b'+' || b == b'-') {
-                    self.state = State::InNumber { need_digit: true, seen_dot, seen_exp, exp_sign_ok: false };
+                    self.state = State::InNumber { need_digit: true, seen_dot, seen_exp, exp_sign_ok: false, lead_zero: false };
                     return true;
                 }
                 if need_digit {
@@ -190,7 +220,7 @@ impl JsonGrammar {
                 self.step(b)
             }
             State::ExpectValue => {
-                if b.is_ascii_whitespace() {
+                if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
                     return true;
                 }
                 if let Some(&Frame::ArrayValueOrEnd) = self.stack.last() {
@@ -213,15 +243,15 @@ impl JsonGrammar {
                         true
                     }
                     b'"' => {
-                        self.state = State::InString { for_key: false, escape: false, hex_rem: 0 };
+                        self.state = State::InString { for_key: false, escape: false, hex_rem: 0, cont: 0, lo: 0x80, hi: 0xBF };
                         true
                     }
                     b'-' => {
-                        self.state = State::InNumber { need_digit: true, seen_dot: false, seen_exp: false, exp_sign_ok: false };
+                        self.state = State::InNumber { need_digit: true, seen_dot: false, seen_exp: false, exp_sign_ok: false, lead_zero: false };
                         true
                     }
                     b'0'..=b'9' => {
-                        self.state = State::InNumber { need_digit: false, seen_dot: false, seen_exp: false, exp_sign_ok: false };
+                        self.state = State::InNumber { need_digit: false, seen_dot: false, seen_exp: false, exp_sign_ok: false, lead_zero: b == b'0' };
                         true
                     }
                     b't' => { self.state = State::InLiteral(b"true", 1); true }
@@ -231,7 +261,7 @@ impl JsonGrammar {
                 }
             }
             State::AfterValue => {
-                if b.is_ascii_whitespace() {
+                if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
                     return true;
                 }
                 match self.stack.last().copied() {
@@ -243,7 +273,7 @@ impl JsonGrammar {
                             true
                         } else if b == b'"' {
                             *self.stack.last_mut().unwrap() = Frame::ObjectCommaOrEnd;
-                            self.state = State::InString { for_key: true, escape: false, hex_rem: 0 };
+                            self.state = State::InString { for_key: true, escape: false, hex_rem: 0, cont: 0, lo: 0x80, hi: 0xBF };
                             true
                         } else {
                             false
@@ -252,7 +282,7 @@ impl JsonGrammar {
                     Some(Frame::ObjectKeyOnly) => {
                         if b == b'"' {
                             *self.stack.last_mut().unwrap() = Frame::ObjectCommaOrEnd;
-                            self.state = State::InString { for_key: true, escape: false, hex_rem: 0 };
+                            self.state = State::InString { for_key: true, escape: false, hex_rem: 0, cont: 0, lo: 0x80, hi: 0xBF };
                             true
                         } else {
                             false
@@ -330,9 +360,9 @@ impl JsonGrammar {
             reset(&mut g);
             *ok = g.step(b as u8);
         }
-        // Inside a string (no pending escape) a byte >= 0x20 other than '"' and '\\' is accepted and
-        // leaves the state unchanged, so tokens made only of such bytes need no stepping.
-        let plain_string = matches!(self.state, State::InString { escape: false, hex_rem: 0, .. });
+        // Inside a string (no pending escape or UTF-8 sequence) an ASCII byte >= 0x20 other than '"'
+        // and '\\' is accepted and leaves the state unchanged, so such tokens need no stepping.
+        let plain_string = matches!(self.state, State::InString { escape: false, hex_rem: 0, cont: 0, .. });
         // JSON whitespace that leaves the state unchanged here (between values): skip a token's
         // leading whitespace and test its first other byte (~40% of BPE tokens start with ' ').
         let mut ws_noop = [false; 256];
@@ -353,7 +383,7 @@ impl JsonGrammar {
                     true // whitespace only, all no-ops here
                 } else if !first_ok[bytes[0] as usize] {
                     false
-                } else if plain_string && bytes.iter().all(|&b| b >= 0x20 && b != b'"' && b != b'\\') {
+                } else if plain_string && bytes.iter().all(|&b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\') {
                     true
                 } else {
                     // One reset of a scratch copy per token (no allocation); `step` mutates it in
@@ -379,5 +409,45 @@ impl JsonGrammar {
             }
         }
         bits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JsonGrammar;
+
+    fn accepts(doc: &[u8]) -> bool {
+        let mut g = JsonGrammar::new();
+        doc.iter().all(|&b| g.feed_byte(b)) && g.is_complete()
+    }
+
+    #[test]
+    fn json_valid_documents() {
+        for d in [
+            &b"{\"a\": [1, -0.5, 0, -0, 10, 1e5, 2E-3, true, false, null], \"b\": {}}"[..],
+            b"\"\\u00e9\\n\"",
+            "\"caf\u{e9} \u{65e5}\u{672c} \u{1f600}\"".as_bytes(),
+            b" \t\r\n[ ]",
+        ] {
+            assert!(accepts(d), "rejected {:?}", String::from_utf8_lossy(d));
+        }
+    }
+
+    #[test]
+    fn json_invalid_documents() {
+        for d in [
+            &b"01"[..],
+            b"-01",
+            b"[00]",
+            b"\x0c{}",
+            b"[1,\x0c2]",
+            b"\"\xff\"",
+            b"\"\xc0\xaf\"",         // overlong '/'
+            b"\"\xed\xa0\x80\"",     // UTF-16 surrogate
+            b"\"\xe2\x82\"",         // truncated sequence
+            b"\"\x80\"",             // stray continuation byte
+        ] {
+            assert!(!accepts(d), "accepted {:?}", d);
+        }
     }
 }

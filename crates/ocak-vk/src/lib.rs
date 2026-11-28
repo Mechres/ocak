@@ -2,6 +2,7 @@
 use ash::{vk, Device, Entry, Instance};
 use ocak_gguf::GgmlType;
 use std::ffi::{CStr, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
@@ -416,6 +417,9 @@ pub struct VkContext {
     q8_scratch: vk::Buffer,
     q8_scratch_mem: vk::DeviceMemory,
     exec: Mutex<ExecState>,
+    /// Set while `upload_async` copies may be in flight, so `Buffer::drop` knows to wait for
+    /// them (cleared by `drain_async`). Never set while a `Recorder` holds `exec`.
+    async_pending: AtomicBool,
     ts_period_ns: f64,
 }
 
@@ -1018,6 +1022,7 @@ impl VkContext {
                 attn_scratch_mem,
                 q8_scratch,
                 q8_scratch_mem,
+                async_pending: AtomicBool::new(false),
                 exec: Mutex::new(ExecState {
                     cmd_pool,
                     cmd_buf,
@@ -1106,6 +1111,7 @@ impl VkContext {
                 exec.up_pending[i] = false;
             }
         }
+        self.async_pending.store(false, Ordering::Release);
     }
 
     /// Like `upload`, but returns once the copy is submitted: the next call's CPU copy (into the
@@ -1144,6 +1150,7 @@ impl VkContext {
                 let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
                 self.device.queue_submit(self.queue, &si, exec.up_fences[slot])?;
                 exec.up_pending[slot] = true;
+                self.async_pending.store(true, Ordering::Release);
             }
             off += chunk;
         }
@@ -1267,6 +1274,10 @@ impl VkContext {
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
             self.device.cmd_fill_buffer(exec.cmd_buf, dst.buf, 0, vk::WHOLE_SIZE, 0);
+            let bar = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            self.device.cmd_pipeline_barrier(exec.cmd_buf, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &bar, &[], &[]);
             self.device.end_command_buffer(exec.cmd_buf)?;
             self.submit_wait(&exec)?;
         }
@@ -1299,7 +1310,8 @@ impl Drop for VkContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            if let Ok(exec) = self.exec.get_mut() {
+            {
+                let exec = self.exec.get_mut().unwrap_or_else(|e| e.into_inner());
                 if exec.qpool != vk::QueryPool::null() {
                     self.device.destroy_query_pool(exec.qpool, None);
                 }
@@ -1343,22 +1355,39 @@ unsafe fn alloc_raw_buffer(
     usage: vk::BufferUsageFlags,
     flags: vk::MemoryPropertyFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory), VkError> {
+    // 16 bytes of tail padding: shaders read packed bytes as 32-bit words and may touch the word
+    // after the last byte they use (e.g. `bytes4` in dequant_i8.glsl at the end of a tensor).
+    // Descriptors bind WHOLE_SIZE, so the padding is in range.
     let buf = dev.create_buffer(
         &vk::BufferCreateInfo::default()
-            .size(size)
+            .size(size + 16)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE),
         None,
     )?;
     let req = dev.get_buffer_memory_requirements(buf);
-    let mem_type = find_mem_type(mp, req.memory_type_bits, flags).ok_or(VkError::NoMemoryType)?;
-    let mem = dev.allocate_memory(
+    let Some(mem_type) = find_mem_type(mp, req.memory_type_bits, flags) else {
+        dev.destroy_buffer(buf, None);
+        return Err(VkError::NoMemoryType);
+    };
+    // Out-of-memory here is routine (VRAM -> GTT fallback), so release the buffer on failure.
+    let mem = match dev.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(mem_type),
         None,
-    )?;
-    dev.bind_buffer_memory(buf, mem, 0)?;
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            dev.destroy_buffer(buf, None);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = dev.bind_buffer_memory(buf, mem, 0) {
+        dev.destroy_buffer(buf, None);
+        dev.free_memory(mem, None);
+        return Err(e.into());
+    }
     Ok((buf, mem))
 }
 
@@ -1375,6 +1404,12 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        // An `upload_async` copy into this buffer may still be in flight (e.g. a model load that
+        // failed part-way): wait for it before the memory is freed.
+        if self.ctx.async_pending.load(Ordering::Acquire) {
+            let mut exec = self.ctx.exec.lock().unwrap_or_else(|e| e.into_inner());
+            self.ctx.drain_async(&mut exec);
+        }
         unsafe {
             self.ctx.device.destroy_buffer(self.buf, None);
             self.ctx.device.free_memory(self.mem, None);
@@ -2603,8 +2638,9 @@ impl<'a> Recorder<'a> {
         }
         let mut offs = Vec::with_capacity(reads.len());
         unsafe {
-            let pre = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-            ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &pre, &[], &[]);
+            // Covers compute writes and recorded transfers (copies, `update`) before the readback.
+            let pre = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+            ctx.device.cmd_pipeline_barrier(self.exec.cmd_buf, vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &pre, &[], &[]);
             let mut so = 0u64;
             for r in reads.iter() {
                 if !r.2.is_empty() {

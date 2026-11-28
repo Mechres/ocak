@@ -106,6 +106,14 @@ fn engine_kind_for(e: &CatalogEntry) -> &'static str {
 }
 
 impl AppState {
+    /// Stops all llama-server bridge processes (called on shutdown: `AppState` itself is kept
+    /// alive by background tasks, so the handles' `Drop` would never run).
+    pub async fn shutdown(&self) {
+        for (_, mut h) in self.bridges.lock().await.drain() {
+            h.stop();
+        }
+    }
+
     pub fn new(cfg: ServerConfig) -> Arc<Self> {
         let catalog = scan(&cfg.models_dirs);
         let presets = Presets::load(&cfg.presets_path);
@@ -234,12 +242,20 @@ impl AppState {
             .set_state(&entry.id, est, ModelResidencyState::Loading, Instant::now());
         let model_path = entry.path.clone();
         let mmproj_owned = mmproj.to_path_buf();
-        let eng = tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || {
             ocak_engine::asr::Qwen3AsrEngine::load(&model_path, &mmproj_owned, true)
         })
         .await
-        .map_err(|e| format!("join error: {e}"))?
-        .map_err(|e| format!("ASR load failed: {e}"))?;
+        .map_err(|e| format!("join error: {e}"))
+        .and_then(|r| r.map_err(|e| format!("ASR load failed: {e}")));
+        let eng = match res {
+            Ok(e) => e,
+            Err(e) => {
+                // Do not keep the estimate reserved for a model that never loaded.
+                self.governor.lock().await.set_state(&entry.id, 0, ModelResidencyState::ColdCatalog, Instant::now());
+                return Err(e);
+            }
+        };
         *self.asr.lock().await = Some((entry.id.clone(), eng));
         self.governor
             .lock()
@@ -309,10 +325,18 @@ impl AppState {
             max_ctx: self.cfg.max_ctx,
             kv_pages,
         };
-        let eng = tokio::task::spawn_blocking(move || NativeEngine::load(&path, opts))
+        let res = tokio::task::spawn_blocking(move || NativeEngine::load(&path, opts))
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        let eng = match res {
+            Ok(e) => e,
+            Err(e) => {
+                // Do not keep the estimate reserved for a model that never loaded.
+                self.governor.lock().await.set_state(&entry.id, 0, ModelResidencyState::ColdCatalog, Instant::now());
+                return Err(e);
+            }
+        };
         let vram = eng.estimated_vram_bytes();
         let fam = detect_family(eng.tokenizer.chat_template());
         let multi = eng.supports_multi_slot();
@@ -422,16 +446,39 @@ pub struct StatusSnapshot {
     pub models: Vec<ModelStatus>,
 }
 
+/// `host[:port]` naming the loopback interface, and nothing else (no userinfo, path or junk).
 fn is_loopback_host(host: &str) -> bool {
     let h = host.trim();
+    let port_ok = |p: &str| p.is_empty() || p.strip_prefix(':').is_some_and(|d| !d.is_empty() && d.len() <= 5 && d.bytes().all(|b| b.is_ascii_digit()));
     if let Some(rest) = h.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            return &rest[..end] == "::1";
-        }
-        return false;
+        return rest.strip_prefix("::1]").is_some_and(port_ok);
     }
-    let bare = h.split(':').next().unwrap_or("");
-    matches!(bare, "localhost" | "127.0.0.1" | "::1")
+    let (bare, port) = h.find(':').map_or((h, ""), |i| (&h[..i], &h[i..]));
+    matches!(bare.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1") && port_ok(port)
+}
+
+/// Percent-decodes a query value (`+` is a space, as in form encoding).
+fn query_decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn is_loopback_origin(origin: &str) -> bool {
@@ -465,13 +512,14 @@ async fn security_middleware(
     next: Next,
 ) -> Response {
     if !st.cfg.allow_remote_host {
-        if let Some(host) = req.headers().get("host").and_then(|v| v.to_str().ok()) {
-            if !is_loopback_host(host) {
+        // A header that is present but not valid UTF-8 fails the check (fail closed).
+        if let Some(host) = req.headers().get("host") {
+            if !host.to_str().is_ok_and(is_loopback_host) {
                 return (StatusCode::FORBIDDEN, Json(json!({ "error": "invalid Host header" }))).into_response();
             }
         }
-        if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
-            if !is_loopback_origin(origin) {
+        if let Some(origin) = req.headers().get("origin") {
+            if !origin.to_str().is_ok_and(is_loopback_origin) {
                 return (StatusCode::FORBIDDEN, Json(json!({ "error": "cross-origin request blocked" }))).into_response();
             }
         }
@@ -490,13 +538,14 @@ async fn security_middleware(
                 req.uri().query().and_then(|q| {
                     q.split('&')
                         .find_map(|pair| pair.strip_prefix("api_key="))
+                        .map(query_decode)
                 })
             } else {
                 None
             };
             let ok = bearer.is_some_and(|k| ct_eq(k, expected))
                 || x_api.is_some_and(|k| ct_eq(k, expected))
-                || query_key.is_some_and(|k| ct_eq(k, expected));
+                || query_key.is_some_and(|k| ct_eq(&k, expected));
             if !ok {
                 return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
             }
@@ -1103,37 +1152,50 @@ async fn anthropic_messages(State(st): State<Arc<AppState>>, Json(req): Json<Ant
                     let mut splitter = reasoning::StreamReasoningSplitter::new(started_in_think);
                     let mut cur_block_idx = 0usize;
                     let mut cur_block_kind: Option<&'static str> = None;
-                    match active.engine.generate(&greq, |_, piece| {
-                        if piece.is_empty() || has_tools { return true; }
+                    // Never block the engine on a slow client: a full queue cancels the stream
+                    // (same policy as the OpenAI path), a closed one stops generation.
+                    let live = |ev: Event| match tx_c.try_send(Ok(ev)) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(model = %model_id, "SSE client channel full; cancelling slow stream");
+                            false
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    };
+                    let gen_res = active.engine.generate(&greq, |_, piece| {
+                        if piece.is_empty() || has_tools { return !tx_c.is_closed(); }
                         let (r_delta, c_delta) = splitter.push(piece);
                         if !r_delta.is_empty() {
                             if cur_block_kind != Some("thinking") {
                                 if cur_block_kind.is_some() {
-                                    let _ = tx_c.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                    if !live(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())) { return false; }
                                     cur_block_idx += 1;
                                 }
                                 let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "thinking", "thinking": "" } });
-                                if tx_c.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string()))).is_err() { return false; }
+                                if !live(Event::default().event("content_block_start").data(blk.to_string())) { return false; }
                                 cur_block_kind = Some("thinking");
                             }
                             let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "thinking_delta", "thinking": r_delta } });
-                            if tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_err() { return false; }
+                            if !live(Event::default().event("content_block_delta").data(d.to_string())) { return false; }
                         }
                         if !c_delta.is_empty() {
                             if cur_block_kind != Some("text") {
                                 if cur_block_kind.is_some() {
-                                    let _ = tx_c.blocking_send(Ok(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())));
+                                    if !live(Event::default().event("content_block_stop").data(json!({ "type": "content_block_stop", "index": cur_block_idx }).to_string())) { return false; }
                                     cur_block_idx += 1;
                                 }
                                 let blk = json!({ "type": "content_block_start", "index": cur_block_idx, "content_block": { "type": "text", "text": "" } });
-                                if tx_c.blocking_send(Ok(Event::default().event("content_block_start").data(blk.to_string()))).is_err() { return false; }
+                                if !live(Event::default().event("content_block_start").data(blk.to_string())) { return false; }
                                 cur_block_kind = Some("text");
                             }
                             let d = json!({ "type": "content_block_delta", "index": cur_block_idx, "delta": { "type": "text_delta", "text": c_delta } });
-                            if tx_c.blocking_send(Ok(Event::default().event("content_block_delta").data(d.to_string()))).is_err() { return false; }
+                            if !live(Event::default().event("content_block_delta").data(d.to_string())) { return false; }
                         }
                         true
-                    }) {
+                    });
+                    // Final events are sent without holding the engine.
+                    drop(guard);
+                    match gen_res {
                         Ok(gr) => {
                             st_c.tokens_generated_total.fetch_add(gr.timings.predicted_n as u64, Ordering::Relaxed);
                             st_c.kv_radix_hits_total.fetch_add(gr.timings.cache_n as u64, Ordering::Relaxed);
@@ -1388,6 +1450,20 @@ async fn audio_transcriptions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loopback_host_and_origin_are_strict() {
+        for h in ["localhost", "localhost:8080", "127.0.0.1:1", "[::1]", "[::1]:443", "LocalHost:80"] {
+            assert!(super::is_loopback_host(h), "{h}");
+        }
+        for h in ["evil.example", "localhost.evil", "localhost:80@evil.example", "[::1]junk", "[::1]:", "127.0.0.1:x", "::1"] {
+            assert!(!super::is_loopback_host(h), "{h}");
+        }
+        assert!(super::is_loopback_origin("http://localhost:3000"));
+        assert!(!super::is_loopback_origin("http://localhost:80@evil.example"));
+        assert!(!super::is_loopback_origin("null"));
+        assert_eq!(super::query_decode("a%2Bb%3D%2F+c%"), "a+b=/ c%");
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;

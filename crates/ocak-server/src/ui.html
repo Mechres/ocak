@@ -69,15 +69,26 @@ function render(s) {
   document.getElementById('hip').textContent = s.hip ? s.hip.detail : '';
   document.getElementById('stats').textContent = s.tokens_generated_total + ' tok · ' + s.requests_total + ' req';
   document.getElementById('kv').textContent = 'Radix KV prefix hits: ' + s.kv_radix_hits_total;
+  // Built with DOM nodes / textContent: model ids come from file names and must not be parsed as HTML.
   const tb = document.getElementById('models');
-  tb.innerHTML = (s.models || []).map(m => `<tr>
-    <td>${m.id}</td><td>${m.arch}</td><td>${gi(m.size_bytes)}</td><td>${m.engine}</td>
-    <td><span class="pill ${m.residency}">${m.residency}</span></td>
-    <td><button onclick="act('${m.id}','load')">Load</button> <button onclick="act('${m.id}','sleep')">Sleep</button></td>
-  </tr>`).join('');
+  const td = t => { const c = document.createElement('td'); c.textContent = t; return c; };
+  const btn = (label, id, op) => { const x = document.createElement('button'); x.textContent = label; x.onclick = () => act(id, op); return x; };
+  tb.replaceChildren(...(s.models || []).map(m => {
+    const tr = document.createElement('tr');
+    tr.append(td(m.id), td(m.arch), td(gi(m.size_bytes)), td(m.engine));
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + String(m.residency).replace(/[^A-Za-z0-9_-]/g, '');
+    pill.textContent = m.residency;
+    const c1 = document.createElement('td'); c1.append(pill);
+    const c2 = document.createElement('td'); c2.append(btn('Load', m.id, 'load'), ' ', btn('Sleep', m.id, 'sleep'));
+    tr.append(c1, c2);
+    return tr;
+  }));
   if (knownModels.length === 0 && s.models && s.models.length) {
     knownModels = s.models;
-    document.getElementById('selModel').innerHTML = s.models.filter(m => !m.is_mmproj).map(m => `<option value="${m.id}">${m.id} (${m.engine})</option>`).join('');
+    document.getElementById('selModel').replaceChildren(...s.models.filter(m => !m.is_mmproj).map(m => {
+      const o = document.createElement('option'); o.value = m.id; o.textContent = m.id + ' (' + m.engine + ')'; return o;
+    }));
   }
 }
 let es = null;

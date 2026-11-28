@@ -120,7 +120,10 @@ impl NativeEngine {
             Box::new(crate::xing_exec::XingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, n_cpu_moe)?)
         } else if cfg.arch == "inkling2_loop" {
             // 24 physical MoE layers (~14.8 GB NVFP4): keep 12 on RX 6700 XT VRAM (~7.4 GB) + 12 mmap CPU
-            Box::new(crate::inkling_exec::InklingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, 12)?)
+            #[cfg(feature = "vulkan")]
+            { Box::new(crate::inkling_exec::InklingExec::new(Arc::clone(&g), opts.backend == BackendKind::Vulkan, max_ctx, 12)?) }
+            #[cfg(not(feature = "vulkan"))]
+            { return Err(EngineError::Backend("inkling2_loop needs the vulkan feature".into())); }
         } else { match opts.backend {
             #[cfg(feature = "vulkan")]
             BackendKind::Vulkan => Box::new(VkExec::new(Arc::clone(&g), cfg.clone(), n_pages)?),
@@ -168,13 +171,24 @@ impl NativeEngine {
     pub fn clear_kv(&mut self) { self.pager.clear(); }
 
     /// Evaluates `tokens` and returns `(logits, final_hidden)` (used by MTP drafter verification).
+    /// Allocates `n` KV pages, releasing the ones already taken if the pool runs out.
+    fn alloc_pages(&mut self, n: usize) -> Result<Vec<u32>, EngineError> {
+        let mut pages = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.pager.alloc_page() {
+                Some(p) => pages.push(p),
+                None => {
+                    self.pager.release(&pages);
+                    return Err(EngineError::KvExhausted);
+                }
+            }
+        }
+        Ok(pages)
+    }
+
     pub fn eval_logits_and_hidden(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
         self.exec.reset_recurrent()?;
-        let need_pages = tokens.len().div_ceil(PAGE_TOKENS);
-        let mut pages = Vec::with_capacity(need_pages);
-        for _ in 0..need_pages {
-            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
-        }
+        let pages = self.alloc_pages(tokens.len().div_ceil(PAGE_TOKENS))?;
         let mut res = Ok(());
         for (pos, &tok) in tokens.iter().enumerate() {
             let is_last = pos + 1 == tokens.len();
@@ -195,11 +209,7 @@ impl NativeEngine {
             return Err(EngineError::Context("empty token sequence".into()));
         }
         self.exec.reset_recurrent()?;
-        let need_pages = tokens.len().div_ceil(PAGE_TOKENS);
-        let mut pages = Vec::with_capacity(need_pages);
-        for _ in 0..need_pages {
-            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
-        }
+        let pages = self.alloc_pages(tokens.len().div_ceil(PAGE_TOKENS))?;
         let res = self.exec.forward_batch(tokens, 0, &pages, Out { logits: true, hidden: false });
         let logits = self.exec.logits().to_vec();
         self.pager.release(&pages);
@@ -215,11 +225,7 @@ impl NativeEngine {
         }
         if tokens.len() > self.max_ctx { tokens.truncate(self.max_ctx); }
         self.exec.reset_recurrent()?;
-        let need_pages = tokens.len().div_ceil(PAGE_TOKENS);
-        let mut pages = Vec::with_capacity(need_pages);
-        for _ in 0..need_pages {
-            pages.push(self.pager.alloc_page().ok_or(EngineError::KvExhausted)?);
-        }
+        let pages = self.alloc_pages(tokens.len().div_ceil(PAGE_TOKENS))?;
         let mut sum = vec![0f32; self.cfg.n_embd];
         let mut res = Ok(());
         for (pos, &tok) in tokens.iter().enumerate() {
@@ -353,6 +359,8 @@ impl NativeEngine {
         let mut forced_tok: Option<u32> = None;
         let pure_greedy = req.sampler.temperature <= 0.0
             && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
+            && req.sampler.presence_penalty == 0.0
+            && req.sampler.frequency_penalty == 0.0
             && json_g.is_none()
             && think_gov.is_none()
             && !use_mtp;
@@ -368,6 +376,8 @@ impl NativeEngine {
         // MTP verification may use device-side argmax when sampling is plain greedy.
         let verify_greedy = req.sampler.temperature <= 0.0
             && (req.sampler.repeat_penalty - 1.0).abs() < 1e-6
+            && req.sampler.presence_penalty == 0.0
+            && req.sampler.frequency_penalty == 0.0
             && json_g.is_none()
             && think_gov.is_none();
         let (mut ms_draft, mut ms_v2, mut ms_rej) = (0.0f64, 0.0f64, 0.0f64);
@@ -426,6 +436,10 @@ impl NativeEngine {
             let nd = want
                 .min(req.max_tokens.saturating_sub(gen_tokens.len() + 1))
                 .min(self.max_ctx.saturating_sub(tokens.len() + 1));
+            // A first draft already written to the drafter KV by the multi-draft path when that path
+            // falls through (chain or verify unavailable): the 2-token path reuses it instead of
+            // drafting the same pair again at the next slot.
+            let mut pre_draft: Option<u32> = None;
             if use_mtp && nd >= 2 {
                 let t0 = Instant::now();
                 let mut drafts: Vec<u32> = Vec::with_capacity(nd);
@@ -538,14 +552,17 @@ impl NativeEngine {
                         }
                     }
                 }
+                pre_draft = drafts.first().copied();
             }
             // Real 2-token batched speculative MTP verify when greedy + MTP drafter available
             if use_mtp && gen_tokens.len() + 1 < req.max_tokens && tokens.len() + 1 < self.max_ctx {
                 let t0 = Instant::now();
-                let draft_tok = self.mtp.as_mut().and_then(|m| {
-                    let dt = m.draft_token(&hidden_buf, next_tok, mtp_pos).ok()?;
-                    mtp_pos += 1;
-                    Some(dt)
+                let draft_tok = pre_draft.or_else(|| {
+                    self.mtp.as_mut().and_then(|m| {
+                        let dt = m.draft_token(&hidden_buf, next_tok, mtp_pos).ok()?;
+                        mtp_pos += 1;
+                        Some(dt)
+                    })
                 });
                 ms_draft += t0.elapsed().as_secs_f64() * 1000.0;
                 if let Some(dt) = draft_tok {
@@ -741,6 +758,19 @@ impl NativeEngine {
             return Err(EngineError::Context(format!("multimodal prompt {total_in} >= max_ctx {}", self.max_ctx)));
         }
         let mut pages = Vec::new();
+        let res = self.multimodal_greedy_inner(&mut pages, prefix_tokens, embds, suffix_tokens, max_tokens);
+        self.pager.release(&pages);
+        res
+    }
+
+    fn multimodal_greedy_inner(
+        &mut self,
+        pages: &mut Vec<u32>,
+        prefix_tokens: &[u32],
+        embds: &[Vec<f32>],
+        suffix_tokens: &[u32],
+        max_tokens: usize,
+    ) -> Result<String, EngineError> {
         let ensure_page = |pager: &mut RadixPager, pages: &mut Vec<u32>, pos: usize| -> Result<(), EngineError> {
             let need = pos / PAGE_TOKENS + 1;
             while pages.len() < need {
@@ -750,19 +780,19 @@ impl NativeEngine {
         };
         let mut pos = 0usize;
         for &tok in prefix_tokens {
-            ensure_page(&mut self.pager, &mut pages, pos)?;
-            self.exec.forward(tok, pos, &pages, Out { logits: false, hidden: false })?;
+            ensure_page(&mut self.pager, pages, pos)?;
+            self.exec.forward(tok, pos, pages, Out { logits: false, hidden: false })?;
             pos += 1;
         }
         for emb in embds {
-            ensure_page(&mut self.pager, &mut pages, pos)?;
-            self.exec.forward_embd(emb, pos, &pages, Out { logits: false, hidden: false })?;
+            ensure_page(&mut self.pager, pages, pos)?;
+            self.exec.forward_embd(emb, pos, pages, Out { logits: false, hidden: false })?;
             pos += 1;
         }
         for (i, &tok) in suffix_tokens.iter().enumerate() {
-            ensure_page(&mut self.pager, &mut pages, pos)?;
+            ensure_page(&mut self.pager, pages, pos)?;
             let is_last = i + 1 == suffix_tokens.len();
-            self.exec.forward(tok, pos, &pages, Out { logits: is_last, hidden: false })?;
+            self.exec.forward(tok, pos, pages, Out { logits: is_last, hidden: false })?;
             pos += 1;
         }
         let mut detok = IncrementalDetokenizer::new();
@@ -782,12 +812,11 @@ impl NativeEngine {
             if step + 1 == max_tokens || pos >= self.max_ctx {
                 break;
             }
-            ensure_page(&mut self.pager, &mut pages, pos)?;
-            self.exec.forward(next_tok, pos, &pages, Out { logits: true, hidden: false })?;
+            ensure_page(&mut self.pager, pages, pos)?;
+            self.exec.forward(next_tok, pos, pages, Out { logits: true, hidden: false })?;
             pos += 1;
         }
         text.push_str(&detok.flush());
-        self.pager.release(&pages);
         Ok(text)
     }
 
