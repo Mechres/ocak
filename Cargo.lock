@@ -716,8 +716,13 @@ dependencies = [
 name = "ocak-hip"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "half",
  "libloading",
+ "ocak-cpu",
+ "ocak-gguf",
  "serde",
+ "sha2",
  "thiserror",
 ]
 
