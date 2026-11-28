@@ -1,6 +1,6 @@
 # Ocak
 
-**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 74 custom GLSL compute shaders (218 SPIR-V modules) with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & host-memory GTT overflow)** and an **x86-64 CPU fallback** (compiled with AVX2/FMA target flags) — with zero CUDA or ROCm SDK required to build or run.
+**Ocak** (*hearth / forge*) is a ground-up Rust LLM & ASR inference engine, GPU VRAM/power orchestrator, and multi-protocol API server built directly on **Vulkan 1.3/1.4 Compute (`ash` + 74 custom GLSL compute shaders (218 SPIR-V modules) with `VK_KHR_push_descriptor`, Wave32 `subgroupClusteredAdd`, 100% coalesced `qmv` decode, GPU `argmax`, LDS-tiled `qmm` prefill, fused `add_rms_norm`, 2-token MTP speculative verify, 1-submit-per-token full-GPU pipelines, & host-memory GTT overflow)** and an **x86-64 CPU fallback** (compiled with AVX2/FMA target flags) — with zero CUDA or ROCm SDK required to build or run. An optional **HIP backend (`ocak-hip`)** loads the ROCm runtime at run time when it is installed.
 
 Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Radeon RX 6700 XT 12 GiB VRAM, Mesa RADV Vulkan 1.4**), Ocak runs dense, hybrid-recurrent, looped MoE, and hybrid GPU+CPU Mixture-of-Experts GGUF models natively from 1B up to 29B parameters while automatically curing AMD RDNA 2's 54W idle compute clock-lock bug.
 
@@ -9,6 +9,7 @@ Designed and verified on a consumer Linux workstation (**AMD Ryzen 5 5600 + Rade
 ## Highlights
 
 - **Ground-up GPU compute engine (`ocak-vk`)**: Raw `ash` Vulkan 1.3/1.4 compute pipeline with 74 hand-written GLSL shaders (218 SPIR-V modules with per-format variants) compiled in parallel at build time via `glslc` or `glslangValidator` — zero graphics/render middleware, `VK_KHR_push_descriptor` zero-allocation dispatch, hardware `subgroupClusteredAdd(32)` reductions, 100% coalesced super-block `qmv` decode & Wave32 GPU `argmax` (4-byte greedy readback), fused `add_rms_norm`, 8-row LDS shared-memory tiled `qmm` prefill across 8 formats, int8 dot-product prefill matmuls and flash-style attention, `HOST_VISIBLE` GTT tensor placement for >12 GiB MoE models, deferred parallel barriers with single `vkQueueSubmit` forward pass per token across dense, hybrid-recurrent, and MoE architectures, and full `VkDevice` teardown on idle sleep.
+- **Optional HIP backend (`ocak-hip`, `--backend hip`)**: `dlopen`s `libamdhip64.so` + `libhiprtc.so` at run time (no ROCm needed to build), JIT-compiles HIP C++ kernels with an on-disk HSACO cache, and runs dense and hybrid-recurrent models (Llama, LFM2/3, Qwen3.5/3.8) with HIP Graph decode, Split-K attention, `v_dot4` int8 prefill, all K-quant and IQ formats, and GPU MTP verify. Greedy output matches Vulkan; MTP is only attached when it fits in free VRAM. Xing and Inkling (MoE) fall back to Vulkan.
 - **Zero-copy GGUF v2/v3 & 20 Vulkan / 20 CPU quantization formats (`ocak-gguf`, `ocak-cpu`, `ocak-vk`)**: Direct `mmap` loading with stat-verified `.digest` SHA-256 caching and native `models-preset.ini` parsing.
   - Vulkan + CPU (20): `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `NVFP4` (plus `Q4_1`, `Q5_0`, `Q5_1` on CPU).
 - **Native architectures (`ocak-engine`)**:
@@ -40,6 +41,7 @@ flowchart TD
     Engine --> KV["ocak-kv (16-tok Paged Radix Prefix Tree)"]
     Engine --> Tok["ocak-tok (SentencePiece, Byte-BPE, Templates, Thinking Cap, JSON Grammar)"]
     Engine --> VK["ocak-vk (Vulkan 1.4 Compute — 74 GLSL shaders)"]
+    Engine --> HIP["ocak-hip (optional HIP backend, hiprtc JIT + HIP Graphs)"]
     Engine --> CPU["ocak-cpu (x86-64 CPU Fallback + Hybrid CPU MoE)"]
     Engine --> GGUF["ocak-gguf (Zero-Copy mmap GGUF v2/v3, Presets, .digest)"]
 ```
@@ -66,6 +68,22 @@ Throughput from the GPU CI baseline ([`ci/bench-baseline.md`](ci/bench-baseline.
 
 Decode in the CI table is measured right after a 512-token prompt; short-prompt greedy decode is higher (e.g. Xing ~47 tok/s, Inkling ~25 tok/s), and MTP models gain further with `OCAK_MTP_DRAFTS`. `docs/PERFORMANCE.md` logs how each number was reached and what was tried and rejected.
 
+HIP backend (`--backend hip`), from [`ci/bench-baseline-hip.md`](ci/bench-baseline-hip.md) (same settings, also checked on every push, together with a HIP long-context `count-test`):
+
+| Model | Prefill (512 tok) | Decode |
+| :--- | :---: | :---: |
+| `LFM3-1.7B-AD-Q6_K` | 3692.4 tok/s | **157.6 tok/s** |
+| `minicpm5-2b-abliterated-Q4_K_M` | 2353.6 tok/s | **129.2 tok/s** |
+| `LFM2.5-2.6B-Q4_K_M` | 2785.8 tok/s | **147.0 tok/s** |
+| `Qwen3.5-4B-Q4_K_M` | 1809.5 tok/s | **88.0 tok/s** |
+| `Qwopus3.5-9B-coder-Exp-Q4_K_M` | 996.7 tok/s | **55.3 tok/s** |
+| `Ornith-1.5-9B-Q4_K_M` (MTP) | 951.5 tok/s | **85.4 tok/s** |
+| `Qwen3.8-27B-UD-IQ2_S` | 302.5 tok/s | **30.7 tok/s** |
+| `RVN-IQ2_S-mtp` (MTP) | 284.7 tok/s | **47.6 tok/s** |
+| `Qwen3.8-27B.i1-Q2_K` | 289.1 tok/s | **27.3 tok/s** |
+
+HIP prefill is faster than Vulkan on short prompts (up to ~1.8x below 100 tokens). At 512+ tokens it is about even with Vulkan, and decode is 5-15% slower. The HIP runtime uses ~350 MiB more VRAM than Vulkan, so on the 12 GiB card the 10 GiB `Qwen3.8-27B.i1-Q2_K` runs without MTP under HIP. Vulkan stays the default backend.
+
 - **Native NextN MTP draft verification (`ocak mtp-test`)**: Verified on 27B `RVN-IQ2_S-mtp` (`"The capital of France is"` -> trunk `+1`: `" Paris"`, MTP draft `+2`: `"."`, trunk verify `+2`: `"."`, `match=true`). Greedy output with MTP on and off is identical (lossless).
 - **1-submit-per-token batched full-GPU MoE (`XingExec` & `InklingExec`)**: zero per-layer CPU↔GPU fence waits, top-k-batched MoE dispatches, device-side greedy argmax, and 3×-looped-core VRAM priority for Inkling (experts that do not fit the 12 GiB card live in host-visible GTT memory).
 - **`WarmSleep` idle power check**: Active VRAM `1.79 GiB` -> `1.07 GiB` on teardown, RX 6700 XT power returns to **`29.0 W`** idle, automatic wake on next request in **`307 ms`**.
@@ -78,6 +96,7 @@ Decode in the CI table is measured right after a 512-token prompt; short-prompt 
 - **Rust** (`cargo`, `rustc` 1.80+)
 - **Vulkan 1.3+ runtime & driver** with 32-wide (or wider) subgroups. Developed and tested on Mesa RADV (AMD RDNA2); the kernels assume Wave32 reductions (`subgroupClusteredAdd(..., 32)`), so other drivers are untested and devices reporting a subgroup size below 32 are rejected
 - **Shader compiler**: `glslc` (`shaderc`) or `glslangValidator` (`glslang-tools`)
+- *Optional, for `--backend hip`*: the ROCm HIP runtime and HIPRTC (`libamdhip64.so` and `libhiprtc.so`, in the default library path or `/opt/rocm/lib`; on Arch, `hip-runtime-amd`). Tested with ROCm 10.1 (`libamdhip64.so.7`) on `gfx1031` (RX 6700 XT). Compiled kernels are cached in `$XDG_CACHE_HOME/ocak/hip` (or `~/.cache/ocak/hip`); set `OCAK_HIP_CACHE_DISABLE=1` to bypass the cache
 
 ```bash
 git clone https://github.com/Mechres/ocak.git
@@ -85,7 +104,7 @@ cd ocak
 cargo build --release --workspace
 ```
 
-Run the full test suite (including Vulkan GPU shader parity tests):
+Run the full test suite (including Vulkan GPU shader parity tests, and HIP kernel parity tests when the ROCm runtime is present):
 
 ```bash
 cargo test --release --workspace
@@ -108,6 +127,7 @@ cargo test --release --workspace
   --prompt "<|im_start|>user\nExplain paged attention in two sentences.<|im_end|>\n<|im_start|>assistant\n" \
   --max-tokens 96
 ```
+Add `--backend hip` to use the HIP backend (also accepted by `ocakd`, `ocak bench` and `ocak count-test`).
 
 ### 3. Start the Server (`ocakd`) + Web Dashboard & TUI
 ```bash
@@ -158,6 +178,7 @@ cargo test --release --workspace
 - [x] **M4 / M4b**: Native `LFM2`, `LFM3`, `Qwen3.5`/`Qwen3.8` Gated DeltaNet & Gated Attention, `Q2_K`/`Q3_K` & all `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` shaders.
 - [x] **M5 / M5b**: Native hybrid GPU+CPU MoE for `Xing4.0-29B-A4B` (fused GPU MoE + parallel MLA) and `Inkling-2-Mini` (`inkling2_loop` 3× looped MoE + `NVFP4` & `BF16` shaders).
 - [x] **M6**: Native `Qwen3.5`/`RVN` NextN MTP draft head (`MtpDrafter` with prompt KV warmup + GPU argmax), native `Qwen3-ASR-1.7B` audio frontend (`qwen3a` + `qwen3vl` on Vulkan), `ocak bench`, `O(n log n)` BPE/SPM tokenizer, and GitHub Actions CI.
+- [x] **M7**: Optional HIP backend (`ocak-hip`): hiprtc JIT kernels, HIP Graph decode, dense + hybrid models, all K-quant/IQ formats, GPU MTP verify, and HIP coverage in the GPU CI.
 - [ ] **Future**: Native vision (`Qwen3-VL` `mmproj` image input).
 
 Performance work log (methodology, what helped, and what was tried and rejected): [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
