@@ -160,7 +160,19 @@ pub(crate) async fn chat_completions(
         .and_then(|v| v.get("enable_thinking"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let prompt = render(fam, &chat_msgs, true, enable_thinking);
+    let mut prompt = render(fam, &chat_msgs, true, enable_thinking);
+    // An explicit `enable_thinking: true` on a template that only thinks when asked (Qwen3.5):
+    // open the reasoning block as the model's own template would.
+    let explicit_think = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|v| v.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    let think_opened = explicit_think && fam == ocak_tok::TemplateFamily::ChatMl && st.template_opens_think(&model_id);
+    if think_opened {
+        prompt.push_str("<think>\n");
+    }
     let greq = GenRequest {
         prompt,
         parse_special: true,
@@ -171,7 +183,7 @@ pub(crate) async fn chat_completions(
         thinking: req.reasoning_max_tokens.map(|m| ThinkingCfg { max_tokens: m }),
     };
 
-    let started_in_think = fam == ocak_tok::TemplateFamily::Xing && enable_thinking;
+    let started_in_think = (fam == ocak_tok::TemplateFamily::Xing && enable_thinking) || think_opened;
     if req.stream {
         let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(1024);
         let (tok_tx, mut tok_rx) = mpsc::channel::<String>(1024);

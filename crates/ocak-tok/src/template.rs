@@ -17,6 +17,13 @@ pub enum TemplateFamily {
     Raw,
 }
 
+/// True when a chat template opens `<think>` only for an explicit `enable_thinking: true` (Qwen3.5:
+/// `if enable_thinking is defined and enable_thinking is true` -> `<think>\n`, otherwise an empty
+/// think block). Such models skip reasoning unless the prompt opens the block.
+pub fn opens_think_on_request(chat_template: Option<&str>) -> bool {
+    chat_template.is_some_and(|t| t.contains("enable_thinking is true") && t.contains("'<think>\\n'"))
+}
+
 pub fn detect_family(chat_template: Option<&str>) -> TemplateFamily {
     let Some(t) = chat_template else {
         return TemplateFamily::Raw;
@@ -256,4 +263,18 @@ pub fn render(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod think_tests {
+    use super::opens_think_on_request;
+
+    #[test]
+    fn detects_explicit_think_templates() {
+        let qwen35 = "{%- if enable_thinking is defined and enable_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}";
+        assert!(opens_think_on_request(Some(qwen35)));
+        let qwen3 = "{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\\n\\n</think>\\n\\n' }}{%- endif %}";
+        assert!(!opens_think_on_request(Some(qwen3)));
+        assert!(!opens_think_on_request(None));
+    }
 }

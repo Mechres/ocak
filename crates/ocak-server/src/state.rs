@@ -36,7 +36,9 @@ pub struct AppState {
     pub(crate) load_lock: Mutex<()>,
     pub(crate) native: Mutex<Option<ActiveNative>>,
     pub(crate) asr: Mutex<Option<(String, ocak_engine::asr::Qwen3AsrEngine)>>,
-    pub(crate) active_meta: std::sync::RwLock<Option<(String, ocak_tok::TemplateFamily, bool)>>,
+    /// Loaded native model: (id, template family, multi-slot, template opens `<think>` only on
+    /// an explicit `enable_thinking: true`).
+    pub(crate) active_meta: std::sync::RwLock<Option<(String, ocak_tok::TemplateFamily, bool, bool)>>,
     pub(crate) batcher: Arc<batch::BatchCoordinator>,
     pub(crate) bridges: Mutex<HashMap<String, LlamaBridgeHandle>>,
     pub(crate) next_bridge_port: AtomicU64,
@@ -212,10 +214,16 @@ impl AppState {
         Ok(())
     }
 
+    /// Whether the loaded model `id`'s chat template opens a `<think>` block only when thinking
+    /// is explicitly requested (Qwen3.5 style), so the prompt must do it for `enable_thinking: true`.
+    pub(crate) fn template_opens_think(&self, id: &str) -> bool {
+        matches!(&*self.active_meta.read().unwrap(), Some((mid, _, _, true)) if mid == id)
+    }
+
     pub async fn ensure_native(&self, entry: &CatalogEntry) -> Result<(ocak_tok::TemplateFamily, bool), String> {
         // Fast lock-free check so concurrent requests can join the continuous batcher immediately!
         let fast = self.active_meta.read().unwrap().clone();
-        if let Some((id, fam, multi)) = fast {
+        if let Some((id, fam, multi, _)) = fast {
             if id == entry.id {
                 if let Ok(mut g) = self.governor.try_lock() {
                     g.touch(&entry.id, Instant::now());
@@ -226,7 +234,7 @@ impl AppState {
         // Serialize model loads so two cold requests never double-load and OOM VRAM
         let _load_guard = self.load_lock.lock().await;
         let cached = self.active_meta.read().unwrap().clone();
-        if let Some((id, fam, multi)) = cached {
+        if let Some((id, fam, multi, _)) = cached {
             if id == entry.id {
                 self.governor.lock().await.touch(&entry.id, Instant::now());
                 return Ok((fam, multi));
@@ -238,7 +246,8 @@ impl AppState {
                 if a.id == entry.id {
                     let fam = detect_family(a.engine.tokenizer.chat_template());
                     let multi = a.engine.supports_multi_slot();
-                    *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi));
+                    let opens = ocak_tok::template::opens_think_on_request(a.engine.tokenizer.chat_template());
+                    *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi, opens));
                     self.governor.lock().await.touch(&entry.id, Instant::now());
                     return Ok((fam, multi));
                 }
@@ -287,9 +296,10 @@ impl AppState {
         };
         let vram = eng.estimated_vram_bytes();
         let fam = detect_family(eng.tokenizer.chat_template());
+        let opens = ocak_tok::template::opens_think_on_request(eng.tokenizer.chat_template());
         let multi = eng.supports_multi_slot();
         *self.native.lock().await = Some(ActiveNative { id: entry.id.clone(), engine: eng });
-        *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi));
+        *self.active_meta.write().unwrap() = Some((entry.id.clone(), fam, multi, opens));
         self.governor
             .lock()
             .await

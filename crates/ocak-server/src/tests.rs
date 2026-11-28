@@ -75,7 +75,7 @@ async fn end_to_end_openai_anthropic_embeddings_radix_kv_and_warm_sleep() {
     assert!(models["data"].as_array().unwrap().len() >= 2);
     let (st_ui, ui_html) = call(&app, "GET", "/ui", None).await;
     assert_eq!(st_ui, StatusCode::OK);
-    assert!(ui_html.contains("Ocak Control Center"));
+    assert!(ui_html.contains("Message Ocak") && ui_html.contains("/v1/chat/completions"));
 
     // 2. Turn 1: OpenAI chat completion
     let sys_msg = "You are a helpful, concise computer architecture assistant answering questions accurately in English.";
