@@ -7,8 +7,8 @@ use crate::config::{LayerKind, ModelConfig};
 use crate::exec::{EngineError, Executor, Out};
 use ocak_gguf::{GgmlType, GgufFile, TensorInfo};
 use ocak_hip::{
-    HipBuffer, HipContext, HipDenseOps, HipEvent, HipGraphExec, HipHybridOps, HipKernels,
-    HipStream, HipWType,
+    HipBuffer, HipContext, HipDenseOps, HipEvent, HipGraphExec, HipHybridOps, HipIqKernels,
+    HipKernels, HipStream, HipWType,
 };
 use std::sync::Arc;
 
@@ -88,6 +88,8 @@ pub struct HipExec {
     ev_join_b: HipEvent,
     ev_join_c: HipEvent,
     kernels: HipKernels,
+    iq_kernels: Option<HipIqKernels>,
+    iq_tbl: Option<HipBuffer>,
     ops: HipDenseOps,
     hops: HipHybridOps,
     cfg: ModelConfig,
@@ -156,6 +158,15 @@ fn hip_wtype(ty: GgmlType) -> Result<HipWType, EngineError> {
         GgmlType::Q6K => Ok(HipWType::Q6K),
         GgmlType::Q2K => Ok(HipWType::Q2K),
         GgmlType::Q3K => Ok(HipWType::Q3K),
+        GgmlType::IQ1S => Ok(HipWType::IQ1S),
+        GgmlType::IQ1M => Ok(HipWType::IQ1M),
+        GgmlType::IQ2XXS => Ok(HipWType::IQ2XXS),
+        GgmlType::IQ2XS => Ok(HipWType::IQ2XS),
+        GgmlType::IQ2S => Ok(HipWType::IQ2S),
+        GgmlType::IQ3XXS => Ok(HipWType::IQ3XXS),
+        GgmlType::IQ3S => Ok(HipWType::IQ3S),
+        GgmlType::IQ4NL => Ok(HipWType::IQ4NL),
+        GgmlType::IQ4XS => Ok(HipWType::IQ4XS),
         other => Err(EngineError::Unsupported(format!(
             "HIP backend does not yet support weight format {other:?}"
         ))),
@@ -366,6 +377,43 @@ impl HipExec {
             Some(upload_weight(&ctx, &g, req_tensor(&g, "output.weight")?)?)
         };
 
+        let has_iq = embd.ty.is_iq()
+            || output.as_ref().is_some_and(|w| w.ty.is_iq())
+            || layers.iter().any(|l| {
+                l.gate.ty.is_iq()
+                    || l.up.ty.is_iq()
+                    || l.down.ty.is_iq()
+                    || match &l.mixer {
+                        HipMixer::FullAttn { wq, wk, wv, wo, head_gate_w, .. } => {
+                            wq.ty.is_iq()
+                                || wk.ty.is_iq()
+                                || wv.ty.is_iq()
+                                || wo.ty.is_iq()
+                                || head_gate_w.as_ref().is_some_and(|w| w.ty.is_iq())
+                        }
+                        HipMixer::ShortConv { in_proj, out_proj, .. } => {
+                            in_proj.ty.is_iq() || out_proj.ty.is_iq()
+                        }
+                        HipMixer::DeltaNet { wqkv, wgate, walpha, wbeta, wout, .. } => {
+                            wqkv.ty.is_iq()
+                                || wgate.ty.is_iq()
+                                || walpha.ty.is_iq()
+                                || wbeta.ty.is_iq()
+                                || wout.ty.is_iq()
+                        }
+                    }
+            });
+        let (iq_kernels, iq_tbl) = if has_iq {
+            let tbl_data = ocak_gguf::iq_tables::packed_gpu_table();
+            let tbl = ctx
+                .buffer_from_slice(&tbl_data)
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            let iqk = HipIqKernels::compile(&ctx).map_err(|e| EngineError::Backend(e.to_string()))?;
+            (Some(iqk), Some(tbl))
+        } else {
+            (None, None)
+        };
+
         let q_dim = cfg.n_head * cfg.head_dim;
         let kv_dim = cfg.kv_dim();
         let layer_stride_bytes = n_pages * 2 * 16 * kv_dim * 2;
@@ -394,6 +442,8 @@ impl HipExec {
             ev_join_b,
             ev_join_c,
             kernels,
+            iq_kernels,
+            iq_tbl,
             ops,
             hops,
             layers,
@@ -465,6 +515,70 @@ impl HipExec {
         Ok(())
     }
 
+    fn qmv(
+        &self,
+        w: &HipWeight,
+        s: &HipStream,
+        x_f32: &HipBuffer,
+        y: &HipBuffer,
+    ) -> Result<(), ocak_hip::HipError> {
+        if w.ty.is_iq() {
+            self.iq_kernels.as_ref().unwrap().qmv(
+                w.ty,
+                s,
+                &w.buf,
+                &self.xq,
+                &self.xsc,
+                y,
+                self.iq_tbl.as_ref().unwrap(),
+                w.k,
+                w.m,
+                1,
+            )
+        } else {
+            self.kernels.qmv(w.ty, s, &w.buf, x_f32, &self.xq, &self.xsc, y, w.k, w.m, 1)
+        }
+    }
+
+    fn qmm(
+        &self,
+        w: &HipWeight,
+        s: &HipStream,
+        x_f32: &HipBuffer,
+        y: &HipBuffer,
+        batch: u32,
+    ) -> Result<(), ocak_hip::HipError> {
+        if w.ty.is_iq() {
+            self.iq_kernels.as_ref().unwrap().qmm_with_split(
+                w.ty,
+                s,
+                &w.buf,
+                &self.xq,
+                &self.xsc,
+                y,
+                self.iq_tbl.as_ref().unwrap(),
+                Some(&self.split_buf),
+                w.k,
+                w.m,
+                batch,
+            )
+        } else {
+            self.kernels.qmm_with_split(
+                w.ty,
+                s,
+                &w.buf,
+                x_f32,
+                &self.xq,
+                &self.xsc,
+                y,
+                Some(&self.split_buf),
+                w.k,
+                w.m,
+                batch,
+            )
+        }
+    }
+
     /// Records the 1-token decode pass onto `s` using fused Q8 norms/swiglu/rope+kv/attn-merge
     /// and a 3-stream HIP Graph DAG (`wq/wk/wv`, `DeltaNet` projections, and `gate/up` concurrent).
     fn record_decode_step(&self, s: &HipStream, with_argmax: bool) -> Result<(), ocak_hip::HipError> {
@@ -477,8 +591,15 @@ impl HipExec {
         let sb = &self.stream_b;
         let sc = &self.stream_c;
 
-        self.ops
-            .embed_token_meta(s, &self.embd.buf, self.embd.ty, &self.step_meta, &self.x, ne)?;
+        self.ops.embed_token_meta(
+            s,
+            &self.embd.buf,
+            self.embd.ty,
+            self.iq_tbl.as_ref(),
+            &self.step_meta,
+            &self.x,
+            ne,
+        )?;
         self.ops
             .rms_norm_q8(s, &self.x, &self.layers[0].attn_norm, &self.xn, &self.xq, &self.xsc, ne, eps)?;
 
@@ -493,11 +614,11 @@ impl HipExec {
                     sc.wait_event(&self.ev_fork)?;
 
                     let q_dst = if *gated_q { &self.qg } else { &self.q };
-                    self.kernels.qmv(wq.ty, s, &wq.buf, &self.xn, &self.xq, &self.xsc, q_dst, wq.k, wq.m, 1)?;
-                    self.kernels.qmv(wk.ty, sb, &wk.buf, &self.xn, &self.xq, &self.xsc, &self.k, wk.k, wk.m, 1)?;
-                    self.kernels.qmv(wv.ty, sc, &wv.buf, &self.xn, &self.xq, &self.xsc, &self.v, wv.k, wv.m, 1)?;
+                    self.qmv(wq, s, &self.xn, q_dst)?;
+                    self.qmv(wk, sb, &self.xn, &self.k)?;
+                    self.qmv(wv, sc, &self.xn, &self.v)?;
                     if let Some(hgw) = head_gate_w {
-                        self.kernels.qmv(hgw.ty, sc, &hgw.buf, &self.xn, &self.xq, &self.xsc, &self.head_gate_buf, hgw.k, hgw.m, 1)?;
+                        self.qmv(hgw, sc, &self.xn, &self.head_gate_buf)?;
                     }
 
                     if *gated_q {
@@ -549,12 +670,12 @@ impl HipExec {
                             &self.xq, &self.xsc, nh, *n_head_kv, hd, *sliding_window, DECODE_ATTN_SPLITS,
                         )?;
                     }
-                    self.kernels.qmv(wo.ty, s, &wo.buf, &self.attn, &self.xq, &self.xsc, &self.o, wo.k, wo.m, 1)?;
+                    self.qmv(wo, s, &self.attn, &self.o)?;
                 }
                 HipMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
-                    self.kernels.qmv(in_proj.ty, s, &in_proj.buf, &self.xn, &self.xq, &self.xsc, &self.bcx, in_proj.k, in_proj.m, 1)?;
+                    self.qmv(in_proj, s, &self.xn, &self.bcx)?;
                     self.hops.shortconv_step_q8(s, &self.bcx, conv_w, state, &self.gate, &self.xq, &self.xsc, ne, *l_cache)?;
-                    self.kernels.qmv(out_proj.ty, s, &out_proj.buf, &self.gate, &self.xq, &self.xsc, &self.o, out_proj.k, out_proj.m, 1)?;
+                    self.qmv(out_proj, s, &self.gate, &self.o)?;
                 }
                 HipMixer::DeltaNet {
                     wqkv, wgate, walpha, wbeta, wout, conv_w, dt_bias, ssm_a, ssm_norm,
@@ -564,10 +685,10 @@ impl HipExec {
                     sb.wait_event(&self.ev_fork)?;
                     sc.wait_event(&self.ev_fork)?;
 
-                    self.kernels.qmv(wqkv.ty, s, &wqkv.buf, &self.xn, &self.xq, &self.xsc, &self.qkv_raw, wqkv.k, wqkv.m, 1)?;
-                    self.kernels.qmv(wgate.ty, sb, &wgate.buf, &self.xn, &self.xq, &self.xsc, &self.z_buf, wgate.k, wgate.m, 1)?;
-                    self.kernels.qmv(walpha.ty, sc, &walpha.buf, &self.xn, &self.xq, &self.xsc, &self.alpha_buf, walpha.k, walpha.m, 1)?;
-                    self.kernels.qmv(wbeta.ty, sc, &wbeta.buf, &self.xn, &self.xq, &self.xsc, &self.beta_buf, wbeta.k, wbeta.m, 1)?;
+                    self.qmv(wqkv, s, &self.xn, &self.qkv_raw)?;
+                    self.qmv(wgate, sb, &self.xn, &self.z_buf)?;
+                    self.qmv(walpha, sc, &self.xn, &self.alpha_buf)?;
+                    self.qmv(wbeta, sc, &self.xn, &self.beta_buf)?;
 
                     self.hops.ssm_conv_silu(s, &self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, 1)?;
 
@@ -581,7 +702,7 @@ impl HipExec {
                     )?;
                     s.wait_event(&self.ev_join_b)?;
                     self.hops.gated_rms_norm_q8(s, &self.dn_out, ssm_norm, &self.z_buf, &self.dn_norm, &self.xq, &self.xsc, *n_v_heads, *state_dim, eps)?;
-                    self.kernels.qmv(wout.ty, s, &wout.buf, &self.dn_norm, &self.xq, &self.xsc, &self.o, wout.k, wout.m, 1)?;
+                    self.qmv(wout, s, &self.dn_norm, &self.o)?;
                 }
             }
 
@@ -593,13 +714,13 @@ impl HipExec {
 
             self.ev_fork.record(s)?;
             sb.wait_event(&self.ev_fork)?;
-            self.kernels.qmv(l.gate.ty, s, &l.gate.buf, &self.xn, &self.xq, &self.xsc, &self.gate, l.gate.k, l.gate.m, 1)?;
-            self.kernels.qmv(l.up.ty, sb, &l.up.buf, &self.xn, &self.xq, &self.xsc, &self.up, l.up.k, l.up.m, 1)?;
+            self.qmv(&l.gate, s, &self.xn, &self.gate)?;
+            self.qmv(&l.up, sb, &self.xn, &self.up)?;
             self.ev_join_b.record(sb)?;
             s.wait_event(&self.ev_join_b)?;
 
             self.ops.swiglu_q8(s, &self.gate, &self.up, &self.act, &self.xq, &self.xsc, self.cfg.n_ff as u32)?;
-            self.kernels.qmv(l.down.ty, s, &l.down.buf, &self.act, &self.xq, &self.xsc, &self.o, l.down.k, l.down.m, 1)?;
+            self.qmv(&l.down, s, &self.act, &self.o)?;
 
             let next_norm = if li + 1 < self.layers.len() {
                 &self.layers[li + 1].attn_norm
@@ -614,7 +735,7 @@ impl HipExec {
         }
 
         let head = self.output.as_ref().unwrap_or(&self.embd);
-        self.kernels.qmv(head.ty, s, &head.buf, &self.xn, &self.xq, &self.xsc, &self.logits_buf, head.k, head.m, 1)?;
+        self.qmv(head, s, &self.xn, &self.logits_buf)?;
         if with_argmax {
             self.ops.argmax(
                 s,
@@ -638,7 +759,6 @@ impl HipExec {
         let eps = self.cfg.eps;
         let mode = self.cfg.rope_mode;
         let s = &self.stream;
-        let sb = Some(&self.split_buf);
         let map_e = |e: ocak_hip::HipError| EngineError::Backend(e.to_string());
 
         self.kernels
@@ -659,11 +779,11 @@ impl HipExec {
                             .map_err(map_e)?;
                     }
                     let q_dst = if *gated_q { &self.qg } else { &self.q };
-                    self.kernels.qmm_with_split(wq.ty, s, &wq.buf, &self.xn, &self.xq, &self.xsc, q_dst, sb, wq.k, wq.m, b).map_err(map_e)?;
-                    self.kernels.qmm_with_split(wk.ty, s, &wk.buf, &self.xn, &self.xq, &self.xsc, &self.k, sb, wk.k, wk.m, b).map_err(map_e)?;
-                    self.kernels.qmm_with_split(wv.ty, s, &wv.buf, &self.xn, &self.xq, &self.xsc, &self.v, sb, wv.k, wv.m, b).map_err(map_e)?;
+                    self.qmm(wq, s, &self.xn, q_dst, b).map_err(map_e)?;
+                    self.qmm(wk, s, &self.xn, &self.k, b).map_err(map_e)?;
+                    self.qmm(wv, s, &self.xn, &self.v, b).map_err(map_e)?;
                     if let Some(hgw) = head_gate_w {
-                        self.kernels.qmm_with_split(hgw.ty, s, &hgw.buf, &self.xn, &self.xq, &self.xsc, &self.head_gate_buf, sb, hgw.k, hgw.m, b).map_err(map_e)?;
+                        self.qmm(hgw, s, &self.xn, &self.head_gate_buf, b).map_err(map_e)?;
                     }
 
                     if *gated_q {
@@ -699,18 +819,18 @@ impl HipExec {
                     if wo.ty.uses_q8_act() {
                         self.kernels.quant_q8(s, &self.attn, &self.xq, &self.xsc, (batch * wo.k as usize / 32) as u32).map_err(map_e)?;
                     }
-                    self.kernels.qmm_with_split(wo.ty, s, &wo.buf, &self.attn, &self.xq, &self.xsc, &self.o, sb, wo.k, wo.m, b).map_err(map_e)?;
+                    self.qmm(wo, s, &self.attn, &self.o, b).map_err(map_e)?;
                 }
                 HipMixer::ShortConv { in_proj, out_proj, conv_w, state, l_cache } => {
                     if in_proj.ty.uses_q8_act() {
                         self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
                     }
-                    self.kernels.qmm_with_split(in_proj.ty, s, &in_proj.buf, &self.xn, &self.xq, &self.xsc, &self.bcx, sb, in_proj.k, in_proj.m, b).map_err(map_e)?;
+                    self.qmm(in_proj, s, &self.xn, &self.bcx, b).map_err(map_e)?;
                     self.hops.shortconv_step(s, &self.bcx, conv_w, state, &self.gate, ne, *l_cache, b).map_err(map_e)?;
                     if out_proj.ty.uses_q8_act() {
                         self.kernels.quant_q8(s, &self.gate, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
                     }
-                    self.kernels.qmm_with_split(out_proj.ty, s, &out_proj.buf, &self.gate, &self.xq, &self.xsc, &self.o, sb, out_proj.k, out_proj.m, b).map_err(map_e)?;
+                    self.qmm(out_proj, s, &self.gate, &self.o, b).map_err(map_e)?;
                 }
                 HipMixer::DeltaNet {
                     wqkv, wgate, walpha, wbeta, wout, conv_w, dt_bias, ssm_a, ssm_norm,
@@ -719,10 +839,10 @@ impl HipExec {
                     if wqkv.ty.uses_q8_act() || wgate.ty.uses_q8_act() || walpha.ty.uses_q8_act() || wbeta.ty.uses_q8_act() {
                         self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
                     }
-                    self.kernels.qmm_with_split(wqkv.ty, s, &wqkv.buf, &self.xn, &self.xq, &self.xsc, &self.qkv_raw, sb, wqkv.k, wqkv.m, b).map_err(map_e)?;
-                    self.kernels.qmm_with_split(wgate.ty, s, &wgate.buf, &self.xn, &self.xq, &self.xsc, &self.z_buf, sb, wgate.k, wgate.m, b).map_err(map_e)?;
-                    self.kernels.qmm_with_split(walpha.ty, s, &walpha.buf, &self.xn, &self.xq, &self.xsc, &self.alpha_buf, sb, walpha.k, walpha.m, b).map_err(map_e)?;
-                    self.kernels.qmm_with_split(wbeta.ty, s, &wbeta.buf, &self.xn, &self.xq, &self.xsc, &self.beta_buf, sb, wbeta.k, wbeta.m, b).map_err(map_e)?;
+                    self.qmm(wqkv, s, &self.xn, &self.qkv_raw, b).map_err(map_e)?;
+                    self.qmm(wgate, s, &self.xn, &self.z_buf, b).map_err(map_e)?;
+                    self.qmm(walpha, s, &self.xn, &self.alpha_buf, b).map_err(map_e)?;
+                    self.qmm(wbeta, s, &self.xn, &self.beta_buf, b).map_err(map_e)?;
 
                     self.hops.ssm_conv_silu(s, &self.qkv_raw, conv_w, conv_state, &self.qkv_conv, *conv_ch, *k_conv, b).map_err(map_e)?;
                     self.hops.deltanet_step(
@@ -734,7 +854,7 @@ impl HipExec {
                     if wout.ty.uses_q8_act() {
                         self.kernels.quant_q8(s, &self.dn_norm, &self.xq, &self.xsc, (batch * wout.k as usize / 32) as u32).map_err(map_e)?;
                     }
-                    self.kernels.qmm_with_split(wout.ty, s, &wout.buf, &self.dn_norm, &self.xq, &self.xsc, &self.o, sb, wout.k, wout.m, b).map_err(map_e)?;
+                    self.qmm(wout, s, &self.dn_norm, &self.o, b).map_err(map_e)?;
                 }
             }
 
@@ -746,14 +866,14 @@ impl HipExec {
             if l.gate.ty.uses_q8_act() || l.up.ty.uses_q8_act() {
                 self.kernels.quant_q8(s, &self.xn, &self.xq, &self.xsc, (batch * self.cfg.n_embd / 32) as u32).map_err(map_e)?;
             }
-            self.kernels.qmm_with_split(l.gate.ty, s, &l.gate.buf, &self.xn, &self.xq, &self.xsc, &self.gate, sb, l.gate.k, l.gate.m, b).map_err(map_e)?;
-            self.kernels.qmm_with_split(l.up.ty, s, &l.up.buf, &self.xn, &self.xq, &self.xsc, &self.up, sb, l.up.k, l.up.m, b).map_err(map_e)?;
+            self.qmm(&l.gate, s, &self.xn, &self.gate, b).map_err(map_e)?;
+            self.qmm(&l.up, s, &self.xn, &self.up, b).map_err(map_e)?;
             self.ops.swiglu(s, &self.gate, &self.up, &self.act, (batch * self.cfg.n_ff) as u32).map_err(map_e)?;
 
             if l.down.ty.uses_q8_act() {
                 self.kernels.quant_q8(s, &self.act, &self.xq, &self.xsc, (batch * self.cfg.n_ff / 32) as u32).map_err(map_e)?;
             }
-            self.kernels.qmm_with_split(l.down.ty, s, &l.down.buf, &self.act, &self.xq, &self.xsc, &self.o, sb, l.down.k, l.down.m, b).map_err(map_e)?;
+            self.qmm(&l.down, s, &self.act, &self.o, b).map_err(map_e)?;
 
             if let Some(pfn) = &l.post_ffw_norm {
                 self.kernels.rms_norm(s, &self.o, pfn, &self.o, ne, b, eps).map_err(map_e)?;
@@ -776,20 +896,7 @@ impl HipExec {
                 .quant_q8(&self.stream, hidden_src, &self.xq, &self.xsc, (self.cfg.n_embd / 32) as u32)
                 .map_err(map_e)?;
         }
-        self.kernels
-            .qmv(
-                head.ty,
-                &self.stream,
-                &head.buf,
-                hidden_src,
-                &self.xq,
-                &self.xsc,
-                &self.logits_buf,
-                head.k,
-                head.m,
-                1,
-            )
-            .map_err(map_e)
+        self.qmv(head, &self.stream, hidden_src, &self.logits_buf).map_err(map_e)
     }
 }
 
@@ -934,6 +1041,7 @@ impl Executor for HipExec {
                     &self.stream,
                     &self.embd.buf,
                     self.embd.ty,
+                    self.iq_tbl.as_ref(),
                     &self.toks_buf,
                     &self.x,
                     self.cfg.n_embd as u32,

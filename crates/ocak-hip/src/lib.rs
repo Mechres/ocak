@@ -3,6 +3,7 @@
 pub mod dense_ops;
 pub mod ffi;
 pub mod hybrid_ops;
+pub mod iq_kernels;
 pub mod kernels;
 pub mod rtc;
 pub mod runtime;
@@ -13,6 +14,7 @@ pub use ffi::{
     HIP_MEMCPY_H2H,
 };
 pub use hybrid_ops::HipHybridOps;
+pub use iq_kernels::HipIqKernels;
 pub use kernels::{HipKernels, HipWType};
 pub use rtc::Hiprtc;
 pub use runtime::{
@@ -114,6 +116,28 @@ mod tests {
                     blk[108..110].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
                 }
             }
+            GgmlType::IQ1S
+            | GgmlType::IQ2XXS
+            | GgmlType::IQ2XS
+            | GgmlType::IQ2S
+            | GgmlType::IQ3XXS
+            | GgmlType::IQ3S
+            | GgmlType::IQ4NL
+            | GgmlType::IQ4XS => {
+                for blk in v.chunks_exact_mut(bb) {
+                    blk[0..2].copy_from_slice(&f16::from_f32(rng.f() * 0.05).to_le_bytes());
+                }
+            }
+            GgmlType::IQ1M => {
+                for blk in v.chunks_exact_mut(bb) {
+                    let d = f16::from_f32(rng.f() * 0.05).to_bits();
+                    for s in 0..4 {
+                        let lo = (rng.next() as u16) & 0x0FFF;
+                        let hi = ((d >> (4 * s)) & 0xF) << 12;
+                        blk[48 + 2 * s..50 + 2 * s].copy_from_slice(&(lo | hi).to_le_bytes());
+                    }
+                }
+            }
             _ => unreachable!(),
         }
         v
@@ -188,6 +212,8 @@ mod tests {
     fn hip_qmv_and_qmm_match_cpu() {
         let Some(ctx) = try_ctx() else { return };
         let kernels = HipKernels::compile(&ctx).unwrap();
+        let iq_kernels = HipIqKernels::compile(&ctx).unwrap();
+        let iq_tbl = ctx.buffer_from_slice(&ocak_gguf::iq_tables::packed_gpu_table()).unwrap();
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(1337);
 
@@ -201,6 +227,15 @@ mod tests {
             (GgmlType::Q6K, HipWType::Q6K),
             (GgmlType::Q2K, HipWType::Q2K),
             (GgmlType::Q3K, HipWType::Q3K),
+            (GgmlType::IQ1S, HipWType::IQ1S),
+            (GgmlType::IQ1M, HipWType::IQ1M),
+            (GgmlType::IQ2XXS, HipWType::IQ2XXS),
+            (GgmlType::IQ2XS, HipWType::IQ2XS),
+            (GgmlType::IQ2S, HipWType::IQ2S),
+            (GgmlType::IQ3XXS, HipWType::IQ3XXS),
+            (GgmlType::IQ3S, HipWType::IQ3S),
+            (GgmlType::IQ4NL, HipWType::IQ4NL),
+            (GgmlType::IQ4XS, HipWType::IQ4XS),
         ] {
             let (k, m, batch) = (512usize, 70usize, 37usize);
             let w = rand_weights(ty, k, m, &mut rng);
@@ -217,18 +252,38 @@ mod tests {
             let bxq = ctx.alloc_buffer(batch * k).unwrap();
             let bxsc = ctx.alloc_buffer(n_blocks as usize * 16).unwrap();
             let by = ctx.alloc_buffer(batch * m * 4).unwrap();
+            let bsplit = ctx.alloc_buffer(batch * m * 4 * 4).unwrap();
 
             if hty.uses_q8_act() {
                 kernels.quant_q8(&stream, &bx, &bxq, &bxsc, n_blocks).unwrap();
             }
 
-            // 1) Decode qmv for batch = 3
+            let scale = y_cpu.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
+
+            // 1a) Specialized batch = 1 decode qmv1
+            if hty.is_iq() {
+                iq_kernels.qmv(hty, &stream, &bw, &bxq, &bxsc, &by, &iq_tbl, k as u32, m as u32, 1).unwrap();
+            } else {
+                kernels.qmv(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, 1).unwrap();
+            }
+            stream.synchronize().unwrap();
+            let mut y_dec1 = vec![0f32; m];
+            by.download_at(0, bytemuck::cast_slice_mut(&mut y_dec1)).unwrap();
+            for i in 0..m {
+                let err = (y_cpu[i] - y_dec1[i]).abs();
+                assert!(err <= 2e-2 * scale, "qmv1 {ty:?}[{i}]: cpu={} gpu={} err={err} scale={scale}", y_cpu[i], y_dec1[i]);
+            }
+
+            // 1b) Decode qmv for batch = 3
             let b_dec = 3u32;
-            kernels.qmv(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, b_dec).unwrap();
+            if hty.is_iq() {
+                iq_kernels.qmv(hty, &stream, &bw, &bxq, &bxsc, &by, &iq_tbl, k as u32, m as u32, b_dec).unwrap();
+            } else {
+                kernels.qmv(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, b_dec).unwrap();
+            }
             stream.synchronize().unwrap();
             let mut y_dec = vec![0f32; b_dec as usize * m];
             by.download_at(0, bytemuck::cast_slice_mut(&mut y_dec)).unwrap();
-            let scale = y_cpu.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
             let mut sum_err = 0f64;
             for i in 0..y_dec.len() {
                 let err = (y_cpu[i] - y_dec[i]).abs();
@@ -238,8 +293,16 @@ mod tests {
             let mean = sum_err / y_dec.len() as f64;
             assert!(mean <= 3e-3 * scale as f64, "qmv {ty:?}: mean err {mean} (scale {scale})");
 
-            // 2) Prefill qmm for full batch = 37
-            kernels.qmm(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, k as u32, m as u32, batch as u32).unwrap();
+            // 2) Prefill qmm (with Split-K) for full batch = 37
+            if hty.is_iq() {
+                iq_kernels
+                    .qmm_with_split(hty, &stream, &bw, &bxq, &bxsc, &by, &iq_tbl, Some(&bsplit), k as u32, m as u32, batch as u32)
+                    .unwrap();
+            } else {
+                kernels
+                    .qmm_with_split(hty, &stream, &bw, &bx, &bxq, &bxsc, &by, Some(&bsplit), k as u32, m as u32, batch as u32)
+                    .unwrap();
+            }
             stream.synchronize().unwrap();
             let mut y_mm = vec![0f32; batch * m];
             by.download(bytemuck::cast_slice_mut(&mut y_mm)).unwrap();
@@ -255,6 +318,10 @@ mod tests {
             for i in 0..y_dec.len() {
                 let err = (y_dec[i] - y_mm[i]).abs();
                 assert!(err < 1e-4 * scale, "qmv vs qmm {ty:?}[{i}]: {} vs {}", y_dec[i], y_mm[i]);
+            }
+            for i in 0..m {
+                let err = (y_dec1[i] - y_dec[i]).abs();
+                assert!(err < 1e-5 * scale, "qmv1 vs qmv {ty:?}[{i}]: {} vs {}", y_dec1[i], y_dec[i]);
             }
 
             // 3) Opt-in GROUP256 Q4_K (rescale once per 256)
@@ -283,12 +350,19 @@ mod tests {
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(777);
 
-        // 1) Embed Q4K + Q6K
-        for (ty, hty) in [(GgmlType::Q4K, HipWType::Q4K), (GgmlType::Q6K, HipWType::Q6K)] {
+        // 1) Embed Q4K + Q6K + IQ3S + IQ4NL + IQ4XS
+        let iq_tbl = ctx.buffer_from_slice(&ocak_gguf::iq_tables::packed_gpu_table()).unwrap();
+        for (ty, hty) in [
+            (GgmlType::Q4K, HipWType::Q4K),
+            (GgmlType::Q6K, HipWType::Q6K),
+            (GgmlType::IQ3S, HipWType::IQ3S),
+            (GgmlType::IQ4NL, HipWType::IQ4NL),
+            (GgmlType::IQ4XS, HipWType::IQ4XS),
+        ] {
             let w = rand_weights(ty, 512, 5, &mut rng);
             let bw = ctx.buffer_from_slice(&w).unwrap();
             let bo = ctx.alloc_buffer(512 * 4).unwrap();
-            ops.embed_token(&stream, &bw, hty, &bo, 3, 512).unwrap();
+            ops.embed_token(&stream, &bw, hty, Some(&iq_tbl), &bo, 3, 512).unwrap();
             stream.synchronize().unwrap();
             let mut e_gpu = vec![0f32; 512];
             bo.download(bytemuck::cast_slice_mut(&mut e_gpu)).unwrap();

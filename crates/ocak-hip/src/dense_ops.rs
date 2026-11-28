@@ -74,10 +74,11 @@ __device__ __forceinline__ void warp_quant_q8_block(
 
 // ---------------------------------------------------------------------------
 // 1. Embedding lookup & dequantization (single token or batched token array)
-//    wtype: 0=F32, 1=F16, 2=Q4_0, 3=Q8_0, 4=Q4_K, 5=Q5_K, 6=Q6_K
+//    wtype: 0=F32, 1=F16, 2=Q4_0, 3=Q8_0, 4=Q4_K, 5=Q5_K, 6=Q6_K, 7=Q2_K, 8=Q3_K,
+//           15=IQ3_S, 16=IQ4_NL, 17=IQ4_XS
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ float dequant_elem(
-    const u8* __restrict__ row, u32 col, u32 wtype
+    const u8* __restrict__ row, const u32* __restrict__ tbl, u32 col, u32 wtype
 ) {
     if (wtype == 0u) {
         return ((const float*)row)[col];
@@ -162,7 +163,7 @@ __device__ __forceinline__ float dequant_elem(
         u8 qb = row[b + 16u + half_ * 32u + l];
         u32 q = (qb >> (2u * g)) & 3u;
         return d * (float)q - m;
-    } else {
+    } else if (wtype == 8u) {
         // Q3_K: 110 bytes / 256 elems
         u32 b = (col >> 8) * 110u;
         u32 n = col & 255u;
@@ -176,12 +177,52 @@ __device__ __forceinline__ float dequant_elem(
         u32 qlo = (row[b + 32u + half_ * 32u + l] >> (2u * g)) & 3u;
         u32 qhi = (row[b + l] >> (half_ * 4u + g)) & 1u;
         return d * (float)((i32)(qlo | (qhi << 2)) - 4);
+    } else if (wtype == 15u) {
+        // IQ3_S: 110 bytes / 256 elems
+        u32 b = (col >> 8) * 110u;
+        u32 sub = col & 255u;
+        u32 ib32 = sub >> 5;
+        u32 rem32 = sub & 31u;
+        u32 l = rem32 >> 3;
+        u32 j = rem32 & 7u;
+        u32 sc = row[b + 106u + (ib32 >> 1)];
+        float db = f16at(row, b) * (float)(1u + 2u * (((ib32 & 1u) == 0u) ? (sc & 0xFu) : (sc >> 4)));
+        u32 qh = row[b + 66u + ib32];
+        u32 qs_off = b + 2u + ib32 * 8u;
+        u32 sg = row[b + 74u + ib32 * 4u + l];
+        u32 idx = (j < 4u)
+            ? ((u32)row[qs_off + 2u * l] | ((qh << (8u - 2u * l)) & 256u))
+            : ((u32)row[qs_off + 2u * l + 1u] | ((qh << (7u - 2u * l)) & 256u));
+        u32 g = tbl[1280u + idx];
+        u32 gv = (g >> (8u * (j & 3u))) & 0xFFu;
+        return db * (float)gv * (((sg & (1u << j)) != 0u) ? -1.0f : 1.0f);
+    } else if (wtype == 16u) {
+        // IQ4_NL: 18 bytes / 32 elems
+        u32 b = (col >> 5) * 18u;
+        u32 l = col & 31u;
+        float d = f16at(row, b);
+        u8 q = row[b + 2u + (l & 15u)];
+        u32 nib = (l < 16u) ? (q & 0xFu) : (q >> 4);
+        return d * (float)(i32)tbl[1920u + nib];
+    } else {
+        // IQ4_XS: 136 bytes / 256 elems
+        u32 b = (col >> 8) * 136u;
+        u32 ib = (col >> 5) & 7u;
+        u32 l = col & 31u;
+        u32 shb = (u32)row[b + 2u] | ((u32)row[b + 3u] << 8);
+        u32 sl = row[b + 4u + (ib >> 1)];
+        i32 ls = (i32)((sl >> (4u * (ib & 1u))) & 0xFu) | (i32)(((shb >> (2u * ib)) & 3u) << 4);
+        float d = f16at(row, b) * (float)(ls - 32);
+        u8 q = row[b + 8u + ib * 16u + (l & 15u)];
+        u32 nib = (l < 16u) ? (q & 0xFu) : (q >> 4);
+        return d * (float)(i32)tbl[1920u + nib];
     }
 }
 
 extern "C" __global__ __launch_bounds__(256)
 void embed_token(
     const u8* __restrict__ w,
+    const u32* __restrict__ tbl,
     float* __restrict__ out,
     u32 token,
     u32 n_embd,
@@ -190,13 +231,14 @@ void embed_token(
 ) {
     u32 i = blockIdx.x * 256u + threadIdx.x;
     if (i >= n_embd) return;
-    out[i] = dequant_elem(w + (u64)token * row_bytes, i, wtype);
+    out[i] = dequant_elem(w + (u64)token * row_bytes, tbl, i, wtype);
 }
 
 // Device-meta variant for HIP Graph decode: reads token from step_meta[0].
 extern "C" __global__ __launch_bounds__(256)
 void embed_token_meta(
     const u8* __restrict__ w,
+    const u32* __restrict__ tbl,
     const u32* __restrict__ step_meta,
     float* __restrict__ out,
     u32 n_embd,
@@ -206,12 +248,13 @@ void embed_token_meta(
     u32 i = blockIdx.x * 256u + threadIdx.x;
     if (i >= n_embd) return;
     u32 token = step_meta[0];
-    out[i] = dequant_elem(w + (u64)token * row_bytes, i, wtype);
+    out[i] = dequant_elem(w + (u64)token * row_bytes, tbl, i, wtype);
 }
 
 extern "C" __global__ __launch_bounds__(256)
 void embed_tokens_batch(
     const u8* __restrict__ w,
+    const u32* __restrict__ tbl,
     const u32* __restrict__ tokens,
     float* __restrict__ out,
     u32 n_embd,
@@ -223,7 +266,7 @@ void embed_tokens_batch(
     u32 t = blockIdx.y;
     if (i >= n_embd || t >= batch) return;
     u32 tok = tokens[t];
-    out[(u64)t * n_embd + i] = dequant_elem(w + (u64)tok * row_bytes, i, wtype);
+    out[(u64)t * n_embd + i] = dequant_elem(w + (u64)tok * row_bytes, tbl, i, wtype);
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,18 +1302,21 @@ impl HipDenseOps {
         stream: &HipStream,
         w: &HipBuffer,
         ty: HipWType,
+        iq_tbl: Option<&HipBuffer>,
         step_meta: &HipBuffer,
         out: &HipBuffer,
         n_embd: u32,
     ) -> Result<(), HipError> {
         let mut wp = w.as_device_ptr();
+        let mut tblp = iq_tbl.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut mp = step_meta.as_device_ptr();
         let mut op = out.as_device_ptr();
         let mut ne = n_embd;
         let mut rb = ty.row_bytes(n_embd);
         let mut wt = ty.code();
-        let mut params: [*mut c_void; 6] = [
+        let mut params: [*mut c_void; 7] = [
             &mut wp as *mut _ as *mut c_void,
+            &mut tblp as *mut _ as *mut c_void,
             &mut mp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut ne as *mut _ as *mut c_void,
@@ -1285,18 +1331,21 @@ impl HipDenseOps {
         stream: &HipStream,
         w: &HipBuffer,
         ty: HipWType,
+        iq_tbl: Option<&HipBuffer>,
         out: &HipBuffer,
         token: u32,
         n_embd: u32,
     ) -> Result<(), HipError> {
         let mut wp = w.as_device_ptr();
+        let mut tblp = iq_tbl.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut op = out.as_device_ptr();
         let mut tok = token;
         let mut ne = n_embd;
         let mut rb = ty.row_bytes(n_embd);
         let mut wt = ty.code();
-        let mut params: [*mut c_void; 6] = [
+        let mut params: [*mut c_void; 7] = [
             &mut wp as *mut _ as *mut c_void,
+            &mut tblp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut tok as *mut _ as *mut c_void,
             &mut ne as *mut _ as *mut c_void,
@@ -1311,20 +1360,23 @@ impl HipDenseOps {
         stream: &HipStream,
         w: &HipBuffer,
         ty: HipWType,
+        iq_tbl: Option<&HipBuffer>,
         tokens: &HipBuffer,
         out: &HipBuffer,
         n_embd: u32,
         batch: u32,
     ) -> Result<(), HipError> {
         let mut wp = w.as_device_ptr();
+        let mut tblp = iq_tbl.map_or(std::ptr::null_mut(), HipBuffer::as_device_ptr);
         let mut tp = tokens.as_device_ptr();
         let mut op = out.as_device_ptr();
         let mut ne = n_embd;
         let mut rb = ty.row_bytes(n_embd);
         let mut wt = ty.code();
         let mut b = batch;
-        let mut params: [*mut c_void; 7] = [
+        let mut params: [*mut c_void; 8] = [
             &mut wp as *mut _ as *mut c_void,
+            &mut tblp as *mut _ as *mut c_void,
             &mut tp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut ne as *mut _ as *mut c_void,

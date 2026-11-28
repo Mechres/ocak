@@ -17,6 +17,15 @@ pub enum HipWType {
     Q6K,
     Q2K,
     Q3K,
+    IQ1S,
+    IQ1M,
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
+    IQ3XXS,
+    IQ3S,
+    IQ4NL,
+    IQ4XS,
 }
 
 impl HipWType {
@@ -31,6 +40,15 @@ impl HipWType {
             Self::Q6K => 6,
             Self::Q2K => 7,
             Self::Q3K => 8,
+            Self::IQ1S => 9,
+            Self::IQ1M => 10,
+            Self::IQ2XXS => 11,
+            Self::IQ2XS => 12,
+            Self::IQ2S => 13,
+            Self::IQ3XXS => 14,
+            Self::IQ3S => 15,
+            Self::IQ4NL => 16,
+            Self::IQ4XS => 17,
         }
     }
 
@@ -45,11 +63,35 @@ impl HipWType {
             Self::Q6K => (k / 256) * 210,
             Self::Q2K => (k / 256) * 84,
             Self::Q3K => (k / 256) * 110,
+            Self::IQ1S => (k / 256) * 50,
+            Self::IQ1M => (k / 256) * 56,
+            Self::IQ2XXS => (k / 256) * 66,
+            Self::IQ2XS => (k / 256) * 74,
+            Self::IQ2S => (k / 256) * 82,
+            Self::IQ3XXS => (k / 256) * 98,
+            Self::IQ3S => (k / 256) * 110,
+            Self::IQ4NL => (k / 32) * 18,
+            Self::IQ4XS => (k / 256) * 136,
         }
     }
 
     pub fn uses_q8_act(self) -> bool {
         !matches!(self, Self::F32 | Self::F16)
+    }
+
+    pub fn is_iq(self) -> bool {
+        matches!(
+            self,
+            Self::IQ1S
+                | Self::IQ1M
+                | Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ2S
+                | Self::IQ3XXS
+                | Self::IQ3S
+                | Self::IQ4NL
+                | Self::IQ4XS
+        )
     }
 }
 
@@ -80,7 +122,7 @@ __device__ __forceinline__ float f16at(const u32* __restrict__ w32, u32 byte_off
 __device__ __forceinline__ u32 bytes4(const u32* __restrict__ w32, u32 byte_off) {
     u32 a = byte_off >> 2;
     u32 sh = (byte_off & 3u) << 3;
-    return sh == 0u ? w32[a] : ((w32[a] >> sh) | (w32[a + 1u] << (32u - sh)));
+    return (w32[a] >> sh) | ((w32[a + 1u] << 1u) << (31u - sh));
 }
 
 // Per-byte (b - c) for packed bytes with b in [0, 127], c <= 0x7F: no cross-byte borrows.
@@ -1771,6 +1813,7 @@ impl HipKernels {
                 HipWType::Q6K => self.launch_qmv1(&self.qmv1_q6_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
                 HipWType::Q2K => self.launch_qmv1(&self.qmv1_q2_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
                 HipWType::Q3K => self.launch_qmv1(&self.qmv1_q3_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k)),
+                _ => Err(HipError::InvalidArg(format!("use HipIqKernels for {ty:?}"))),
             };
         }
         match ty {
@@ -1783,6 +1826,7 @@ impl HipKernels {
             HipWType::Q6K => self.launch_qmv(&self.qmv_q6_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
             HipWType::Q2K => self.launch_qmv(&self.qmv_q2_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
             HipWType::Q3K => self.launch_qmv(&self.qmv_q3_k, stream, w, xq, xsc, y, k, m, ty.row_bytes(k), batch),
+            _ => Err(HipError::InvalidArg(format!("use HipIqKernels for {ty:?}"))),
         }
     }
 
@@ -1831,6 +1875,7 @@ impl HipKernels {
             HipWType::Q6K => &self.qmm_q6_k,
             HipWType::Q2K => &self.qmm_q2_k,
             HipWType::Q3K => &self.qmm_q3_k,
+            _ => return Err(HipError::InvalidArg(format!("use HipIqKernels for {ty:?}"))),
         };
         let gx = m.div_ceil(64);
         let gy = batch.div_ceil(128);
