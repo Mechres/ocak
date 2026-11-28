@@ -2,6 +2,7 @@
 //! Builds cleanly with zero ROCm SDK installed; lights up automatically when ROCm is present.
 pub mod dense_ops;
 pub mod ffi;
+pub mod hybrid_ops;
 pub mod kernels;
 pub mod rtc;
 pub mod runtime;
@@ -11,6 +12,7 @@ pub use ffi::{
     DeviceInfo, HipError, HipStatus, MemcpyKind, HIP_MEMCPY_D2D, HIP_MEMCPY_D2H, HIP_MEMCPY_H2D,
     HIP_MEMCPY_H2H,
 };
+pub use hybrid_ops::HipHybridOps;
 pub use kernels::{HipKernels, HipWType};
 pub use rtc::Hiprtc;
 pub use runtime::{
@@ -358,6 +360,64 @@ mod tests {
         let mut idx = [0u32; 1];
         bi.download(bytemuck::cast_slice_mut(&mut idx)).unwrap();
         assert_eq!(idx[0], 17321);
+    }
+
+    #[test]
+    fn hip_hybrid_shortconv_and_deltanet_match_cpu() {
+        let Some(ctx) = try_ctx() else { return };
+        let hops = HipHybridOps::compile(&ctx).unwrap();
+        let stream = ctx.create_stream().unwrap();
+        let mut rng = Lcg(4242);
+
+        // 1) ShortConv (LFM2/LFM3)
+        let (ne, lc) = (256usize, 3usize);
+        let bcx: Vec<f32> = (0..3 * ne).map(|_| rng.f()).collect();
+        let cw: Vec<f32> = (0..ne * lc).map(|_| rng.f()).collect();
+        let mut st_cpu = vec![0f32; ne * (lc - 1)];
+        let mut o_cpu = vec![0f32; ne];
+        let b_bcx = ctx.buffer_from_slice(&bcx).unwrap();
+        let b_cw = ctx.buffer_from_slice(&cw).unwrap();
+        let b_st = ctx.alloc_buffer(st_cpu.len() * 4).unwrap();
+        let b_o = ctx.alloc_buffer(o_cpu.len() * 4).unwrap();
+        b_st.zero().unwrap();
+        for _ in 0..4 {
+            ocak_cpu::ops::shortconv_step(&bcx, &cw, &mut st_cpu, &mut o_cpu, ne, lc);
+            hops.shortconv_step(&stream, &b_bcx, &b_cw, &b_st, &b_o, ne as u32, lc as u32, 1).unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut o_gpu = vec![0f32; ne];
+        b_o.download(bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..ne {
+            assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-4, "shortconv[{i}]: cpu={} gpu={}", o_cpu[i], o_gpu[i]);
+        }
+
+        // 2) Gated DeltaNet (Qwen3.5)
+        let (nkh, nvh, hd) = (4usize, 8usize, 128usize);
+        let qkv: Vec<f32> = (0..(2 * nkh + nvh) * hd).map(|_| rng.f()).collect();
+        let alpha: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let beta: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let dt_bias: Vec<f32> = (0..nvh).map(|_| rng.f()).collect();
+        let ssm_a: Vec<f32> = (0..nvh).map(|_| -rng.f().abs()).collect();
+        let mut st_cpu = vec![0f32; nvh * hd * hd];
+        let mut o_cpu = vec![0f32; nvh * hd];
+        let b_qkv = ctx.buffer_from_slice(&qkv).unwrap();
+        let b_al = ctx.buffer_from_slice(&alpha).unwrap();
+        let b_bt = ctx.buffer_from_slice(&beta).unwrap();
+        let b_dt = ctx.buffer_from_slice(&dt_bias).unwrap();
+        let b_sa = ctx.buffer_from_slice(&ssm_a).unwrap();
+        let b_st = ctx.alloc_buffer(st_cpu.len() * 4).unwrap();
+        let b_o = ctx.alloc_buffer(o_cpu.len() * 4).unwrap();
+        b_st.zero().unwrap();
+        for _ in 0..3 {
+            ocak_cpu::ops::deltanet_step(&qkv, &alpha, &beta, &dt_bias, &ssm_a, &mut st_cpu, &mut o_cpu, nkh, nvh, hd, 1e-6);
+            hops.deltanet_step(&stream, &b_qkv, &b_al, &b_bt, &b_dt, &b_sa, &b_st, &b_o, nkh as u32, nvh as u32, hd as u32, 1e-6, 1).unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut o_gpu = vec![0f32; nvh * hd];
+        b_o.download(bytemuck::cast_slice_mut(&mut o_gpu)).unwrap();
+        for i in 0..o_cpu.len() {
+            assert!((o_cpu[i] - o_gpu[i]).abs() < 1e-3, "deltanet[{i}]: cpu={} gpu={}", o_cpu[i], o_gpu[i]);
+        }
     }
 
     #[test]
