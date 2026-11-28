@@ -5,7 +5,7 @@ use crate::ffi::{
     HIP_ATTR_MAX_SHARED_MEM_PER_BLOCK, HIP_ATTR_MEM_BUS_WIDTH, HIP_ATTR_MEM_CLOCK_RATE,
     HIP_ATTR_MULTIPROCESSOR_COUNT, HIP_ATTR_WARP_SIZE, HIP_EVENT_DEFAULT,
     HIP_EVENT_DISABLE_TIMING, HIP_HOST_MALLOC_MAPPED, HIP_PROP_R0600_GCN_ARCH_LEN,
-    HIP_PROP_R0600_GCN_ARCH_OFFSET, HIP_PROP_R0600_MIN_SIZE, HIP_STREAM_CAPTURE_MODE_GLOBAL,
+    HIP_PROP_R0600_GCN_ARCH_OFFSET, HIP_PROP_R0600_MIN_SIZE, HIP_STREAM_CAPTURE_MODE_RELAXED,
     HIP_STREAM_NON_BLOCKING,
 };
 use crate::rtc::Hiprtc;
@@ -515,7 +515,7 @@ impl HipStream {
         };
         self.ctx
             .api
-            .check(unsafe { begin(self.raw, HIP_STREAM_CAPTURE_MODE_GLOBAL) })?;
+            .check(unsafe { begin(self.raw, HIP_STREAM_CAPTURE_MODE_RELAXED) })?;
         let body_res = f(self);
         let mut graph: *mut c_void = ptr::null_mut();
         let end_rc = unsafe { end(self.raw, &mut graph) };

@@ -61,6 +61,8 @@ pub const HIP_EVENT_DEFAULT: c_uint = 0;
 pub const HIP_EVENT_DISABLE_TIMING: c_uint = 2;
 
 pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;
+pub const HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
+pub const HIP_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
 // ROCm 6/7 hipDeviceAttribute_t values (verified against /opt/rocm/include/hip/hip_runtime_api.h).
 pub const HIP_ATTR_CLOCK_RATE: c_int = 5;

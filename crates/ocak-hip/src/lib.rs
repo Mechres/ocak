@@ -143,9 +143,15 @@ mod tests {
         v
     }
 
-    fn try_ctx() -> Option<std::sync::Arc<HipContext>> {
+    // ROCm's synchronous `hipMemcpy` (used by `buffer_from_slice`/`download`) fails with
+    // `hipErrorStreamCaptureImplicit (906)` if another thread in the same process is inside
+    // `hipStreamBeginCapture`. Serialize GPU tests within this test binary.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn try_ctx() -> Option<(std::sync::MutexGuard<'static, ()>, std::sync::Arc<HipContext>)> {
+        let guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         match HipContext::new(0) {
-            Ok(c) => Some(c),
+            Ok(c) => Some((guard, c)),
             Err(HipError::Unavailable) => None,
             Err(e) => panic!("HIP init failed: {e}"),
         }
@@ -159,7 +165,7 @@ mod tests {
 
     #[test]
     fn hip_device_info_and_memory_roundtrip() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         assert!(!ctx.info.name.is_empty());
         assert!(ctx.info.cu_count > 0);
         assert!(ctx.info.warp_size == 32 || ctx.info.warp_size == 64);
@@ -185,7 +191,7 @@ mod tests {
 
     #[test]
     fn hip_rms_norm_matches_cpu() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         let kernels = HipKernels::compile(&ctx).unwrap();
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(999);
@@ -210,7 +216,7 @@ mod tests {
 
     #[test]
     fn hip_qmv_and_qmm_match_cpu() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         let kernels = HipKernels::compile(&ctx).unwrap();
         let iq_kernels = HipIqKernels::compile(&ctx).unwrap();
         let iq_tbl = ctx.buffer_from_slice(&ocak_gguf::iq_tables::packed_gpu_table()).unwrap();
@@ -345,7 +351,7 @@ mod tests {
 
     #[test]
     fn hip_dense_ops_match_cpu() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         let ops = HipDenseOps::compile(&ctx).unwrap();
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(777);
@@ -451,7 +457,7 @@ mod tests {
 
     #[test]
     fn hip_hybrid_shortconv_and_deltanet_match_cpu() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         let hops = HipHybridOps::compile(&ctx).unwrap();
         let stream = ctx.create_stream().unwrap();
         let mut rng = Lcg(4242);
@@ -509,7 +515,7 @@ mod tests {
 
     #[test]
     fn hip_graph_capture_and_replay() {
-        let Some(ctx) = try_ctx() else { return };
+        let Some((_g, ctx)) = try_ctx() else { return };
         let kernels = HipKernels::compile(&ctx).unwrap();
         let stream = ctx.create_stream().unwrap();
         let n = 512usize;
