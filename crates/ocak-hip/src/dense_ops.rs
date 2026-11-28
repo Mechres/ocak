@@ -130,6 +130,22 @@ void embed_token(
     out[i] = dequant_elem(w + (u64)token * row_bytes, i, wtype);
 }
 
+// Device-meta variant for HIP Graph decode: reads token from step_meta[0].
+extern "C" __global__ __launch_bounds__(256)
+void embed_token_meta(
+    const u8* __restrict__ w,
+    const u32* __restrict__ step_meta,
+    float* __restrict__ out,
+    u32 n_embd,
+    u32 row_bytes,
+    u32 wtype
+) {
+    u32 i = blockIdx.x * 256u + threadIdx.x;
+    if (i >= n_embd) return;
+    u32 token = step_meta[0];
+    out[i] = dequant_elem(w + (u64)token * row_bytes, i, wtype);
+}
+
 extern "C" __global__ __launch_bounds__(256)
 void embed_tokens_batch(
     const u8* __restrict__ w,
@@ -289,6 +305,38 @@ void rope_f32(
     base[i1] = x0 * s + x1 * c;
 }
 
+extern "C" __global__ __launch_bounds__(256)
+void rope_f32_meta(
+    float* __restrict__ x,
+    const u32* __restrict__ step_meta,
+    u32 n_heads,
+    u32 head_dim,
+    u32 n_rot,
+    float rope_base,
+    u32 mode
+) {
+    u32 half_rot = n_rot >> 1;
+    u32 idx = blockIdx.x * 256u + threadIdx.x;
+    u32 total = n_heads * half_rot;
+    if (idx >= total) return;
+
+    u32 h = idx / half_rot;
+    u32 j = idx % half_rot;
+    float pos = (float)step_meta[1];
+    float freq = powf(rope_base, -(2.0f * (float)j) / (float)n_rot);
+    float ang = pos * freq;
+    float c, s;
+    sincosf(ang, &s, &c);
+
+    float* base = x + (u64)h * head_dim;
+    u32 i0 = (mode == 0u) ? (2u * j) : j;
+    u32 i1 = (mode == 0u) ? (2u * j + 1u) : (j + half_rot);
+    float x0 = base[i0];
+    float x1 = base[i1];
+    base[i0] = x0 * c - x1 * s;
+    base[i1] = x0 * s + x1 * c;
+}
+
 // ---------------------------------------------------------------------------
 // 4. Paged FP16 KV write (16 tokens/page; packed u16 pairs in u32)
 //    Layout matches ocak-vk: kv[layer_off + page * 2 * 16 * half_kv + is_v * 16 * half_kv + slot * half_kv + i]
@@ -320,6 +368,315 @@ void kv_write_f16(
     u32 pv = (u32)f32_to_f16(vt[2u * i]) | ((u32)f32_to_f16(vt[2u * i + 1u]) << 16);
     kv_layer[k_off] = pk;
     kv_layer[v_off] = pv;
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void kv_write_f16_meta(
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    u32* __restrict__ kv_layer,
+    const u32* __restrict__ page_table,
+    const u32* __restrict__ step_meta,
+    u32 kv_dim
+) {
+    u32 half_kv = kv_dim >> 1;
+    u32 i = blockIdx.x * 256u + threadIdx.x;
+    if (i >= half_kv) return;
+
+    u32 pos = step_meta[1];
+    u32 page = page_table[pos >> 4];
+    u32 slot = pos & 15u;
+    u64 k_off = ((u64)page * 32u + slot) * half_kv + i;
+    u64 v_off = ((u64)page * 32u + 16u + slot) * half_kv + i;
+
+    u32 pk = (u32)f32_to_f16(k[2u * i]) | ((u32)f32_to_f16(k[2u * i + 1u]) << 16);
+    u32 pv = (u32)f32_to_f16(v[2u * i]) | ((u32)f32_to_f16(v[2u * i + 1u]) << 16);
+    kv_layer[k_off] = pk;
+    kv_layer[v_off] = pv;
+}
+
+// ---------------------------------------------------------------------------
+// 5a. Split-K Decode Attention (0 bytes LDS, 1 Wave32 per (head, split))
+//     Reads pos from step_meta[1] (HIP Graph compatible).
+//     Grid: (n_heads, n_splits, 1), Block: (32, 1, 1).
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(32)
+void attention_split_f16_meta(
+    const float* __restrict__ q,
+    const u32* __restrict__ kv_layer,
+    const u32* __restrict__ page_table,
+    const u32* __restrict__ step_meta,
+    float* __restrict__ part_out,  // [n_heads, n_splits, head_dim]
+    float* __restrict__ part_ml,   // [n_heads, n_splits, 2] (max, sum)
+    u32 n_heads,
+    u32 n_kv_heads,
+    u32 head_dim,
+    u32 sliding_window,
+    u32 n_splits
+) {
+    u32 h = blockIdx.x;
+    u32 sp = blockIdx.y;
+    u32 lane = threadIdx.x;
+    if (h >= n_heads) return;
+
+    u32 pos = step_meta[1];
+    u32 k_start = (sliding_window > 0u && pos + 1u > sliding_window) ? (pos + 1u - sliding_window) : 0u;
+    u32 n_keys = pos + 1u - k_start;
+    u32 chunk = (n_keys + n_splits - 1u) / n_splits;
+    u32 kb = k_start + sp * chunk;
+    u32 ke = min(pos + 1u, kb + chunk);
+
+    u32 part_idx = h * n_splits + sp;
+    if (kb >= ke) {
+        if (lane == 0u) {
+            part_ml[part_idx * 2u] = -1e30f;
+            part_ml[part_idx * 2u + 1u] = 0.0f;
+        }
+        return;
+    }
+
+    u32 kvh = (h * n_kv_heads) / n_heads;
+    u32 half_kv = (n_kv_heads * head_dim) >> 1;
+    u32 half_hd = head_dim >> 1;
+    float scale = rsqrtf((float)head_dim);
+    const float* qr = q + (u64)h * head_dim;
+
+    float q0[4], q1[4], acc0[4], acc1[4];
+    u32 n_pairs = (half_hd + 31u) >> 5;
+    for (u32 p = 0; p < n_pairs; p++) {
+        u32 idx = lane + p * 32u;
+        if (idx < half_hd) {
+            q0[p] = qr[2u * idx] * scale;
+            q1[p] = qr[2u * idx + 1u] * scale;
+        } else {
+            q0[p] = 0.0f;
+            q1[p] = 0.0f;
+        }
+        acc0[p] = 0.0f;
+        acc1[p] = 0.0f;
+    }
+
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+    u32 cur_pg_idx = 0xFFFFFFFFu;
+    u32 page = 0u;
+
+    for (u32 kt = kb; kt < ke; kt++) {
+        u32 pg_idx = kt >> 4;
+        if (pg_idx != cur_pg_idx) {
+            cur_pg_idx = pg_idx;
+            page = page_table[pg_idx];
+        }
+        u32 slot = kt & 15u;
+        u64 k_base = ((u64)page * 32u + slot) * half_kv + (u64)kvh * half_hd;
+        u64 v_base = ((u64)page * 32u + 16u + slot) * half_kv + (u64)kvh * half_hd;
+
+        float dot = 0.0f;
+        for (u32 p = 0; p < n_pairs; p++) {
+            u32 idx = lane + p * 32u;
+            if (idx < half_hd) {
+                u32 pk = kv_layer[k_base + idx];
+                dot = __fmaf_rn(q0[p], f16_to_f32((u16)(pk & 0xFFFFu)), dot);
+                dot = __fmaf_rn(q1[p], f16_to_f32((u16)(pk >> 16)), dot);
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor(dot, off, 32);
+
+        float m_new = fmaxf(m_val, dot);
+        float alpha = __expf(m_val - m_new);
+        float w_k = __expf(dot - m_new);
+        l_val = l_val * alpha + w_k;
+        m_val = m_new;
+
+        for (u32 p = 0; p < n_pairs; p++) {
+            u32 idx = lane + p * 32u;
+            if (idx < half_hd) {
+                u32 pv = kv_layer[v_base + idx];
+                acc0[p] = __fmaf_rn(w_k, f16_to_f32((u16)(pv & 0xFFFFu)), acc0[p] * alpha);
+                acc1[p] = __fmaf_rn(w_k, f16_to_f32((u16)(pv >> 16)), acc1[p] * alpha);
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        part_ml[part_idx * 2u] = m_val;
+        part_ml[part_idx * 2u + 1u] = l_val;
+    }
+    float* pout = part_out + (u64)part_idx * head_dim;
+    for (u32 p = 0; p < n_pairs; p++) {
+        u32 idx = lane + p * 32u;
+        if (idx < half_hd) {
+            pout[2u * idx] = acc0[p];
+            pout[2u * idx + 1u] = acc1[p];
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(64)
+void attention_merge_f16(
+    const float* __restrict__ part_out,
+    const float* __restrict__ part_ml,
+    float* __restrict__ out,
+    u32 head_dim,
+    u32 n_splits
+) {
+    u32 h = blockIdx.x;
+    u32 lid = threadIdx.x;
+    float mg = -1e30f;
+    for (u32 sp = 0; sp < n_splits; sp++) {
+        float m = part_ml[(h * n_splits + sp) * 2u];
+        mg = fmaxf(mg, m);
+    }
+    float ltot = 0.0f;
+    float sc[8];
+    for (u32 sp = 0; sp < n_splits; sp++) {
+        float l = part_ml[(h * n_splits + sp) * 2u + 1u];
+        float m = part_ml[(h * n_splits + sp) * 2u];
+        float w = (l > 0.0f) ? __expf(m - mg) : 0.0f;
+        sc[sp] = w;
+        ltot += l * w;
+    }
+    float inv_l = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    float* orow = out + (u64)h * head_dim;
+    for (u32 d = lid; d < head_dim; d += 64u) {
+        float acc = 0.0f;
+        for (u32 sp = 0; sp < n_splits; sp++) {
+            if (sc[sp] > 0.0f) {
+                acc = __fmaf_rn(part_out[(u64)(h * n_splits + sp) * head_dim + d], sc[sp], acc);
+            }
+        }
+        orow[d] = acc * inv_l;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Flash-Tiled Prefill Attention (8 query rows x 16-key KV page tile in LDS)
+//     Grid: (n_heads, batch.div_ceil(8), 1), Block: (256, 1, 1) = 8 Wave32s (1 wave/query row).
+//     Each 16-key tile is one physical KV page: staged once in LDS and reused 8x!
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256)
+void attention_prefill_f16(
+    const float* __restrict__ q,
+    const u32* __restrict__ kv_layer,
+    const u32* __restrict__ page_table,
+    float* __restrict__ out,
+    u32 n_heads,
+    u32 n_kv_heads,
+    u32 head_dim,
+    u32 pos0,
+    u32 sliding_window,
+    u32 batch
+) {
+    // Max head_dim = 256 -> half_hd = 128 u32s -> 16 * 128 = 2048 u32s = 8 KB for K + 8 KB for V = 16 KB LDS.
+    __shared__ u32 sk[16 * 128];
+    __shared__ u32 sv[16 * 128];
+
+    u32 h = blockIdx.x;
+    u32 t0 = blockIdx.y * 8u;
+    u32 lid = threadIdx.x;
+    u32 warp = lid >> 5;   // 0..7 = query row within tile
+    u32 lane = lid & 31u;
+    u32 t = t0 + warp;
+    bool live = (t < batch);
+
+    u32 kvh = (h * n_kv_heads) / n_heads;
+    u32 half_kv = (n_kv_heads * head_dim) >> 1;
+    u32 half_hd = head_dim >> 1;
+    u32 n_pairs = (half_hd + 31u) >> 5;
+    float scale = rsqrtf((float)head_dim);
+
+    u32 pos = pos0 + t;
+    u32 max_pos = pos0 + min(t0 + 7u, batch - 1u);
+    u32 min_k_start = (sliding_window > 0u && (pos0 + t0 + 1u) > sliding_window)
+        ? (pos0 + t0 + 1u - sliding_window) : 0u;
+    u32 my_k_start = (sliding_window > 0u && (pos + 1u) > sliding_window)
+        ? (pos + 1u - sliding_window) : 0u;
+
+    float q0[4], q1[4], acc0[4], acc1[4];
+    const float* qr = q + ((u64)min(t, batch - 1u) * n_heads + h) * head_dim;
+    for (u32 p = 0; p < n_pairs; p++) {
+        u32 idx = lane + p * 32u;
+        if (live && idx < half_hd) {
+            q0[p] = qr[2u * idx] * scale;
+            q1[p] = qr[2u * idx + 1u] * scale;
+        } else {
+            q0[p] = 0.0f;
+            q1[p] = 0.0f;
+        }
+        acc0[p] = 0.0f;
+        acc1[p] = 0.0f;
+    }
+
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+
+    u32 pg_beg = min_k_start >> 4;
+    u32 pg_end = (max_pos >> 4) + 1u;
+    u32 tile_words = 16u * half_hd;
+
+    for (u32 pg_idx = pg_beg; pg_idx < pg_end; pg_idx++) {
+        u32 page = page_table[pg_idx];
+        u64 k_pg_base = (u64)page * 32u * half_kv + (u64)kvh * half_hd;
+        u64 v_pg_base = ((u64)page * 32u + 16u) * half_kv + (u64)kvh * half_hd;
+
+        // Cooperative coalesced load of this 16-token KV page into LDS
+        for (u32 w = lid; w < tile_words; w += 256u) {
+            u32 slot = w / half_hd;
+            u32 col = w - slot * half_hd;
+            sk[w] = kv_layer[k_pg_base + (u64)slot * half_kv + col];
+            sv[w] = kv_layer[v_pg_base + (u64)slot * half_kv + col];
+        }
+        lds_barrier();
+
+        if (live) {
+            u32 kt0 = pg_idx << 4;
+            u32 s_beg = (kt0 < my_k_start) ? (my_k_start - kt0) : 0u;
+            u32 s_end = (kt0 + 16u <= pos + 1u) ? 16u : ((pos + 1u > kt0) ? (pos + 1u - kt0) : 0u);
+            for (u32 slot = s_beg; slot < s_end; slot++) {
+                u32 base = slot * half_hd;
+                float dot = 0.0f;
+                for (u32 p = 0; p < n_pairs; p++) {
+                    u32 idx = lane + p * 32u;
+                    if (idx < half_hd) {
+                        u32 pk = sk[base + idx];
+                        dot = __fmaf_rn(q0[p], f16_to_f32((u16)(pk & 0xFFFFu)), dot);
+                        dot = __fmaf_rn(q1[p], f16_to_f32((u16)(pk >> 16)), dot);
+                    }
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor(dot, off, 32);
+
+                float m_new = fmaxf(m_val, dot);
+                float alpha = __expf(m_val - m_new);
+                float w_k = __expf(dot - m_new);
+                l_val = l_val * alpha + w_k;
+                m_val = m_new;
+
+                for (u32 p = 0; p < n_pairs; p++) {
+                    u32 idx = lane + p * 32u;
+                    if (idx < half_hd) {
+                        u32 pv = sv[base + idx];
+                        acc0[p] = __fmaf_rn(w_k, f16_to_f32((u16)(pv & 0xFFFFu)), acc0[p] * alpha);
+                        acc1[p] = __fmaf_rn(w_k, f16_to_f32((u16)(pv >> 16)), acc1[p] * alpha);
+                    }
+                }
+            }
+        }
+        lds_barrier();
+    }
+
+    if (live) {
+        float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+        float* orow = out + ((u64)t * n_heads + h) * head_dim;
+        for (u32 p = 0; p < n_pairs; p++) {
+            u32 idx = lane + p * 32u;
+            if (idx < half_hd) {
+                orow[2u * idx] = acc0[p] * inv_l;
+                orow[2u * idx + 1u] = acc1[p] * inv_l;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +899,7 @@ void argmax_p2(
 pub struct HipDenseOps {
     _module: Arc<HipModule>,
     embed_token: HipFunction,
+    embed_token_meta: HipFunction,
     embed_tokens_batch: HipFunction,
     add_f32: HipFunction,
     add_bias_f32: HipFunction,
@@ -549,8 +907,13 @@ pub struct HipDenseOps {
     rms_norm_heads_f32: HipFunction,
     swiglu_f32: HipFunction,
     rope_f32: HipFunction,
+    rope_f32_meta: HipFunction,
     kv_write_f16: HipFunction,
+    kv_write_f16_meta: HipFunction,
     attention_f16: HipFunction,
+    attention_split_f16_meta: HipFunction,
+    attention_merge_f16: HipFunction,
+    attention_prefill_f16: HipFunction,
     argmax_p1: HipFunction,
     argmax_p2: HipFunction,
 }
@@ -560,6 +923,7 @@ impl HipDenseOps {
         let module = Arc::new(ctx.compile_module(DENSE_OPS_SRC, "ocak_hip_dense_ops.hip", &[])?);
         Ok(Self {
             embed_token: module.function("embed_token")?,
+            embed_token_meta: module.function("embed_token_meta")?,
             embed_tokens_batch: module.function("embed_tokens_batch")?,
             add_f32: module.function("add_f32")?,
             add_bias_f32: module.function("add_bias_f32")?,
@@ -567,12 +931,43 @@ impl HipDenseOps {
             rms_norm_heads_f32: module.function("rms_norm_heads_f32")?,
             swiglu_f32: module.function("swiglu_f32")?,
             rope_f32: module.function("rope_f32")?,
+            rope_f32_meta: module.function("rope_f32_meta")?,
             kv_write_f16: module.function("kv_write_f16")?,
+            kv_write_f16_meta: module.function("kv_write_f16_meta")?,
             attention_f16: module.function("attention_f16")?,
+            attention_split_f16_meta: module.function("attention_split_f16_meta")?,
+            attention_merge_f16: module.function("attention_merge_f16")?,
+            attention_prefill_f16: module.function("attention_prefill_f16")?,
             argmax_p1: module.function("argmax_p1")?,
             argmax_p2: module.function("argmax_p2")?,
             _module: module,
         })
+    }
+
+    pub fn embed_token_meta(
+        &self,
+        stream: &HipStream,
+        w: &HipBuffer,
+        ty: HipWType,
+        step_meta: &HipBuffer,
+        out: &HipBuffer,
+        n_embd: u32,
+    ) -> Result<(), HipError> {
+        let mut wp = w.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut op = out.as_device_ptr();
+        let mut ne = n_embd;
+        let mut rb = ty.row_bytes(n_embd);
+        let mut wt = ty.code();
+        let mut params: [*mut c_void; 6] = [
+            &mut wp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+            &mut wt as *mut _ as *mut c_void,
+        ];
+        unsafe { self.embed_token_meta.launch(stream, (n_embd.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut params) }
     }
 
     pub fn embed_token(
@@ -851,6 +1246,170 @@ impl HipDenseOps {
             &mut b as *mut _ as *mut c_void,
         ];
         unsafe { self.attention_f16.launch(stream, (n_heads, batch, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn rope_meta(
+        &self,
+        stream: &HipStream,
+        x: &HipBuffer,
+        step_meta: &HipBuffer,
+        n_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        rope_base: f32,
+        mode: u32,
+    ) -> Result<(), HipError> {
+        let mut xp = x.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut rb = rope_base;
+        let mut md = mode;
+        let mut params: [*mut c_void; 7] = [
+            &mut xp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut rb as *mut _ as *mut c_void,
+            &mut md as *mut _ as *mut c_void,
+        ];
+        let total = n_heads * (n_rot / 2);
+        unsafe { self.rope_f32_meta.launch(stream, (total.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn kv_write_meta(
+        &self,
+        stream: &HipStream,
+        k: &HipBuffer,
+        v: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        step_meta: &HipBuffer,
+        kv_dim: u32,
+    ) -> Result<(), HipError> {
+        let mut kp = k.as_device_ptr();
+        let mut vp = v.as_device_ptr();
+        let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
+        let mut ptp = page_table.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut kd = kv_dim;
+        let mut params: [*mut c_void; 6] = [
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut kvp as *mut _ as *mut c_void,
+            &mut ptp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void,
+        ];
+        let half_kv = kv_dim / 2;
+        unsafe { self.kv_write_f16_meta.launch(stream, (half_kv.div_ceil(256), 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
+    pub fn attention_decode_split_meta(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        step_meta: &HipBuffer,
+        part_out: &HipBuffer,
+        part_ml: &HipBuffer,
+        out: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        sliding_window: u32,
+        n_splits: u32,
+    ) -> Result<(), HipError> {
+        let mut qp = q.as_device_ptr();
+        let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
+        let mut ptp = page_table.as_device_ptr();
+        let mut mp = step_meta.as_device_ptr();
+        let mut pop = part_out.as_device_ptr();
+        let mut pmlp = part_ml.as_device_ptr();
+        let mut nh = n_heads;
+        let mut nkv = n_kv_heads;
+        let mut hd = head_dim;
+        let mut sw = sliding_window;
+        let mut ns = n_splits;
+        let mut p1: [*mut c_void; 11] = [
+            &mut qp as *mut _ as *mut c_void,
+            &mut kvp as *mut _ as *mut c_void,
+            &mut ptp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut pop as *mut _ as *mut c_void,
+            &mut pmlp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.attention_split_f16_meta
+                .launch(stream, (n_heads, n_splits, 1), (32, 1, 1), 0, &mut p1)
+        }?;
+
+        let mut pop2 = part_out.as_device_ptr();
+        let mut pmlp2 = part_ml.as_device_ptr();
+        let mut op = out.as_device_ptr();
+        let mut hd2 = head_dim;
+        let mut ns2 = n_splits;
+        let mut p2: [*mut c_void; 5] = [
+            &mut pop2 as *mut _ as *mut c_void,
+            &mut pmlp2 as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void,
+            &mut ns2 as *mut _ as *mut c_void,
+        ];
+        unsafe { self.attention_merge_f16.launch(stream, (n_heads, 1, 1), (64, 1, 1), 0, &mut p2) }
+    }
+
+    pub fn attention_prefill(
+        &self,
+        stream: &HipStream,
+        q: &HipBuffer,
+        kv: &HipBuffer,
+        kv_byte_offset: usize,
+        page_table: &HipBuffer,
+        out: &HipBuffer,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        pos0: u32,
+        sliding_window: u32,
+        batch: u32,
+    ) -> Result<(), HipError> {
+        let mut qp = q.as_device_ptr();
+        let mut kvp = kv.device_ptr_at(kv_byte_offset)?;
+        let mut ptp = page_table.as_device_ptr();
+        let mut op = out.as_device_ptr();
+        let mut nh = n_heads;
+        let mut nkv = n_kv_heads;
+        let mut hd = head_dim;
+        let mut p0 = pos0;
+        let mut sw = sliding_window;
+        let mut b = batch;
+        let mut params: [*mut c_void; 10] = [
+            &mut qp as *mut _ as *mut c_void,
+            &mut kvp as *mut _ as *mut c_void,
+            &mut ptp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut p0 as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.attention_prefill_f16
+                .launch(stream, (n_heads, batch.div_ceil(8), 1), (256, 1, 1), 0, &mut params)
+        }
     }
 
     pub fn argmax(

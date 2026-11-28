@@ -315,6 +315,37 @@ mod tests {
             assert!((a_cpu[i] - a_gpu[i]).abs() < 2e-3, "attn[{i}]: cpu={} gpu={}", a_cpu[i], a_gpu[i]);
         }
 
+        // 2b) Split-K decode attention (device-meta) vs CPU
+        let meta = [0u32, pos as u32];
+        let bmeta = ctx.buffer_from_slice(&meta).unwrap();
+        let bpout = ctx.alloc_buffer(nh * 8 * hd * 4).unwrap();
+        let bpml = ctx.alloc_buffer(nh * 8 * 2 * 4).unwrap();
+        ops.attention_decode_split_meta(
+            &stream, &bq, &bkv, 0, &bpt, &bmeta, &bpout, &bpml, &bo,
+            nh as u32, nkv as u32, hd as u32, 0, 8,
+        ).unwrap();
+        stream.synchronize().unwrap();
+        bo.download(bytemuck::cast_slice_mut(&mut a_gpu)).unwrap();
+        for i in 0..a_cpu.len() {
+            assert!((a_cpu[i] - a_gpu[i]).abs() < 2e-3, "attn_split[{i}]: cpu={} gpu={}", a_cpu[i], a_gpu[i]);
+        }
+
+        // 2c) Flash-tiled prefill attention (batch=12 ending at pos=37) vs CPU on final token
+        let b_pf = 12usize;
+        let mut q_pf: Vec<f32> = (0..(b_pf - 1) * nh * hd).map(|_| rng.f()).collect();
+        q_pf.extend_from_slice(&q);
+        let bq_pf = ctx.buffer_from_slice(&q_pf).unwrap();
+        let bo_pf = ctx.alloc_buffer(b_pf * nh * hd * 4).unwrap();
+        ops.attention_prefill(
+            &stream, &bq_pf, &bkv, 0, &bpt, &bo_pf,
+            nh as u32, nkv as u32, hd as u32, (pos + 1 - b_pf) as u32, 0, b_pf as u32,
+        ).unwrap();
+        stream.synchronize().unwrap();
+        bo_pf.download_at((b_pf - 1) * nh * hd * 4, bytemuck::cast_slice_mut(&mut a_gpu)).unwrap();
+        for i in 0..a_cpu.len() {
+            assert!((a_cpu[i] - a_gpu[i]).abs() < 2e-3, "attn_prefill[{i}]: cpu={} gpu={}", a_cpu[i], a_gpu[i]);
+        }
+
         // 3) GPU argmax
         let mut logits: Vec<f32> = (0..32000).map(|_| rng.f()).collect();
         logits[17321] = 42.5;
